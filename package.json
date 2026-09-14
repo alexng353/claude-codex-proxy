@@ -1,0 +1,32 @@
+{
+  "name": "claude-codex-proxy",
+  "version": "0.1.0",
+  "description": "Use a Claude subscription through Claude Code as a Codex Responses API provider",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "claude-codex-proxy": "src/server.ts"
+  },
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit",
+    "check": "bun run typecheck && bun test"
+  },
+  "keywords": [
+    "bun",
+    "claude",
+    "claude-code",
+    "codex",
+    "responses-api"
+  ],
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,77 @@
+import { outputSchema, requestToPrompt } from "./request";
+import type { ClaudeResult, ProxyOutput, ResponsesRequest } from "./types";
+
+const MODEL_ALIASES: Record<string, string> = {
+  opus: "opus",
+  sonnet: "sonnet",
+  haiku: "haiku",
+  "claude-opus": "opus",
+  "claude-sonnet": "sonnet",
+  "claude-haiku": "haiku",
+};
+
+export function resolveModel(model: string): string {
+  const resolved = MODEL_ALIASES[model] ?? model;
+  if (!/^[a-zA-Z0-9._-]+$/.test(resolved) || (!resolved.startsWith("claude-") && !["opus", "sonnet", "haiku"].includes(resolved))) {
+    throw new Error(`Unsupported Claude model: ${model}`);
+  }
+  return resolved;
+}
+
+function parseResult(stdout: string): ClaudeResult {
+  const lines = stdout.trim().split("\n").filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index--) {
+    try {
+      const value = JSON.parse(lines[index]) as ClaudeResult;
+      if (value.type === "result") return value;
+    } catch {
+      // Ignore non-JSON diagnostics and continue looking for the result.
+    }
+  }
+  throw new Error("Claude CLI did not return a result");
+}
+
+export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput> {
+  const args = [
+    "-p",
+    "--safe-mode",
+    "--strict-mcp-config",
+    "--tools", "",
+    "--permission-prompts", "none",
+    "--no-session-persistence",
+    "--output-format", "json",
+    "--model", resolveModel(request.model),
+    "--json-schema", JSON.stringify(outputSchema(request.tools ?? [])),
+  ];
+
+  const subprocess = Bun.spawn([process.env.CLAUDE_BIN ?? "claude", ...args], {
+    stdin: new Blob([requestToPrompt(request)]),
+    stdout: "pipe",
+    stderr: "pipe",
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "CLAUDECODE")) as Record<string, string>,
+  });
+  const timeoutMs = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
+  const timeout = setTimeout(() => subprocess.kill(), timeoutMs);
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(subprocess.stdout).text(),
+    new Response(subprocess.stderr).text(),
+    subprocess.exited,
+  ]).finally(() => clearTimeout(timeout));
+
+  if (exitCode !== 0) throw new Error(stderr.trim() || `Claude CLI exited with code ${exitCode}`);
+  const result = parseResult(stdout);
+  if (result.is_error) throw new Error(result.result || "Claude CLI returned an error");
+  const structured = result.structured_output ?? JSON.parse(result.result ?? "{}") as ClaudeResult["structured_output"];
+  if (!structured || typeof structured.text !== "string" || !Array.isArray(structured.tool_calls)) {
+    throw new Error("Claude CLI returned invalid structured output");
+  }
+  const inputTokens = (result.usage?.input_tokens ?? 0)
+    + (result.usage?.cache_creation_input_tokens ?? 0)
+    + (result.usage?.cache_read_input_tokens ?? 0);
+  const outputTokens = result.usage?.output_tokens ?? 0;
+  return {
+    text: structured.text,
+    toolCalls: structured.tool_calls,
+    usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+  };
+}
