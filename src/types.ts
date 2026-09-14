@@ -1,20 +1,35 @@
 export type ResponseTool = {
-  type: "function" | "custom";
-  name: string;
+  type: string;
+  name?: string;
+  namespace?: string;
   description?: string;
   parameters?: unknown;
   format?: unknown;
+  tools?: ResponseTool[];
+  [key: string]: unknown;
+};
+
+export type ResponseContentPart = {
+  type?: string;
+  text?: string;
+  image_url?: string;
+  file_id?: string;
+  [key: string]: unknown;
 };
 
 export type ResponseInputItem = {
   type?: string;
   role?: string;
-  content?: string | Array<{ type?: string; text?: string }>;
+  content?: string | ResponseContentPart[];
   name?: string;
   call_id?: string;
   arguments?: string;
   input?: string;
   output?: string | unknown;
+  action?: unknown;
+  actions?: unknown[];
+  namespace?: string;
+  proxy_image_paths?: string[];
 };
 
 export type ResponsesRequest = {

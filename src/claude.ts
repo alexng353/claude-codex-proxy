@@ -1,4 +1,4 @@
-import { outputSchema, requestToPrompt } from "./request";
+import { outputSchema, prepareClaudePrompt } from "./request";
 import type { ClaudeResult, ProxyOutput, ResponsesRequest } from "./types";
 
 const MODEL_ALIASES: Record<string, string> = {
@@ -18,6 +18,17 @@ export function resolveModel(model: string): string {
   return resolved;
 }
 
+export function buildClaudeArgs(request: ResponsesRequest): string[] {
+  return [
+    "-p",
+    "--dangerously-skip-permissions",
+    "--no-session-persistence",
+    "--output-format", "json",
+    "--model", resolveModel(request.model),
+    "--json-schema", JSON.stringify(outputSchema(request.tools ?? [])),
+  ];
+}
+
 function parseResult(stdout: string): ClaudeResult {
   const lines = stdout.trim().split("\n").filter(Boolean);
   for (let index = lines.length - 1; index >= 0; index--) {
@@ -32,22 +43,14 @@ function parseResult(stdout: string): ClaudeResult {
 }
 
 export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput> {
-  const args = [
-    "-p",
-    "--safe-mode",
-    "--strict-mcp-config",
-    "--tools", "",
-    "--permission-prompts", "none",
-    "--no-session-persistence",
-    "--output-format", "json",
-    "--model", resolveModel(request.model),
-    "--json-schema", JSON.stringify(outputSchema(request.tools ?? [])),
-  ];
+  const args = buildClaudeArgs(request);
+  const prepared = await prepareClaudePrompt(request);
 
   const subprocess = Bun.spawn([process.env.CLAUDE_BIN ?? "claude", ...args], {
-    stdin: new Blob([requestToPrompt(request)]),
+    stdin: new Blob([prepared.prompt]),
     stdout: "pipe",
     stderr: "pipe",
+    cwd: process.env.CLAUDE_CWD || process.cwd(),
     env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "CLAUDECODE")) as Record<string, string>,
   });
   const timeoutMs = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
@@ -56,7 +59,10 @@ export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput>
     new Response(subprocess.stdout).text(),
     new Response(subprocess.stderr).text(),
     subprocess.exited,
-  ]).finally(() => clearTimeout(timeout));
+  ]).finally(async () => {
+    clearTimeout(timeout);
+    await prepared.cleanup();
+  });
 
   if (exitCode !== 0) throw new Error(stderr.trim() || `Claude CLI exited with code ${exitCode}`);
   const result = parseResult(stdout);

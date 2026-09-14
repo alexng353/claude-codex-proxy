@@ -21,10 +21,10 @@ const modelCatalog = ["opus", "sonnet", "haiku"].map((model, index) => ({
   default_verbosity: null,
   apply_patch_tool_type: "freeform",
   truncation_policy: { mode: "bytes", limit: 100_000 },
-  supports_image_detail_original: false,
+  supports_image_detail_original: true,
   context_window: 200_000,
   experimental_supported_tools: [],
-  input_modalities: ["text"],
+  input_modalities: ["text", "image"],
   base_instructions: "You are a coding agent. Follow the instructions and use the supplied tools when needed.",
 }));
 

@@ -1,4 +1,5 @@
 import type { ProxyOutput, ResponsesRequest } from "./types";
+import { COMPUTER_TOOL_NAME, toolDescriptors } from "./request";
 
 type OutputItem = Record<string, unknown>;
 
@@ -12,18 +13,36 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
       content: [{ type: "output_text", annotations: [], text: output.text }],
     });
   }
+  const descriptors = toolDescriptors(request.tools ?? []);
   for (const call of output.toolCalls) {
-    const toolType = request.tools?.find((tool) => tool.name === call.name)?.type ?? "function";
-    if (toolType === "custom") {
+    const descriptor = descriptors.find((tool) => tool.proxyName === call.name);
+    if (call.name === COMPUTER_TOOL_NAME || descriptor?.type === "computer") {
+      let action: unknown;
+      try {
+        action = JSON.parse(call.arguments);
+      } catch {
+        throw new Error("Computer tool arguments must be valid JSON");
+      }
+      const batched = action && typeof action === "object" && Array.isArray((action as { actions?: unknown }).actions)
+        ? (action as { actions: unknown[] }).actions
+        : undefined;
+      items.push({
+        id: id("cu"), type: "computer_call", status: "completed",
+        call_id: id("call"), pending_safety_checks: [],
+        ...(batched ? { actions: batched } : { action }),
+      });
+      continue;
+    }
+    if (descriptor?.type === "custom") {
       items.push({
         id: id("ctc"), type: "custom_tool_call", status: "completed",
-        call_id: id("call"), name: call.name, input: call.arguments,
+        call_id: id("call"), name: descriptor.name, namespace: descriptor.namespace, input: call.arguments,
       });
       continue;
     }
     items.push({
       id: id("fc"), type: "function_call", status: "completed",
-      call_id: id("call"), name: call.name, arguments: call.arguments,
+      call_id: id("call"), name: descriptor?.name ?? call.name, namespace: descriptor?.namespace, arguments: call.arguments,
     });
   }
   return items;
@@ -67,7 +86,7 @@ export function streamResponse(response: ReturnType<typeof responseObject>): Res
     } else if (item.type === "function_call") {
       chunks.push(sse("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", sequence_number: sequence++, item_id: item.id, output_index: outputIndex, delta: item.arguments }));
       chunks.push(sse("response.function_call_arguments.done", { type: "response.function_call_arguments.done", sequence_number: sequence++, item_id: item.id, output_index: outputIndex, arguments: item.arguments }));
-    } else {
+    } else if (item.type === "custom_tool_call") {
       chunks.push(sse("response.custom_tool_call_input.delta", { type: "response.custom_tool_call_input.delta", sequence_number: sequence++, item_id: item.id, call_id: item.call_id, output_index: outputIndex, delta: item.input }));
       chunks.push(sse("response.custom_tool_call_input.done", { type: "response.custom_tool_call_input.done", sequence_number: sequence++, item_id: item.id, call_id: item.call_id, output_index: outputIndex, input: item.input }));
     }

@@ -11,7 +11,9 @@ Use a Claude Pro, Max, or Team subscription as a custom model provider in Codex 
 Codex Desktop ── Responses API ──> this local Bun server ── stdin/stdout ──> Claude Code CLI
 ```
 
-Codex remains the agent runtime: it owns approvals, the sandbox, and tool execution. The proxy disables Claude Code's built-in tools, converts Codex tool schemas into a constrained structured-output request, and translates Claude's answer or tool requests back into Responses API events.
+The proxy converts Codex tool schemas into a structured-output request and translates Claude's answer or tool requests back into Responses API events. It supports Codex function/custom tools, namespaced tools, and the Desktop browser's computer-use loop, including screenshot feedback.
+
+Claude is launched with its normal user and project configuration plus `--dangerously-skip-permissions`. That means Claude can also load and directly use the tools, MCP servers, plugins, hooks, and instructions available to your Claude Code installation. This unrestricted behavior is intentional in this project; read the [Security](#security) section before running it in a sensitive directory.
 
 ## Requirements
 
@@ -74,6 +76,7 @@ Provider settings cannot be placed in a repository's `.codex/config.toml`; Codex
 | `HOST` | `127.0.0.1` | Listening address |
 | `PORT` | `3456` | Listening port |
 | `CLAUDE_BIN` | `claude` | Claude CLI executable path |
+| `CLAUDE_CWD` | proxy process directory | Working directory used by each Claude subprocess |
 | `CLAUDE_TIMEOUT_MS` | `900000` | Per-request timeout |
 | `PROXY_API_KEY` | unset | Optional bearer token |
 
@@ -90,14 +93,15 @@ export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 - `GET /v1/models`
 - `POST /v1/responses`, streaming and non-streaming
 - Text input and multi-item agent history
-- Function and custom tool calls
+- Function, custom, and namespaced tool calls
 - Parallel tool calls
+- Codex Desktop computer/browser actions and screenshot results
 
 ## Current limitations
 
 - Streaming is protocol-compatible SSE, but Claude's text is emitted after its structured response completes rather than token by token.
-- Images and other binary input parts are not forwarded yet.
-- Built-in OpenAI hosted tools are not implemented; Codex-local function/custom tools are passed through.
+- Browser screenshots returned through `computer_call_output` are materialized temporarily for Claude to inspect. General image/file input parts are not yet forwarded.
+- OpenAI-hosted tools are not reimplemented by the proxy. Codex-local tools are passed through, while tools configured in Claude Code may also execute directly inside the unrestricted Claude subprocess.
 - Each turn is stateless at the proxy layer. Codex sends the active conversation history again, which favors correctness over prompt-cache efficiency.
 - Claude Code changes can affect compatibility because its CLI JSON format is not a stable third-party provider API.
 
@@ -113,9 +117,10 @@ Tests use a fake Claude executable and do not consume subscription quota. A manu
 
 - Prompts go to Claude through stdin, never through a shell.
 - The proxy never reads or exposes Claude OAuth credentials.
-- Claude Code tools, MCP servers, plugins, hooks, and project instructions are disabled for inference subprocesses.
+- Every inference subprocess uses `--dangerously-skip-permissions` and loads normal Claude Code configuration. Claude may read files, run commands, use configured MCP servers/plugins, and perform other actions without Claude's permission prompts.
+- Those direct Claude actions may occur outside Codex's visible tool-call and approval loop. Run the proxy only in directories and with credentials you trust. Set `CLAUDE_CWD` to a deliberately scoped directory if needed.
 - Keep the server bound to localhost unless you add a bearer token and understand the network exposure.
 
 ## Attribution
 
-Inspired by [wende/claude-max-api-proxy](https://github.com/wende/claude-max-api-proxy). This project differs by targeting Codex's Responses API and keeping tool execution in Codex.
+Inspired by [wende/claude-max-api-proxy](https://github.com/wende/claude-max-api-proxy). This project differs by targeting Codex's Responses API, including Codex Desktop's browser computer-use protocol.

@@ -27,4 +27,16 @@ describe("Responses API output", () => {
     expect(response.output[1]).toMatchObject({ type: "custom_tool_call", input: "*** Begin Patch" });
     expect(await streamResponse(response).text()).toContain("event: response.custom_tool_call_input.delta");
   });
+
+  test("returns computer calls for browser actions", async () => {
+    const computerRequest = { ...request, tools: [{ type: "computer" }] };
+    const computerOutput = { ...output, toolCalls: [{ name: "__codex_computer_use", arguments: '{"type":"click","x":10,"y":20,"button":"left"}' }] };
+    const response = responseObject(computerRequest, computerOutput);
+    expect(response.output[1]).toMatchObject({
+      type: "computer_call",
+      action: { type: "click", x: 10, y: 20, button: "left" },
+      pending_safety_checks: [],
+    });
+    expect(await streamResponse(response).text()).toContain('"type":"computer_call"');
+  });
 });
