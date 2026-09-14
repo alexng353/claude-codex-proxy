@@ -65,6 +65,8 @@ stream_max_retries = 1
 
 Restart Codex Desktop after changing the config. Use `opus`, `sonnet`, or `haiku` as the model. Full Claude model IDs beginning with `claude-` are also accepted.
 
+Codex caches model capabilities. After upgrading the proxy, quit Codex Desktop, remove `~/.codex/models_cache.json`, and reopen Codex so browser/plugin capability changes are fetched. Existing tasks retain the model instructions and tool world captured when they were created, so test browser changes in a new task.
+
 To switch back, set `model_provider = "openai"` and choose an OpenAI model, or remove the added provider/default lines.
 
 Provider settings cannot be placed in a repository's `.codex/config.toml`; Codex ignores project-local provider overrides for credential and routing safety.
@@ -96,6 +98,7 @@ export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 - Function, custom, and namespaced tool calls
 - Parallel tool calls
 - Codex Desktop computer/browser actions and screenshot results
+- Codex plugin, app, skill, and Node/CUA REPL capability metadata
 
 ## Current limitations
 

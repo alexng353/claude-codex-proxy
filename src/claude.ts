@@ -10,6 +10,8 @@ const MODEL_ALIASES: Record<string, string> = {
   "claude-haiku": "haiku",
 };
 
+const CODEX_TOOL_SYSTEM_PROMPT = `You are running inside a Codex agent loop. Tools described in <available_tools> are real, available Codex tools even though they are not present in Claude Code's native tool registry. Invoke them by returning their exact name and arguments in the required structured tool_calls output. Never claim that a listed Codex tool is unavailable merely because it is absent from the native registry. When a Codex browser, node_repl, cua_repl, or computer tool is listed, use it for browser requests instead of substituting WebFetch, web search, curl, or another native tool.`;
+
 export function resolveModel(model: string): string {
   const resolved = MODEL_ALIASES[model] ?? model;
   if (!/^[a-zA-Z0-9._-]+$/.test(resolved) || (!resolved.startsWith("claude-") && !["opus", "sonnet", "haiku"].includes(resolved))) {
@@ -25,6 +27,7 @@ export function buildClaudeArgs(request: ResponsesRequest): string[] {
     "--no-session-persistence",
     "--output-format", "json",
     "--model", resolveModel(request.model),
+    "--append-system-prompt", CODEX_TOOL_SYSTEM_PROMPT,
     "--json-schema", JSON.stringify(outputSchema(request.tools ?? [])),
   ];
 }

@@ -25,9 +25,14 @@ afterAll(async () => {
 describe("HTTP app", () => {
   test("serves health and models", async () => {
     expect(await (await handleRequest(new Request("http://local/health"))).json()).toEqual({ status: "ok" });
-    const models = await (await handleRequest(new Request("http://local/v1/models"))).json() as { data: unknown[]; models: unknown[] };
+    const models = await (await handleRequest(new Request("http://local/v1/models"))).json() as { data: unknown[]; models: Array<Record<string, unknown>> };
     expect(models.data).toHaveLength(3);
     expect(models.models).toHaveLength(3);
+    expect(models.models[0]).toMatchObject({
+      include_plugin_usage_instructions: true,
+      include_apps_usage_instructions: true,
+      node_repl_disabled: false,
+    });
   });
 
   test("runs a non-streaming response", async () => {

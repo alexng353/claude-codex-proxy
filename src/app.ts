@@ -19,13 +19,19 @@ const modelCatalog = ["opus", "sonnet", "haiku"].map((model, index) => ({
   upgrade: null,
   support_verbosity: false,
   default_verbosity: null,
+  supports_parallel_tool_calls: true,
   apply_patch_tool_type: "freeform",
+  include_skills_usage_instructions: true,
+  include_plugin_usage_instructions: true,
+  include_apps_usage_instructions: true,
+  node_repl_auto_review_required: false,
+  node_repl_disabled: false,
   truncation_policy: { mode: "bytes", limit: 100_000 },
   supports_image_detail_original: true,
   context_window: 200_000,
   experimental_supported_tools: [],
   input_modalities: ["text", "image"],
-  base_instructions: "You are a coding agent. Follow the instructions and use the supplied tools when needed.",
+  base_instructions: "You are a coding agent. Follow the instructions and use every supplied Codex tool when needed. Codex tools are available even when they are not registered as native tools in the underlying model runtime.",
 }));
 
 function authorized(request: Request): boolean {

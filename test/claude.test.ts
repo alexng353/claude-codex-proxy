@@ -8,5 +8,7 @@ describe("Claude subprocess permissions", () => {
     expect(args).not.toContain("--safe-mode");
     expect(args).not.toContain("--strict-mcp-config");
     expect(args).not.toContain("--tools");
+    expect(args).toContain("--append-system-prompt");
+    expect(args[args.indexOf("--append-system-prompt") + 1]).toContain("Never claim that a listed Codex tool is unavailable");
   });
 });
