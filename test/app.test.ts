@@ -10,7 +10,7 @@ let oldClaudeBin: string | undefined;
 beforeAll(async () => {
   directory = await mkdtemp(join(tmpdir(), "claude-codex-proxy-test-"));
   const mock = join(directory, "claude");
-  await writeFile(mock, `#!/bin/sh\nprintf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"mock-ok","tool_calls":[]},"usage":{"input_tokens":5,"output_tokens":2}}'\n`);
+  await writeFile(mock, `#!/bin/sh\nprintf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"mock-ok","tool_calls":[]},"usage":{"input_tokens":440960,"output_tokens":2,"cache_read_input_tokens":180000}}'\n`);
   await chmod(mock, 0o755);
   oldClaudeBin = process.env.CLAUDE_BIN;
   process.env.CLAUDE_BIN = mock;
@@ -42,7 +42,8 @@ describe("HTTP app", () => {
       body: JSON.stringify({ model: "sonnet", input: "hello" }),
     }));
     expect(response.status).toBe(200);
-    const body = await response.json() as { output: Array<{ content: Array<{ text: string }> }> };
+    const body = await response.json() as { output: Array<{ content: Array<{ text: string }> }>; usage: { input_tokens: number } };
     expect(body.output[0].content[0].text).toBe("mock-ok");
+    expect(body.usage.input_tokens).toBeLessThan(1_000);
   });
 });

@@ -46,6 +46,11 @@ function parseResult(stdout: string): ClaudeResult {
   throw new Error("Claude CLI did not return a result");
 }
 
+export function estimateVisibleTokens(value: string): number {
+  if (!value) return 0;
+  return Math.max(1, Math.ceil(Buffer.byteLength(value, "utf8") / 4));
+}
+
 export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput> {
   const args = buildClaudeArgs(request);
   const prepared = await prepareClaudePrompt(request);
@@ -75,10 +80,12 @@ export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput>
   if (!structured || typeof structured.text !== "string" || !Array.isArray(structured.tool_calls)) {
     throw new Error("Claude CLI returned invalid structured output");
   }
-  const inputTokens = (result.usage?.input_tokens ?? 0)
-    + (result.usage?.cache_creation_input_tokens ?? 0)
-    + (result.usage?.cache_read_input_tokens ?? 0);
-  const outputTokens = result.usage?.output_tokens ?? 0;
+  // Claude Code's usage includes its private system prompt, native tool schemas,
+  // plugins, MCP definitions, and cache activity. Reporting that hidden runtime
+  // overhead makes Codex believe its own conversation exceeds the context window.
+  // Only report the request/output content that Codex can retain or compact.
+  const inputTokens = estimateVisibleTokens(prepared.prompt);
+  const outputTokens = estimateVisibleTokens(structured.text + JSON.stringify(structured.tool_calls));
   return {
     text: structured.text,
     toolCalls: structured.tool_calls,
