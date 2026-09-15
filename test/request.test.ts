@@ -38,6 +38,14 @@ describe("Responses request adapter", () => {
     expect(requestToPrompt({ model: "sonnet", input: "open a page", tools })).not.toContain("undefined");
   });
 
+  test("normalizes deferred Codex tool search", () => {
+    const tools = [{ type: "tool_search", description: "Search deferred tools" }];
+    expect(toolDescriptors(tools)).toEqual([
+      expect.objectContaining({ proxyName: "__codex_tool_search", type: "tool_search" }),
+    ]);
+    expect(JSON.stringify(outputSchema(tools))).toContain('"__codex_tool_search"');
+  });
+
   test("materializes computer screenshots for Claude's Read tool", async () => {
     const prepared = await prepareClaudePrompt({
       model: "sonnet",

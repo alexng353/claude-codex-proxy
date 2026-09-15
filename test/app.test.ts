@@ -32,6 +32,7 @@ describe("HTTP app", () => {
       include_plugin_usage_instructions: true,
       include_apps_usage_instructions: true,
       node_repl_disabled: false,
+      supports_search_tool: true,
     });
   });
 

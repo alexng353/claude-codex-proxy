@@ -26,6 +26,9 @@ export type ResponseInputItem = {
   arguments?: string;
   input?: string;
   output?: string | unknown;
+  tools?: unknown[];
+  execution?: string;
+  status?: string;
   action?: unknown;
   actions?: unknown[];
   namespace?: string;

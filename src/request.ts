@@ -4,12 +4,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 export const COMPUTER_TOOL_NAME = "__codex_computer_use";
+export const TOOL_SEARCH_NAME = "__codex_tool_search";
 
 export type ToolDescriptor = {
   proxyName: string;
   name: string;
   namespace?: string;
-  type: "function" | "custom" | "computer";
+  type: "function" | "custom" | "computer" | "tool_search";
   description?: string;
   contract?: unknown;
 };
@@ -17,6 +18,24 @@ export type ToolDescriptor = {
 export function toolDescriptors(tools: ResponseTool[]): ToolDescriptor[] {
   const descriptors: ToolDescriptor[] = [];
   for (const tool of tools) {
+    if (tool.type === "tool_search") {
+      descriptors.push({
+        proxyName: TOOL_SEARCH_NAME,
+        name: "tool_search",
+        type: "tool_search",
+        description: tool.description ?? "Search deferred Codex tools and load matching tools for the next model call.",
+        contract: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Specific names and capabilities of the deferred tools to load." },
+            limit: { type: "number", description: "Maximum tools to load. Defaults to 8." },
+          },
+          required: ["query"],
+          additionalProperties: false,
+        },
+      });
+      continue;
+    }
     if (tool.type === "namespace") {
       descriptors.push(...toolDescriptors(tool.tools ?? []).map((nested) => ({
         ...nested,
@@ -51,6 +70,12 @@ const textFromContent = (content: ResponseInputItem["content"]): string => {
 };
 
 const serializeItem = (item: ResponseInputItem): string => {
+  if (item.type === "tool_search_call") {
+    return `<assistant_tool_call name=${JSON.stringify(TOOL_SEARCH_NAME)} call_id=${JSON.stringify(item.call_id)}>\n${JSON.stringify(item.arguments ?? {})}\n</assistant_tool_call>`;
+  }
+  if (item.type === "tool_search_output") {
+    return `<tool_result call_id=${JSON.stringify(item.call_id)}>\n${JSON.stringify(item.tools ?? [])}\n</tool_result>`;
+  }
   if (item.type === "function_call" || item.type === "custom_tool_call") {
     return `<assistant_tool_call name=${JSON.stringify(item.name)} call_id=${JSON.stringify(item.call_id)}>\n${item.arguments ?? item.input ?? "{}"}\n</assistant_tool_call>`;
   }
@@ -105,7 +130,7 @@ export function requestToPrompt(request: ResponsesRequest): string {
 ${tools.map(describeTool).join("\n")}
 </available_tools>
 
-You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls even when Claude has an equivalent built-in tool. For a function tool, arguments must be a JSON object encoded as a string. For a custom tool, arguments must be the exact raw input string. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. You may use Claude's Read tool to inspect screenshot paths included in computer results.`;
+You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls even when Claude has an equivalent built-in tool. For a function tool, arguments must be a JSON object encoded as a string. For a custom tool, arguments must be the exact raw input string. For ${TOOL_SEARCH_NAME}, arguments must be {"query":"specific tool names and capabilities","limit":8} encoded as JSON; use it before concluding that an instructed MCP, plugin, app, browser, node_repl, or cua_repl tool is unavailable. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. You may use Claude's Read tool to inspect screenshot paths included in computer results.`;
 
   return [
     request.instructions ? `<instructions>\n${request.instructions}\n</instructions>` : "",

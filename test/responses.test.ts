@@ -39,4 +39,15 @@ describe("Responses API output", () => {
     });
     expect(await streamResponse(response).text()).toContain('"type":"computer_call"');
   });
+
+  test("returns client tool search calls for deferred MCP discovery", () => {
+    const searchRequest = { ...request, tools: [{ type: "tool_search" }] };
+    const searchOutput = { ...output, toolCalls: [{ name: "__codex_tool_search", arguments: '{"query":"browser cua_repl node_repl","limit":8}' }] };
+    const response = responseObject(searchRequest, searchOutput);
+    expect(response.output[1]).toMatchObject({
+      type: "tool_search_call",
+      execution: "client",
+      arguments: { query: "browser cua_repl node_repl", limit: 8 },
+    });
+  });
 });

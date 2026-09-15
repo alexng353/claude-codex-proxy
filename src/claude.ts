@@ -27,6 +27,7 @@ export function buildClaudeArgs(request: ResponsesRequest): string[] {
     "--no-session-persistence",
     "--output-format", "json",
     "--model", resolveModel(request.model),
+    "--disallowed-tools", "ToolSearch,WebFetch,WebSearch",
     "--append-system-prompt", CODEX_TOOL_SYSTEM_PROMPT,
     "--json-schema", JSON.stringify(outputSchema(request.tools ?? [])),
   ];

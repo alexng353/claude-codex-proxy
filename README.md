@@ -99,12 +99,14 @@ export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 - Parallel tool calls
 - Codex Desktop computer/browser actions and screenshot results
 - Codex plugin, app, skill, and Node/CUA REPL capability metadata
+- Client-side `tool_search` discovery for deferred Codex MCP/plugin tools
 
 ## Current limitations
 
 - Streaming is protocol-compatible SSE, but Claude's text is emitted after its structured response completes rather than token by token.
 - Browser screenshots returned through `computer_call_output` are materialized temporarily for Claude to inspect. General image/file input parts are not yet forwarded.
 - OpenAI-hosted tools are not reimplemented by the proxy. Codex-local tools are passed through, while tools configured in Claude Code may also execute directly inside the unrestricted Claude subprocess.
+- Claude Code's native `ToolSearch`, `WebFetch`, and `WebSearch` are disabled because they conflict with Codex's deferred-tool and Browser routing. Codex-provided browser, search, app, plugin, and MCP tools remain available through the Responses tool loop.
 - Each turn is stateless at the proxy layer. Codex sends the active conversation history again, which favors correctness over prompt-cache efficiency.
 - Claude Code changes can affect compatibility because its CLI JSON format is not a stable third-party provider API.
 

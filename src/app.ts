@@ -26,6 +26,7 @@ const modelCatalog = ["opus", "sonnet", "haiku"].map((model, index) => ({
   include_apps_usage_instructions: true,
   node_repl_auto_review_required: false,
   node_repl_disabled: false,
+  supports_search_tool: true,
   truncation_policy: { mode: "bytes", limit: 100_000 },
   supports_image_detail_original: true,
   context_window: 200_000,

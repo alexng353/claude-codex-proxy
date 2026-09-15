@@ -1,5 +1,5 @@
 import type { ProxyOutput, ResponsesRequest } from "./types";
-import { COMPUTER_TOOL_NAME, toolDescriptors } from "./request";
+import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, toolDescriptors } from "./request";
 
 type OutputItem = Record<string, unknown>;
 
@@ -16,6 +16,22 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
   const descriptors = toolDescriptors(request.tools ?? []);
   for (const call of output.toolCalls) {
     const descriptor = descriptors.find((tool) => tool.proxyName === call.name);
+    if (call.name === TOOL_SEARCH_NAME || descriptor?.type === "tool_search") {
+      let argumentsValue: unknown;
+      try {
+        argumentsValue = JSON.parse(call.arguments);
+      } catch {
+        throw new Error("Tool search arguments must be valid JSON");
+      }
+      if (!argumentsValue || typeof argumentsValue !== "object" || typeof (argumentsValue as { query?: unknown }).query !== "string") {
+        throw new Error("Tool search arguments must include a query string");
+      }
+      items.push({
+        id: id("ts"), type: "tool_search_call", status: "completed",
+        call_id: id("call"), execution: "client", arguments: argumentsValue,
+      });
+      continue;
+    }
     if (call.name === COMPUTER_TOOL_NAME || descriptor?.type === "computer") {
       let action: unknown;
       try {
