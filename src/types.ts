@@ -64,6 +64,6 @@ export type ClaudeResult = {
 
 export type ProxyOutput = {
   text: string;
-  toolCalls: Array<{ name: string; arguments: string }>;
+  toolCalls: Array<{ name: string; arguments: string; callId?: string }>;
   usage: { inputTokens: number; outputTokens: number; totalTokens: number };
 };

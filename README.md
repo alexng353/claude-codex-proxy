@@ -80,6 +80,7 @@ Provider settings cannot be placed in a repository's `.codex/config.toml`; Codex
 | `CLAUDE_BIN` | `claude` | Claude CLI executable path |
 | `CLAUDE_CWD` | proxy process directory | Working directory used by each Claude subprocess |
 | `CLAUDE_TIMEOUT_MS` | `900000` | Per-request timeout |
+| `CLAUDE_SESSION_IDLE_MS` | `900000` | How long an idle Claude tool-loop process is retained |
 | `PROXY_API_KEY` | unset | Optional bearer token |
 
 Binding to a non-loopback address is rejected unless `PROXY_API_KEY` is set. If enabled, add `env_key = "CLAUDE_CODEX_PROXY_KEY"` to the provider and export the same value:
@@ -107,7 +108,7 @@ export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 - Browser screenshots returned through `computer_call_output` are materialized temporarily for Claude to inspect. General image/file input parts are not yet forwarded.
 - OpenAI-hosted tools are not reimplemented by the proxy. Codex-local tools are passed through, while tools configured in Claude Code may also execute directly inside the unrestricted Claude subprocess.
 - Claude Code's native `ToolSearch`, `WebFetch`, and `WebSearch` are disabled because they conflict with Codex's deferred-tool and Browser routing. Codex-provided browser, search, app, plugin, and MCP tools remain available through the Responses tool loop.
-- Each turn is stateless at the proxy layer. Codex sends the active conversation history again, which favors correctness over prompt-cache efficiency.
+- Claude processes are retained while Codex executes requested tools, so tool results continue in the same Claude session without replaying the full history. Abandoned tool sessions expire after `CLAUDE_SESSION_IDLE_MS`; failed or expired continuations fall back to a fresh full-history request.
 - Responses usage reports only Codex-visible request and output content. Claude Code's private system prompt, native tool schemas, plugins, MCP definitions, and cache activity are intentionally excluded so Codex does not compact its conversation based on hidden subprocess overhead.
 - Claude Code changes can affect compatibility because its CLI JSON format is not a stable third-party provider API.
 

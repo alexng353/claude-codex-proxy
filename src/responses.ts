@@ -28,7 +28,7 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
       }
       items.push({
         id: id("ts"), type: "tool_search_call", status: "completed",
-        call_id: id("call"), execution: "client", arguments: argumentsValue,
+        call_id: call.callId ?? id("call"), execution: "client", arguments: argumentsValue,
       });
       continue;
     }
@@ -44,7 +44,7 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
         : undefined;
       items.push({
         id: id("cu"), type: "computer_call", status: "completed",
-        call_id: id("call"), pending_safety_checks: [],
+        call_id: call.callId ?? id("call"), pending_safety_checks: [],
         ...(batched ? { actions: batched } : { action }),
       });
       continue;
@@ -52,13 +52,13 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
     if (descriptor?.type === "custom") {
       items.push({
         id: id("ctc"), type: "custom_tool_call", status: "completed",
-        call_id: id("call"), name: descriptor.name, namespace: descriptor.namespace, input: call.arguments,
+        call_id: call.callId ?? id("call"), name: descriptor.name, namespace: descriptor.namespace, input: call.arguments,
       });
       continue;
     }
     items.push({
       id: id("fc"), type: "function_call", status: "completed",
-      call_id: id("call"), name: descriptor?.name ?? call.name, namespace: descriptor?.namespace, arguments: call.arguments,
+      call_id: call.callId ?? id("call"), name: descriptor?.name ?? call.name, namespace: descriptor?.namespace, arguments: call.arguments,
     });
   }
   return items;

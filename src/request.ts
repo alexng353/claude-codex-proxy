@@ -139,6 +139,16 @@ You are the model inside the Codex agent loop. Return Codex-provided tool reques
   ].filter(Boolean).join("\n\n");
 }
 
+export function continuationRequest(request: ResponsesRequest, callIds: ReadonlySet<string>): ResponsesRequest | undefined {
+  if (typeof request.input === "string") return undefined;
+  const firstOutput = request.input.findIndex((item) =>
+    typeof item.call_id === "string"
+    && callIds.has(item.call_id)
+    && ["function_call_output", "custom_tool_call_output", "computer_call_output", "tool_search_output"].includes(item.type ?? ""));
+  if (firstOutput < 0) return undefined;
+  return { ...request, instructions: undefined, input: request.input.slice(firstOutput) };
+}
+
 export function outputSchema(tools: ResponseTool[]): Record<string, unknown> {
   const descriptors = toolDescriptors(tools);
   const properties: Record<string, unknown> = {

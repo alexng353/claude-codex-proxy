@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { exists } from "node:fs/promises";
-import { COMPUTER_TOOL_NAME, outputSchema, prepareClaudePrompt, requestToPrompt, toolDescriptors, validateRequest } from "../src/request";
+import { COMPUTER_TOOL_NAME, continuationRequest, outputSchema, prepareClaudePrompt, requestToPrompt, toolDescriptors, validateRequest } from "../src/request";
 
 describe("Responses request adapter", () => {
   test("preserves conversation items and tool results", () => {
@@ -64,5 +64,23 @@ describe("Responses request adapter", () => {
 
   test("rejects malformed requests", () => {
     expect(() => validateRequest({ input: "hello" })).toThrow("model is required");
+  });
+
+  test("reduces a tool continuation to new results and following input", () => {
+    const request = {
+      model: "sonnet",
+      instructions: "original instructions",
+      input: [
+        { role: "user", content: "run it" },
+        { type: "function_call", call_id: "call_1", name: "shell", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_1", output: "done" },
+        { role: "user", content: "summarize" },
+      ],
+    };
+    expect(continuationRequest(request, new Set(["call_1"]))).toEqual({
+      ...request,
+      instructions: undefined,
+      input: request.input.slice(2),
+    });
   });
 });

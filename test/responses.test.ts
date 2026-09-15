@@ -11,6 +11,14 @@ describe("Responses API output", () => {
     expect(response.usage.total_tokens).toBe(13);
   });
 
+  test("preserves proxy-assigned tool call IDs", () => {
+    const response = responseObject(request, {
+      ...output,
+      toolCalls: [{ name: "shell", arguments: "{}", callId: "call_session_route" }],
+    });
+    expect(response.output[1].call_id).toBe("call_session_route");
+  });
+
   test("emits Codex-compatible SSE events", async () => {
     const body = await streamResponse(responseObject(request, output)).text();
     expect(body).toContain("event: response.created");
