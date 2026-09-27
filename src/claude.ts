@@ -1,5 +1,28 @@
-import { continuationRequest, outputSchema, prepareClaudePrompt, requestToPrompt, toolDescriptors } from "./request";
-import type { ClaudeResult, ProxyOutput, ResponsesRequest } from "./types";
+import { recordUsage } from "./usage";
+import {
+  findSessions,
+  pruneSessions,
+  registerSession,
+  saveSession,
+  type SessionKey,
+} from "./sessions";
+import {
+  deltaRequest,
+  outputSchema,
+  prepareClaudePrompt,
+  requestToPrompt,
+  requestTools,
+  stableJson,
+  textFromContent,
+  toolDescriptors,
+  type ClaudeInputBlock,
+} from "./request";
+import type {
+  ClaudeResult,
+  ProxyOutput,
+  ResponseInputItem,
+  ResponsesRequest,
+} from "./types";
 
 const MODEL_ALIASES: Record<string, string> = {
   opus: "opus",
@@ -12,30 +35,77 @@ const MODEL_ALIASES: Record<string, string> = {
 
 const CODEX_TOOL_SYSTEM_PROMPT = `You are running inside a Codex agent loop. Tools described in <available_tools> are real, available Codex tools even though they are not present in Claude Code's native tool registry. Invoke them by returning their exact name and arguments in the required structured tool_calls output. Never claim that a listed Codex tool is unavailable merely because it is absent from the native registry. When a Codex browser, node_repl, cua_repl, or computer tool is listed, use it for browser requests instead of substituting WebFetch, web search, curl, or another native tool.`;
 
+const MAX_TOOL_NAME_RETRIES = 2;
+
 export function resolveModel(model: string): string {
   const resolved = MODEL_ALIASES[model] ?? model;
-  if (!/^[a-zA-Z0-9._-]+$/.test(resolved) || (!resolved.startsWith("claude-") && !["opus", "sonnet", "haiku"].includes(resolved))) {
+  if (
+    !/^[a-zA-Z0-9._-]+$/.test(resolved) ||
+    (!resolved.startsWith("claude-") &&
+      !["opus", "sonnet", "haiku"].includes(resolved))
+  ) {
     throw new Error(`Unsupported Claude model: ${model}`);
   }
   return resolved;
 }
 
-export function buildClaudeArgs(request: ResponsesRequest): string[] {
+export function resolveEffort(request: ResponsesRequest): string | undefined {
+  const effort = request.reasoning?.effort;
+  if (effort === undefined)
+    return request.model === "claude-opus-5-5" ? "medium" : undefined;
+  if (!["low", "medium", "high", "xhigh", "max"].includes(effort))
+    throw new Error(`Unsupported Claude effort: ${effort}`);
+  return effort;
+}
+
+/** A fresh session, or a fork of a persisted one (`--resume` + `--fork-session`
+ * so concurrent continuations of one history never share a transcript). */
+export type SessionLaunch = { id: string; resumeFrom?: string };
+
+export function buildClaudeArgs(
+  request: ResponsesRequest,
+  session?: SessionLaunch,
+): string[] {
+  const effort = resolveEffort(request);
   return [
+    ...(effort ? ["--effort", effort] : []),
     "-p",
     "--dangerously-skip-permissions",
-    "--no-session-persistence",
-    "--input-format", "stream-json",
-    "--output-format", "stream-json",
+    ...(session
+      ? [
+          ...(session.resumeFrom
+            ? ["--resume", session.resumeFrom, "--fork-session"]
+            : []),
+          "--session-id",
+          session.id,
+        ]
+      : ["--no-session-persistence"]),
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
     "--verbose",
-    "--model", resolveModel(request.model),
-    "--disallowed-tools", "ToolSearch,WebFetch,WebSearch",
-    "--append-system-prompt", CODEX_TOOL_SYSTEM_PROMPT,
-    "--json-schema", JSON.stringify(outputSchema(request.tools ?? [])),
+    "--model",
+    resolveModel(request.model),
+    "--safe-mode",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--tools",
+    "",
+    "--system-prompt",
+    CODEX_TOOL_SYSTEM_PROMPT,
+    "--json-schema",
+    JSON.stringify(outputSchema(request.tools ?? [])),
   ];
 }
 
-type PendingTurn = { resolve: (result: ClaudeResult) => void; reject: (error: Error) => void };
+type PendingTurn = {
+  resolve: (result: ClaudeResult) => void;
+  reject: (error: Error) => void;
+};
 type ClaudeProcess = {
   stdin: { write(data: string): unknown; flush(): unknown; end(): unknown };
   stdout: ReadableStream<Uint8Array>;
@@ -43,43 +113,116 @@ type ClaudeProcess = {
   exited: Promise<number>;
   kill(): void;
 };
+/** What the worker answered last, so the next request can be checked against it. */
+type LastTurn = { text: string; callIds: Set<string> };
 
-const workersByCallId = new Map<string, ClaudeWorker>();
+/**
+ * Idle workers, least recently used first. Claude Code caches a conversation
+ * only at the end of its own message history, so a new process that receives
+ * the conversation re-flattened into one message misses the cache entirely.
+ * Workers therefore stay alive across Codex turns, including final answers
+ * and tool searches, and receive only the items they have not seen.
+ */
+const idleWorkers = new Set<ClaudeWorker>();
+/** Every running worker, so pruning never deletes a transcript in use. */
+const liveWorkers = new Set<ClaudeWorker>();
+
+const PRUNE_INTERVAL_MS = 300_000;
+let lastPrune = 0;
+
+function maybePrune(): void {
+  if (Date.now() - lastPrune < PRUNE_INTERVAL_MS) return;
+  lastPrune = Date.now();
+  try {
+    pruneSessions(
+      Number(process.env.CLAUDE_SESSION_RETENTION_MS ?? 3_600_000),
+      new Set([...liveWorkers].map((worker) => worker.sessionId)),
+    );
+  } catch (error) {
+    console.error("Unable to prune Claude sessions:", (error as Error).message);
+  }
+}
 
 class ClaudeWorker {
   readonly model: string;
+  readonly effort: string | undefined;
   readonly toolSignature: string;
-  readonly callIds = new Set<string>();
+  readonly instructions: string | undefined;
+  readonly sessionId = crypto.randomUUID();
+  readonly key: SessionKey;
+  /** Count and hash of the Codex input items this worker has consumed. */
+  seenCount = 0;
+  prefixHash = "";
+  lastTurn: LastTurn = { text: "", callIds: new Set() };
   private readonly subprocess: ClaudeProcess;
   private pending?: PendingTurn;
+  private readonly workerId = crypto.randomUUID();
+  private workerTurn = 0;
+  private requestId = "";
+  private attempt = 1;
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
 
-  constructor(request: ResponsesRequest) {
+  constructor(request: ResponsesRequest, resumeFrom?: string) {
     this.model = request.model;
+    this.effort = resolveEffort(request);
     this.toolSignature = toolSignature(request);
-    this.subprocess = Bun.spawn([process.env.CLAUDE_BIN ?? "claude", ...buildClaudeArgs(request)], {
-      stdin: "pipe", stdout: "pipe", stderr: "pipe",
-      cwd: process.env.CLAUDE_CWD || process.cwd(),
-      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "CLAUDECODE")) as Record<string, string>,
-    }) as unknown as ClaudeProcess;
+    this.instructions = request.instructions;
+    this.key = sessionKey(request);
+    maybePrune();
+    try {
+      registerSession(this.sessionId, this.key);
+    } catch (error) {
+      // The map only saves cache; a broken database must not block inference.
+      console.error("Unable to register Claude session:", (error as Error).message);
+    }
+    this.subprocess = Bun.spawn(
+      [
+        process.env.CLAUDE_BIN ?? "claude",
+        ...buildClaudeArgs(request, { id: this.sessionId, resumeFrom }),
+      ],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: process.env.CLAUDE_CWD || process.cwd(),
+        env: Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([key]) =>
+              key !== "CLAUDECODE" && key !== "CLAUDE_CODE_EFFORT_LEVEL",
+          ),
+        ) as Record<string, string>,
+      },
+    ) as unknown as ClaudeProcess;
+    liveWorkers.add(this);
     void this.readStdout().catch((cause) => this.fail(cause));
     void this.readStderr();
     void this.subprocess.exited.then((exitCode) => {
       this.closed = true;
-      this.detach();
+      idleWorkers.delete(this);
+      liveWorkers.delete(this);
       if (this.pending) {
-        const message = this.stderr.trim() || `Claude CLI exited with code ${exitCode}`;
+        const message =
+          this.stderr.trim() || `Claude CLI exited with code ${exitCode}`;
         this.pending.reject(new Error(message));
         this.pending = undefined;
       }
     });
   }
 
-  async run(prompt: string): Promise<ClaudeResult> {
+  async run(
+    content: ClaudeInputBlock[],
+    requestId: string,
+    attempt = 1,
+  ): Promise<ClaudeResult> {
+    this.requestId = requestId;
+    this.attempt = attempt;
+    this.workerTurn++;
     if (this.closed) throw new Error("Claude CLI worker is closed");
-    if (this.pending) throw new Error("Claude CLI worker is already processing a turn");
+    if (this.pending)
+      throw new Error("Claude CLI worker is already processing a turn");
+    idleWorkers.delete(this);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     const timeoutMs = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
     return await new Promise<ClaudeResult>((resolve, reject) => {
@@ -89,37 +232,68 @@ class ClaudeWorker {
         reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       this.pending = {
-        resolve: (result) => { clearTimeout(timeout); resolve(result); },
-        reject: (error) => { clearTimeout(timeout); reject(error); },
+        resolve: (result) => {
+          clearTimeout(timeout);
+          resolve(result);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
       };
-      const message = { type: "user", message: { role: "user", content: [{ type: "text", text: prompt }] } };
+      const message = { type: "user", message: { role: "user", content } };
       this.subprocess.stdin.write(`${JSON.stringify(message)}\n`);
       this.subprocess.stdin.flush();
     });
   }
 
-  retainFor(callIds: string[]): void {
-    this.detach();
-    for (const callId of callIds) {
-      this.callIds.add(callId);
-      workersByCallId.set(callId, this);
+  /** Park the worker until the conversation's next request, or evict it. */
+  park(input: ResponseInputItem[], lastTurn: LastTurn): void {
+    if (this.closed) return;
+    this.seenCount = input.length;
+    this.prefixHash = prefixHash(input, input.length);
+    this.lastTurn = lastTurn;
+    try {
+      saveSession({
+        ...this.key,
+        sessionId: this.sessionId,
+        seenCount: this.seenCount,
+        prefixHash: this.prefixHash,
+        lastText: lastTurn.text,
+        lastCallIds: [...lastTurn.callIds],
+      });
+    } catch (error) {
+      console.error("Unable to save Claude session:", (error as Error).message);
     }
-    const idleMs = Number(process.env.CLAUDE_SESSION_IDLE_MS ?? 900_000);
+    idleWorkers.delete(this);
+    idleWorkers.add(this);
+    const maxIdle = Number(process.env.CLAUDE_MAX_IDLE_WORKERS ?? 8);
+    for (const oldest of idleWorkers) {
+      if (idleWorkers.size <= maxIdle) break;
+      oldest.close();
+    }
+    // Claude Code writes cache entries with a 1-hour TTL; keep the process just
+    // under that so a user returning within the hour still hits its cache.
+    const idleMs = Number(process.env.CLAUDE_SESSION_IDLE_MS ?? 3_300_000);
     this.idleTimer = setTimeout(() => this.close(), idleMs);
     this.idleTimer.unref?.();
   }
 
   close(): void {
+    idleWorkers.delete(this);
     if (this.closed) return;
     this.closed = true;
     if (this.idleTimer) clearTimeout(this.idleTimer);
-    this.detach();
-    try { this.subprocess.stdin.end(); } catch {}
+    try {
+      this.subprocess.stdin.end();
+    } catch {}
   }
 
   private abort(): void {
     this.close();
-    try { this.subprocess.kill(); } catch {}
+    try {
+      this.subprocess.kill();
+    } catch {}
   }
 
   private fail(cause: unknown): void {
@@ -127,13 +301,6 @@ class ClaudeWorker {
     this.pending = undefined;
     this.abort();
     pending?.reject(cause instanceof Error ? cause : new Error(String(cause)));
-  }
-
-  private detach(): void {
-    for (const callId of this.callIds) {
-      if (workersByCallId.get(callId) === this) workersByCallId.delete(callId);
-    }
-    this.callIds.clear();
   }
 
   private async readStdout(): Promise<void> {
@@ -155,6 +322,15 @@ class ClaudeWorker {
     try {
       const value = JSON.parse(line) as ClaudeResult;
       if (value.type !== "result" || !this.pending) return;
+      recordUsage(value, {
+        requestId: this.requestId,
+        workerId: this.workerId,
+        workerTurn: this.workerTurn,
+        model: this.model,
+        effort: this.effort,
+        attempt: this.attempt,
+        launchMode: "minimal",
+      });
       const pending = this.pending;
       this.pending = undefined;
       pending.resolve(value);
@@ -169,26 +345,145 @@ class ClaudeWorker {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      this.stderr = (this.stderr + decoder.decode(value, { stream: true })).slice(-65_536);
+      this.stderr = (
+        this.stderr + decoder.decode(value, { stream: true })
+      ).slice(-65_536);
     }
   }
 }
 
-function continuationWorker(request: ResponsesRequest): ClaudeWorker | undefined {
-  if (typeof request.input === "string") return undefined;
-  for (let index = request.input.length - 1; index >= 0; index--) {
-    const callId = request.input[index].call_id;
-    const worker = callId ? workersByCallId.get(callId) : undefined;
-    if (worker?.model !== request.model) continue;
-    if (worker.toolSignature === toolSignature(request)) return worker;
-    worker.close();
+/** Item types the model produced; Codex echoes them back in the next request. */
+const MODEL_OUTPUT_TYPES = new Set([
+  "function_call",
+  "custom_tool_call",
+  "computer_call",
+  "tool_search_call",
+]);
+
+export function prefixHash(input: ResponseInputItem[], count: number): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  for (const item of input.slice(0, count)) {
+    // Server-assigned ids and statuses are not conversation content.
+    const { id: _id, status: _status, ...content } = item as Record<
+      string,
+      unknown
+    >;
+    hasher.update(stableJson(content));
+    hasher.update("\n");
+  }
+  return hasher.digest("hex");
+}
+
+/**
+ * New items after a worker's last turn, excluding Codex's echo of that turn.
+ * Returns undefined unless the echo accounts for exactly the worker's answer,
+ * so an edited, forked, or compacted history always starts a fresh worker.
+ */
+export function conversationDelta(
+  items: ResponseInputItem[],
+  lastTurn: LastTurn,
+): ResponseInputItem[] | undefined {
+  const unmatchedCalls = new Set(lastTurn.callIds);
+  const expectedText = lastTurn.text.trim();
+  let textMatched = expectedText === "";
+  const delta: ResponseInputItem[] = [];
+  for (const item of items) {
+    if (item.type && MODEL_OUTPUT_TYPES.has(item.type)) {
+      if (!item.call_id || !unmatchedCalls.delete(item.call_id)) return undefined;
+      continue;
+    }
+    if (item.role === "assistant") {
+      if (textMatched || textFromContent(item.content).trim() !== expectedText)
+        return undefined;
+      textMatched = true;
+      continue;
+    }
+    delta.push(item);
+  }
+  if (unmatchedCalls.size > 0 || !textMatched || delta.length === 0)
     return undefined;
+  return delta;
+}
+
+function claimWorker(
+  request: ResponsesRequest,
+): { worker: ClaudeWorker; delta: ResponseInputItem[] } | undefined {
+  const input = inputItems(request);
+  const effort = resolveEffort(request);
+  const signature = toolSignature(request);
+  // Most recently parked first.
+  for (const worker of [...idleWorkers].reverse()) {
+    if (
+      worker.model !== request.model ||
+      worker.effort !== effort ||
+      worker.instructions !== request.instructions ||
+      worker.toolSignature !== signature ||
+      input.length <= worker.seenCount ||
+      prefixHash(input, worker.seenCount) !== worker.prefixHash
+    )
+      continue;
+    const delta = conversationDelta(
+      input.slice(worker.seenCount),
+      worker.lastTurn,
+    );
+    if (!delta) continue;
+    // Claim it so a concurrent fork of the same history gets its own worker.
+    idleWorkers.delete(worker);
+    return { worker, delta };
   }
   return undefined;
 }
 
+/** A string input is shorthand for one user message; later turns send arrays. */
+function inputItems(request: ResponsesRequest): ResponseInputItem[] {
+  return typeof request.input === "string"
+    ? [{ role: "user", content: request.input }]
+    : request.input;
+}
+
+const sha256 = (value: string) =>
+  new Bun.CryptoHasher("sha256").update(value).digest("hex");
+
+function sessionKey(request: ResponsesRequest): SessionKey {
+  return {
+    model: request.model,
+    effort: resolveEffort(request) ?? "",
+    instructionsHash: sha256(request.instructions ?? ""),
+    toolsHash: sha256(toolSignature(request)),
+  };
+}
+
+/** A persisted session whose history this request extends; its process is gone. */
+function findStoredSession(
+  request: ResponsesRequest,
+): { resumeFrom: string; delta: ResponseInputItem[] } | undefined {
+  const input = inputItems(request);
+  let candidates;
+  try {
+    candidates = findSessions(sessionKey(request), input.length);
+  } catch (error) {
+    console.error("Unable to read Claude sessions:", (error as Error).message);
+    return undefined;
+  }
+  for (const session of candidates) {
+    if (prefixHash(input, session.seenCount) !== session.prefixHash) continue;
+    const delta = conversationDelta(input.slice(session.seenCount), {
+      text: session.lastText,
+      callIds: new Set(session.lastCallIds),
+    });
+    if (delta) return { resumeFrom: session.sessionId, delta };
+  }
+  return undefined;
+}
+
+/** Close idle workers; their sessions stay resumable. Used on shutdown and in tests. */
+export function closeIdleWorkers(): void {
+  for (const worker of [...idleWorkers]) worker.close();
+}
+
 function toolSignature(request: ResponsesRequest): string {
-  return JSON.stringify(toolDescriptors(request.tools ?? []).map((tool) => tool.proxyName));
+  // Only the base registry: tools loaded later arrive as conversation items.
+  return stableJson(toolDescriptors(request.tools ?? []));
 }
 
 export function estimateVisibleTokens(value: string): number {
@@ -196,24 +491,60 @@ export function estimateVisibleTokens(value: string): number {
   return Math.max(1, Math.ceil(Buffer.byteLength(value, "utf8") / 4));
 }
 
-export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput> {
-  let worker = continuationWorker(request);
-  const delta = worker ? continuationRequest(request, worker.callIds) : undefined;
-  let prepared = await prepareClaudePrompt(delta ?? request);
+type StructuredOutput = NonNullable<ClaudeResult["structured_output"]>;
+
+function structuredOutput(
+  worker: ClaudeWorker,
+  result: ClaudeResult,
+): StructuredOutput {
+  if (result.is_error) {
+    worker.close();
+    throw new Error(result.result || "Claude CLI returned an error");
+  }
+  let structured: ClaudeResult["structured_output"];
+  try {
+    structured =
+      result.structured_output ??
+      (JSON.parse(result.result ?? "{}") as ClaudeResult["structured_output"]);
+  } catch {
+    worker.close();
+    throw new Error("Claude CLI returned invalid structured output");
+  }
+  if (
+    !structured ||
+    typeof structured.text !== "string" ||
+    !Array.isArray(structured.tool_calls)
+  ) {
+    worker.close();
+    throw new Error("Claude CLI returned invalid structured output");
+  }
+  return structured;
+}
+
+export async function runClaude(
+  request: ResponsesRequest,
+): Promise<ProxyOutput> {
+  const requestId = crypto.randomUUID();
+  const live = claimWorker(request);
+  const stored = live ? undefined : findStoredSession(request);
+  const delta = live?.delta ?? stored?.delta;
+  let worker = live?.worker ?? new ClaudeWorker(request, stored?.resumeFrom);
+  let prepared = await prepareClaudePrompt(
+    delta ? deltaRequest(request, delta) : request,
+  );
   let result: ClaudeResult;
   try {
-    result = await (worker ??= new ClaudeWorker(request)).run(prepared.prompt);
+    result = await worker.run(prepared.content, requestId);
   } catch (error) {
-    if (!delta) {
-      worker?.close();
-      throw error;
-    }
-    worker!.close();
+    worker.close();
+    if (!delta) throw error;
+    // A parked worker can die while idle, or a transcript can be missing;
+    // replay the full request once in a fresh session.
     await prepared.cleanup();
     prepared = await prepareClaudePrompt(request);
     worker = new ClaudeWorker(request);
     try {
-      result = await worker.run(prepared.prompt);
+      result = await worker.run(prepared.content, requestId, 2);
     } catch (fallbackError) {
       worker.close();
       throw fallbackError;
@@ -221,42 +552,59 @@ export async function runClaude(request: ResponsesRequest): Promise<ProxyOutput>
   } finally {
     await prepared.cleanup();
   }
-  if (result.is_error) {
-    worker.close();
-    throw new Error(result.result || "Claude CLI returned an error");
-  }
-  let structured: ClaudeResult["structured_output"];
-  try {
-    structured = result.structured_output ?? JSON.parse(result.result ?? "{}") as ClaudeResult["structured_output"];
-  } catch {
-    worker.close();
-    throw new Error("Claude CLI returned invalid structured output");
-  }
-  if (!structured || typeof structured.text !== "string" || !Array.isArray(structured.tool_calls)) {
-    worker.close();
-    throw new Error("Claude CLI returned invalid structured output");
-  }
-  const allowedTools = new Set(toolDescriptors(request.tools ?? []).map((tool) => tool.proxyName));
-  for (const call of structured.tool_calls) {
-    if (!allowedTools.has(call.name)) {
+
+  // Tool names are validated here instead of by a schema enum (see
+  // outputSchema). Correct them in the same process to keep its cache.
+  const allowedTools = new Set(
+    toolDescriptors(requestTools(request)).map((tool) => tool.proxyName),
+  );
+  let structured = structuredOutput(worker, result);
+  for (let retry = 0; ; retry++) {
+    const unknown = structured.tool_calls
+      .map((call) => call.name)
+      .filter((name) => !allowedTools.has(name));
+    if (unknown.length === 0) break;
+    if (retry >= MAX_TOOL_NAME_RETRIES) {
       worker.close();
-      throw new Error(`Claude CLI requested unavailable tool: ${call.name}`);
+      throw new Error(`Claude CLI requested unavailable tool: ${unknown[0]}`);
     }
+    const correction = `<tool_error>\nNo tool calls were executed. Unknown tool name(s): ${unknown.join(", ")}. Use only exact names from <available_tools> or tools loaded by tool search, formatted namespace.name for namespaced tools. Reply again with the corrected text and tool_calls.\n</tool_error>`;
+    try {
+      result = await worker.run(
+        [{ type: "text", text: correction }],
+        requestId,
+        retry + 2,
+      );
+    } catch (error) {
+      worker.close();
+      throw error;
+    }
+    structured = structuredOutput(worker, result);
   }
-  const toolCalls = structured.tool_calls.map((call) => ({ ...call, callId: `call_${crypto.randomUUID().replaceAll("-", "")}` }));
-  const descriptorTypes = new Map(toolDescriptors(request.tools ?? []).map((tool) => [tool.proxyName, tool.type]));
-  const canContinue = toolCalls.length > 0 && toolCalls.every((call) => descriptorTypes.get(call.name) !== "tool_search");
-  if (canContinue) worker.retainFor(toolCalls.map((call) => call.callId));
-  else worker.close();
+
+  const toolCalls = structured.tool_calls.map((call) => ({
+    ...call,
+    callId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
+  }));
+  worker.park(inputItems(request), {
+    text: structured.text,
+    callIds: new Set(toolCalls.map((call) => call.callId)),
+  });
   // Claude Code's usage includes its private system prompt, native tool schemas,
   // plugins, MCP definitions, and cache activity. Reporting that hidden runtime
   // overhead makes Codex believe its own conversation exceeds the context window.
   // Only report the request/output content that Codex can retain or compact.
   const inputTokens = estimateVisibleTokens(requestToPrompt(request));
-  const outputTokens = estimateVisibleTokens(structured.text + JSON.stringify(toolCalls));
+  const outputTokens = estimateVisibleTokens(
+    structured.text + JSON.stringify(toolCalls),
+  );
   return {
     text: structured.text,
     toolCalls,
-    usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+    },
   };
 }

@@ -1,0 +1,54 @@
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { findSessions, pruneSessions, registerSession, saveSession } from "../src/sessions";
+
+let directory = "";
+const saved: Record<string, string | undefined> = {};
+const key = { model: "m", effort: "low", instructionsHash: "i", toolsHash: "t" };
+
+beforeAll(async () => {
+  directory = await mkdtemp(join(tmpdir(), "claude-codex-sessions-"));
+  for (const name of ["PROXY_STATE_DIR", "CLAUDE_CONFIG_DIR"]) saved[name] = process.env[name];
+  process.env.PROXY_STATE_DIR = join(directory, "state");
+  process.env.CLAUDE_CONFIG_DIR = join(directory, "claude");
+});
+
+afterAll(async () => {
+  for (const [name, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  await rm(directory, { recursive: true, force: true });
+});
+
+test("finds only completed sessions with the same key and a shorter history", () => {
+  const id = crypto.randomUUID();
+  registerSession(id, key);
+  expect(findSessions(key, 10)).toHaveLength(0);
+  saveSession({ ...key, sessionId: id, seenCount: 3, prefixHash: "h", lastText: "x", lastCallIds: ["c"] });
+  expect(findSessions(key, 10)).toEqual([
+    { ...key, sessionId: id, seenCount: 3, prefixHash: "h", lastText: "x", lastCallIds: ["c"] },
+  ]);
+  expect(findSessions(key, 3)).toHaveLength(0);
+  expect(findSessions({ ...key, toolsHash: "other" }, 10)).toHaveLength(0);
+});
+
+test("pruning deletes expired sessions and their transcripts, but not kept ones", () => {
+  const old = crypto.randomUUID();
+  const kept = crypto.randomUUID();
+  const project = join(directory, "claude", "projects", "-tmp-x");
+  mkdirSync(join(project, old), { recursive: true });
+  writeFileSync(join(project, `${old}.jsonl`), "{}");
+  writeFileSync(join(project, `${kept}.jsonl`), "{}");
+  registerSession(old, key);
+  registerSession(kept, key);
+  const removed = pruneSessions(-1, new Set([kept]));
+  expect(removed).toBeGreaterThanOrEqual(1);
+  expect(existsSync(join(project, `${old}.jsonl`))).toBe(false);
+  expect(existsSync(join(project, old))).toBe(false);
+  expect(existsSync(join(project, `${kept}.jsonl`))).toBe(true);
+  expect(findSessions(key, 10).map((s) => s.sessionId)).not.toContain(old);
+});

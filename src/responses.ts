@@ -1,5 +1,5 @@
 import type { ProxyOutput, ResponsesRequest } from "./types";
-import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, toolDescriptors } from "./request";
+import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, requestTools, toolDescriptors } from "./request";
 
 type OutputItem = Record<string, unknown>;
 
@@ -13,7 +13,7 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
       content: [{ type: "output_text", annotations: [], text: output.text }],
     });
   }
-  const descriptors = toolDescriptors(request.tools ?? []);
+  const descriptors = toolDescriptors(requestTools(request));
   for (const call of output.toolCalls) {
     const descriptor = descriptors.find((tool) => tool.proxyName === call.name);
     if (call.name === TOOL_SEARCH_NAME || descriptor?.type === "tool_search") {

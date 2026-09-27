@@ -43,6 +43,7 @@ export type ResponsesRequest = {
   tool_choice?: unknown;
   stream?: boolean;
   max_output_tokens?: number;
+  reasoning?: { effort?: string };
 };
 
 export type ClaudeResult = {
@@ -54,6 +55,7 @@ export type ClaudeResult = {
     text: string;
     tool_calls: Array<{ name: string; arguments: string }>;
   };
+  modelUsage?: Record<string, unknown>;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
