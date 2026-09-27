@@ -98,6 +98,7 @@ export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/responses`, streaming and non-streaming
+- Assistant message phases: `commentary` for text accompanying tool calls, `final_answer` for text-only replies
 - Text input and multi-item agent history
 - Function, custom, and namespaced tool calls
 - Parallel tool calls
