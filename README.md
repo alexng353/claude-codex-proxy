@@ -146,3 +146,12 @@ Stable instructions and a canonically ordered tool registry precede changing con
 `--no-session-persistence` disables disk transcripts; it does not disable prompt caching or in-memory tool continuation. Fresh-worker requests can still reuse a stable provider cache prefix. Cache hits depend on the provider, prefix identity, and expiry; no fixed hit rate is promised for arbitrary conversations.
 
 Measured on 2026-09-27 with Claude Code 2.1.283 and exact Opus 5.5: three identical fresh requests used cache read/write tokens of 99076/29572, 99076/29576, 99076/29573 before cleanup, versus 0/9798, 9798/0, 9798/0 after. A two-call tool loop after cleanup read 10236 and created 180 on the continuation. These are a controlled synthetic workload, not estimates of all production traffic or billing.
+
+### Local Codex Desktop customizations
+
+Alex's existing Linux desktop integration has an incremental
+[model-label and effort-slider patch](desktop/README.md). The optional
+[restart-codex-desktop skill](skills/restart-codex-desktop/SKILL.md) restarts the
+Arch/Hyprland app in an independent job and verifies that its window returns.
+The restart helper's safety checks run with
+`python3 -m unittest discover -s test -p '*_test.py'`.

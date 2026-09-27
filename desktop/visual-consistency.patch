@@ -1,0 +1,58 @@
+--- a/patches.py
++++ b/patches.py
+@@ -41,8 +41,8 @@
+     s=replace_once(s,anchor,anchor+'\n  s = alexMiddleClickTarget(t, i, n, s);')
+     p='/* ALEX_CODEX_PICKER_V1 */\n'+helper+'\n'+p
+     p=replace_once(p,'function tXe(e) {','function tXe(e) {\n  e = alexPickerProps(e);')
+-    p=replace_once(p,'function SW(e) {','function SW(e) {\n  if (e.model === "claude-opus-5-5") e = {...e, displayName:"Opus 5.5", labelClassName:[e.labelClassName,"alex-opus-label"].filter(Boolean).join(" ")};')
+-    p=replace_once(p,'(0, wW.jsx)(`span`, { className: f, children: u })','(0, wW.jsx)(`span`, { className: f, style: n === "claude-opus-5-5" ? {color:"#fff"} : undefined, children: u })')
++    p=replace_once(p,'function SW(e) {','function SW(e) {\n  if (e.model === "claude-opus-5-5") e = {...e, displayName:"Opus 5.5"};')
++    p=replace_once(p,'className: IZ.SimpleView,\n          children: [A, M, ee],','className: IZ.SimpleView,\n          style: alexEffortStyle(f?.model),\n          children: [A, M, ee],')
+     for anchor in ['children: (0, w3.jsx)(Y, { ...uW[$e] }),']:
+         if p.count(anchor)!=2: raise PatchError('Expected two composer effort labels')
+         p=p.replace(anchor,'children: Ce === "claude-opus-5-5" ? alexEffortLabel($e) : (0, w3.jsx)(Y, { ...uW[$e] }),')
+--- a/behavior.js
++++ b/behavior.js
+@@ -26,9 +26,23 @@
+   const models = props.models || [];
+   const options = props.modelOptions || models.map(model => ({model, disabledReason:null}));
+   return {...props,
+-    ...(props.model===model.model?{hasWorkModeAccess:false,showReasoningEffortControls:true}:{}),
++    // Use the native picker and preserve each model's actual effort choices.
++    ...(props.model===model.model?{
++      showReasoningEffortControls:true,
++      powerSelections:model.supportedReasoningEfforts.map(({reasoningEffort},powerSettingIndex)=>({
++        id:model.model+':'+reasoningEffort, model:model.model, modelLabel:'Opus 5.5',
++        reasoningEffort, powerSettingIndex, sliderLabel:alexEffortLabel(reasoningEffort)
++      }))
++    }:{}),
+     models:models.some(x=>x.model===model.model)?models.map(x=>x.model===model.model?{...x,...model}:x):[...models,model],
+     modelOptions:options.some(x=>x.model.model===model.model)?options.map(x=>x.model.model===model.model?{...x,model:{...x.model,...model}}:x):[...options,{model,disabledReason:null}]};
+ }
+ 
+ function alexEffortLabel(effort) { return ({low:"Low",medium:"Medium",high:"High",xhigh:"Extra High",max:"Max"})[effort] || effort; }
++
++// Scope these tokens to the effort control, including its fill and particles.
++function alexEffortStyle(model) {
++  return typeof model === 'string' && model.startsWith('claude-')
++    ? {'--color-chart-purple':'#D97757','--color-chart-blue':'#D97757'}
++    : undefined;
++}
+--- a/test-behavior.cjs
++++ b/test-behavior.cjs
+@@ -23,5 +23,14 @@
+ assert.equal(opus.supportedReasoningEfforts.map(x=>x.reasoningEffort).join(','),'low,medium,high,xhigh,max');
+ assert.equal(c.alexEffortLabel('low'),'Low');
+ 
+-assert.equal(c.alexPickerProps({model:'claude-opus-5-5',hasWorkModeAccess:true}).hasWorkModeAccess,false);
++assert.equal(c.alexPickerProps({model:'claude-opus-5-5',hasWorkModeAccess:true}).hasWorkModeAccess,true);
+ assert.equal(c.alexPickerProps({model:'gpt-6-astra',hasWorkModeAccess:true}).hasWorkModeAccess,true);
++
++const claudePicker=c.alexPickerProps({model:'claude-opus-5-5',hasWorkModeAccess:true,powerSelections:[]});
++assert.equal(claudePicker.powerSelections.map(x=>x.reasoningEffort).join(','),'low,medium,high,xhigh,max');
++assert.ok(claudePicker.powerSelections.every(x=>x.model==='claude-opus-5-5'));
++const gptSelections=[{id:'gpt-6-astra:high',model:'gpt-6-astra',reasoningEffort:'high'}];
++assert.equal(c.alexPickerProps({model:'gpt-6-astra',powerSelections:gptSelections}).powerSelections,gptSelections);
++assert.equal(c.alexEffortStyle('claude-opus-5-5')['--color-chart-purple'],'#D97757');
++assert.equal(c.alexEffortStyle('gpt-6-astra'),undefined);
++console.log('Native slider choices and provider-scoped palette passed');
