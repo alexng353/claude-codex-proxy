@@ -10,6 +10,8 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
   if (output.text) {
     items.push({
       id: id("msg"), type: "message", status: "completed", role: "assistant",
+      // Text accompanying a tool call is progress; a text-only result ends the turn.
+      phase: output.toolCalls.length > 0 ? "commentary" : "final_answer",
       content: [{ type: "output_text", annotations: [], text: output.text }],
     });
   }
