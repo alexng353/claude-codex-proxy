@@ -11,6 +11,30 @@ describe("Responses API output", () => {
     expect(response.usage.total_tokens).toBe(13);
   });
 
+  for (const [phase, toolCalls] of [
+    ["commentary", output.toolCalls],
+    ["final_answer", []],
+  ] as const) {
+    test(`preserves ${phase} through JSON and SSE message lifecycle`, async () => {
+      const response = responseObject(request, { ...output, toolCalls: [...toolCalls] });
+      expect(response.output[0]).toMatchObject({ type: "message", phase });
+      const body = await streamResponse(response).text();
+      const events = body.split("\n")
+        .filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+      for (const type of ["response.output_item.added", "response.output_item.done"]) {
+        const event = events.find((event) => event.type === type && event.item.type === "message");
+        expect(event.item.phase).toBe(phase);
+      }
+      expect(events.find((event) => event.type === "response.completed").response.output[0].phase).toBe(phase);
+    });
+  }
+
+  test("tool-only output does not invent a final answer", () => {
+    const response = responseObject(request, { ...output, text: "" });
+    expect(response.output.map((item) => item.type)).toEqual(["function_call"]);
+    expect(response.output[0]).not.toHaveProperty("phase");
+  });
+
   test("preserves proxy-assigned tool call IDs", () => {
     const response = responseObject(request, {
       ...output,
