@@ -1,11 +1,15 @@
 import type { ProxyOutput, ResponsesRequest } from "./types";
-import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, requestTools, toolDescriptors } from "./request";
+import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, encodeCompaction, requestTools, toolDescriptors } from "./request";
 
 type OutputItem = Record<string, unknown>;
 
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
 
 function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem[] {
+  // Codex rejects a compaction response unless it holds exactly one compaction item.
+  if (output.compaction !== undefined) {
+    return [{ id: id("cmp"), type: "compaction", encrypted_content: encodeCompaction(output.compaction) }];
+  }
   const items: OutputItem[] = [];
   if (output.text) {
     items.push({

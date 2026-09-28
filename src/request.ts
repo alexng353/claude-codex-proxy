@@ -7,6 +7,62 @@ import type {
 export const COMPUTER_TOOL_NAME = "__codex_computer_use";
 export const TOOL_SEARCH_NAME = "__codex_tool_search";
 
+/**
+ * Codex's own compaction prompt and summary prefix (codex-rs
+ * prompts/templates/compact, 0.155), so a Claude conversation compacted here
+ * reads like one Codex compacted locally.
+ */
+export const SUMMARIZATION_PROMPT = `You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.`;
+export const SUMMARY_PREFIX = `Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:`;
+
+/**
+ * Marks compaction items this proxy wrote. Codex stores `encrypted_content`
+ * opaquely and returns it unchanged in later requests; an item OpenAI wrote is
+ * encrypted for OpenAI and cannot be read here.
+ */
+const COMPACTION_PREFIX = "claude-codex-proxy.compaction.v1:";
+const COMPACTION_ITEM_TYPES = new Set([
+  "compaction",
+  "compaction_summary",
+  "context_compaction",
+]);
+
+/** Codex remote compaction (v2) appends this item to the history it wants summarized. */
+export const isCompactionRequest = (request: ResponsesRequest): boolean =>
+  Array.isArray(request.input) &&
+  request.input.at(-1)?.type === "compaction_trigger";
+
+export const encodeCompaction = (summary: string): string =>
+  COMPACTION_PREFIX + Buffer.from(summary, "utf8").toString("base64");
+
+function compactionSummary(item: ResponseInputItem): string {
+  const content = item.encrypted_content;
+  if (typeof content !== "string" || !content.startsWith(COMPACTION_PREFIX))
+    throw new Error(
+      "Unsupported Claude input: this history contains a compaction item another provider wrote, which Claude cannot read. Start a new task.",
+    );
+  return Buffer.from(
+    content.slice(COMPACTION_PREFIX.length),
+    "base64",
+  ).toString("utf8");
+}
+
+/** Rejects unreadable compaction items before any Claude process starts. */
+export function validateCompactionItems(request: ResponsesRequest): void {
+  if (typeof request.input === "string") return;
+  for (const item of request.input)
+    if (item.type && COMPACTION_ITEM_TYPES.has(item.type))
+      compactionSummary(item);
+}
+
 export type ToolDescriptor = {
   proxyName: string;
   name: string;
@@ -117,6 +173,12 @@ export const textFromContent = (
 };
 
 const serializeItem = (item: ResponseInputItem): string => {
+  if (item.type === "compaction_trigger") {
+    return `<user>\n${SUMMARIZATION_PROMPT}\n\nPut the whole summary in text and leave tool_calls empty.\n</user>`;
+  }
+  if (item.type && COMPACTION_ITEM_TYPES.has(item.type)) {
+    return `<user>\n${SUMMARY_PREFIX}\n${compactionSummary(item)}\n</user>`;
+  }
   if (item.type === "tool_search_call") {
     return `<assistant_tool_call name=${JSON.stringify(TOOL_SEARCH_NAME)} call_id=${JSON.stringify(item.call_id)}>\n${JSON.stringify(item.arguments ?? {})}\n</assistant_tool_call>`;
   }

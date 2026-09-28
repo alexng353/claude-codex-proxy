@@ -71,6 +71,10 @@ To switch back, set `model_provider = "openai"` and choose an OpenAI model, or r
 
 Provider settings cannot be placed in a repository's `.codex/config.toml`; Codex ignores project-local provider overrides for credential and routing safety.
 
+### Sub-agents on other models
+
+A spawned sub-agent inherits its parent task's provider; Codex changes only the model (`core/src/agent/child_config.rs`, 0.155). A task on `claude_subscription` therefore cannot run an OpenAI-model sub-agent: the request reaches this Claude-only endpoint and fails with `Unsupported Claude model`. The proxy never substitutes a Claude model. To mix models, put both behind one provider that dispatches by exact model. Alex's Linux setup does this with a local router at `openai_base_url`: tasks use the built-in `openai` provider, Claude requests reach this proxy, and GPT requests go to OpenAI unchanged. See [desktop/README.md](desktop/README.md).
+
 ## Configuration
 
 | Environment variable | Default | Purpose |
@@ -105,6 +109,7 @@ export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 - Codex Desktop computer/browser actions and screenshot results
 - Codex plugin, app, skill, and Node/CUA REPL capability metadata
 - Client-side `tool_search` discovery for deferred Codex MCP/plugin tools
+- Codex remote compaction (v2): a request whose input ends in `compaction_trigger` returns exactly one `compaction` item holding Claude's handoff summary, written with Codex's own compaction prompt. When that item returns in a later history, the proxy expands it into the summary message Codex would have kept after local compaction. A compaction item another provider encrypted cannot be read, so the request is rejected with HTTP 400 rather than dropped.
 
 ## Current limitations
 

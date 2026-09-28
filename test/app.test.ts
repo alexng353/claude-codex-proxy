@@ -20,7 +20,11 @@ resumed=0
 case "$*" in *--resume*) resumed=1 ;; esac
 turn=0
 while IFS= read -r input; do
-  if [ "$resumed" -eq 1 ]; then
+  if printf '%s' "$input" | grep -q 'CONTEXT CHECKPOINT COMPACTION'; then
+    printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"compacted-summary","tool_calls":[]}}'
+  elif printf '%s' "$input" | grep -q 'compacted-summary'; then
+    printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"saw-summary","tool_calls":[]}}'
+  elif [ "$resumed" -eq 1 ]; then
     if printf '%s' "$input" | grep -q 'persistent-first'; then
       printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"resumed-with-full-history","tool_calls":[]}}'
     else
@@ -260,3 +264,54 @@ for (const change of ["order", "schema", "instructions", "effort"]) {
     );
   });
 }
+
+describe("remote compaction through the openai provider", () => {
+  const post = (body: unknown) =>
+    handleRequest(
+      new Request("http://local/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    );
+
+  test("summarizes on compaction_trigger and reads the summary back", async () => {
+    const base = { model: "claude-opus-5-5", instructions: "compaction-test" };
+    const compacted = (await (
+      await post({
+        ...base,
+        input: [
+          { role: "user", content: "long task" },
+          { type: "compaction_trigger" },
+        ],
+      })
+    ).json()) as any;
+    expect(compacted.output).toHaveLength(1);
+    expect(compacted.output[0].type).toBe("compaction");
+
+    const next = (await (
+      await post({
+        ...base,
+        input: [compacted.output[0], { role: "user", content: "continue" }],
+      })
+    ).json()) as any;
+    expect(next.output[0].content[0].text).toBe("saw-summary");
+  });
+
+  test("rejects another provider's compaction item without calling Claude", async () => {
+    const response = await post({
+      model: "claude-opus-5-5",
+      input: [{ type: "compaction", encrypted_content: "gAAAAopaque" }],
+    });
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as any).error.message).toContain("another provider");
+  });
+
+  test("names the right provider when a GPT model reaches this endpoint", async () => {
+    const response = await post({ model: "gpt-5.6-sol", input: "hi" });
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as any).error.message).toBe(
+      "Unsupported Claude model: gpt-5.6-sol. This endpoint serves only Claude; OpenAI models route through the openai provider.",
+    );
+  });
+});

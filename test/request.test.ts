@@ -2,10 +2,14 @@ import { describe, expect, test } from "bun:test";
 import {
   COMPUTER_TOOL_NAME,
   deltaRequest,
+  encodeCompaction,
+  isCompactionRequest,
   outputSchema,
   prepareClaudePrompt,
   requestToPrompt,
+  SUMMARY_PREFIX,
   toolDescriptors,
+  validateCompactionItems,
   validateRequest,
 } from "../src/request";
 
@@ -163,4 +167,39 @@ test("tool ordering and object key ordering do not perturb the cache prefix", ()
   expect(requestToPrompt(request).indexOf("<available_tools>")).toBeLessThan(
     requestToPrompt(request).indexOf("changing input"),
   );
+});
+
+describe("remote compaction", () => {
+  const trigger = {
+    model: "claude-opus-5-5",
+    input: [{ role: "user", content: "work so far" }, { type: "compaction_trigger" }],
+  };
+
+  test("a trailing compaction_trigger asks Claude for Codex's handoff summary", () => {
+    expect(isCompactionRequest(trigger)).toBe(true);
+    expect(isCompactionRequest({ ...trigger, input: [...trigger.input].reverse() })).toBe(false);
+    expect(requestToPrompt(trigger)).toContain("CONTEXT CHECKPOINT COMPACTION");
+    expect(requestToPrompt(trigger)).toContain("leave tool_calls empty");
+  });
+
+  test("the proxy's own compaction item expands to the summary Codex would keep", () => {
+    const prompt = requestToPrompt({
+      model: "claude-opus-5-5",
+      input: [
+        { type: "compaction", encrypted_content: encodeCompaction("summary: Ω done") },
+        { role: "user", content: "continue" },
+      ],
+    });
+    expect(prompt).toContain(`<user>\n${SUMMARY_PREFIX}\nsummary: Ω done\n</user>`);
+    expect(prompt).not.toContain("claude-codex-proxy.compaction");
+  });
+
+  test("rejects a compaction item another provider encrypted", () => {
+    const foreign = {
+      model: "claude-opus-5-5",
+      input: [{ type: "compaction", encrypted_content: "gAAAAopaque" }],
+    };
+    expect(() => validateCompactionItems(foreign)).toThrow(/^Unsupported Claude input/);
+    expect(() => requestToPrompt(foreign)).toThrow(/another provider wrote/);
+  });
 });

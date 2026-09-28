@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { encodeCompaction } from "../src/request";
 import { responseObject, streamResponse } from "../src/responses";
 
 describe("Responses API output", () => {
@@ -81,5 +82,16 @@ describe("Responses API output", () => {
       execution: "client",
       arguments: { query: "browser cua_repl node_repl", limit: 8 },
     });
+  });
+
+  test("answers remote compaction with exactly one compaction item", async () => {
+    const response = responseObject(request, { ...output, text: "", toolCalls: [], compaction: "handoff" });
+    expect(response.output).toEqual([
+      { id: expect.stringMatching(/^cmp_/), type: "compaction", encrypted_content: encodeCompaction("handoff") },
+    ]);
+    const events = (await streamResponse(response).text()).split("\n")
+      .filter((line) => line.startsWith("data: {")).map((line) => JSON.parse(line.slice(6)));
+    const done = events.filter((event) => event.type === "response.output_item.done");
+    expect(done.map((event) => event.item.type)).toEqual(["compaction"]);
   });
 });

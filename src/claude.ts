@@ -8,6 +8,7 @@ import {
 } from "./sessions";
 import {
   deltaRequest,
+  isCompactionRequest,
   outputSchema,
   prepareClaudePrompt,
   requestToPrompt,
@@ -15,6 +16,7 @@ import {
   stableJson,
   textFromContent,
   toolDescriptors,
+  validateCompactionItems,
   type ClaudeInputBlock,
 } from "./request";
 import type {
@@ -37,6 +39,8 @@ const CODEX_TOOL_SYSTEM_PROMPT = `You are running inside a Codex agent loop. Too
 
 const MAX_TOOL_NAME_RETRIES = 2;
 
+const COMPACTION_CORRECTION = `<compaction_error>\nNo tools were executed. This turn must produce only the handoff summary: put all of it in text and leave tool_calls empty.\n</compaction_error>`;
+
 export function resolveModel(model: string): string {
   const resolved = MODEL_ALIASES[model] ?? model;
   if (
@@ -44,7 +48,11 @@ export function resolveModel(model: string): string {
     (!resolved.startsWith("claude-") &&
       !["opus", "sonnet", "haiku"].includes(resolved))
   ) {
-    throw new Error(`Unsupported Claude model: ${model}`);
+    // Never substitute a Claude model. Name where the request should have gone.
+    const hint = model.startsWith("gpt-")
+      ? " This endpoint serves only Claude; OpenAI models route through the openai provider."
+      : "";
+    throw new Error(`Unsupported Claude model: ${model}.${hint}`);
   }
   return resolved;
 }
@@ -524,6 +532,7 @@ function structuredOutput(
 export async function runClaude(
   request: ResponsesRequest,
 ): Promise<ProxyOutput> {
+  validateCompactionItems(request);
   const requestId = crypto.randomUUID();
   const live = claimWorker(request);
   const stored = live ? undefined : findStoredSession(request);
@@ -553,12 +562,15 @@ export async function runClaude(
     await prepared.cleanup();
   }
 
+  let structured = structuredOutput(worker, result);
+  if (isCompactionRequest(request))
+    return await compactionOutput(worker, request, requestId, structured);
+
   // Tool names are validated here instead of by a schema enum (see
   // outputSchema). Correct them in the same process to keep its cache.
   const allowedTools = new Set(
     toolDescriptors(requestTools(request)).map((tool) => tool.proxyName),
   );
-  let structured = structuredOutput(worker, result);
   for (let retry = 0; ; retry++) {
     const unknown = structured.tool_calls
       .map((call) => call.name)
@@ -601,6 +613,56 @@ export async function runClaude(
   return {
     text: structured.text,
     toolCalls,
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens,
+    },
+  };
+}
+
+/**
+ * Answers Codex remote compaction (v2), which a task on the built-in openai
+ * provider uses instead of local summarization. Codex requires exactly one
+ * `compaction` item back; the summary rides in it and is expanded when the
+ * compacted history returns (see request.ts).
+ */
+async function compactionOutput(
+  worker: ClaudeWorker,
+  request: ResponsesRequest,
+  requestId: string,
+  structured: StructuredOutput,
+): Promise<ProxyOutput> {
+  for (
+    let retry = 0;
+    structured.tool_calls.length > 0 || !structured.text.trim();
+    retry++
+  ) {
+    if (retry >= MAX_TOOL_NAME_RETRIES) {
+      worker.close();
+      throw new Error("Claude CLI did not return a compaction summary");
+    }
+    let result: ClaudeResult;
+    try {
+      result = await worker.run(
+        [{ type: "text", text: COMPACTION_CORRECTION }],
+        requestId,
+        retry + 2,
+      );
+    } catch (error) {
+      worker.close();
+      throw error;
+    }
+    structured = structuredOutput(worker, result);
+  }
+  // The summary replaces this history, so no later request can extend this worker.
+  worker.close();
+  const inputTokens = estimateVisibleTokens(requestToPrompt(request));
+  const outputTokens = estimateVisibleTokens(structured.text);
+  return {
+    text: "",
+    toolCalls: [],
+    compaction: structured.text,
     usage: {
       inputTokens,
       outputTokens,

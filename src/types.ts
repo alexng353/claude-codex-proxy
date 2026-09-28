@@ -32,6 +32,8 @@ export type ResponseInputItem = {
   action?: unknown;
   actions?: unknown[];
   namespace?: string;
+  /** Opaque on OpenAI compaction items; see request.ts for the proxy's own. */
+  encrypted_content?: string;
   proxy_image_paths?: string[];
 };
 
@@ -67,5 +69,7 @@ export type ClaudeResult = {
 export type ProxyOutput = {
   text: string;
   toolCalls: Array<{ name: string; arguments: string; callId?: string }>;
+  /** Set for a remote compaction request: the summary that replaces history. */
+  compaction?: string;
   usage: { inputTokens: number; outputTokens: number; totalTokens: number };
 };
