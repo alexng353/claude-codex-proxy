@@ -124,6 +124,36 @@ describe("Responses request adapter", () => {
     await prepared.cleanup();
   });
 
+  test("attaches function-output images as image blocks, not base64 text", async () => {
+    const image = "data:image/png;base64," + "A".repeat(400_000);
+    const prepared = await prepareClaudePrompt({
+      model: "sonnet",
+      input: [
+        {
+          type: "function_call_output",
+          call_id: "call_view_1",
+          output: [
+            { type: "input_text", text: "screenshot of the page" },
+            { type: "input_image", image_url: image, detail: "high" },
+          ],
+        },
+      ],
+    });
+    expect(prepared.prompt).toContain("screenshot of the page");
+    expect(prepared.prompt).toContain("[Image attached to this message.]");
+    expect(prepared.prompt).not.toContain("AAAA");
+    expect(prepared.prompt.length).toBeLessThan(1_000);
+    expect(prepared.content).toContainEqual({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: "image/png",
+        data: "A".repeat(400_000),
+      },
+    });
+    await prepared.cleanup();
+  });
+
   test("rejects malformed requests", () => {
     expect(() => validateRequest({ input: "hello" })).toThrow(
       "model is required",

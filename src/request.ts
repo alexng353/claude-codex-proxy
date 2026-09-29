@@ -1,4 +1,5 @@
 import type {
+  ResponseContentPart,
   ResponseInputItem,
   ResponsesRequest,
   ResponseTool,
@@ -195,7 +196,9 @@ const serializeItem = (item: ResponseInputItem): string => {
     const output =
       typeof item.output === "string"
         ? item.output
-        : JSON.stringify(item.output);
+        : Array.isArray(item.output)
+          ? toolOutputText(item.output)
+          : JSON.stringify(item.output);
     return `<tool_result call_id=${JSON.stringify(item.call_id)}>\n${output ?? ""}\n</tool_result>`;
   }
   if (item.type === "computer_call") {
@@ -319,6 +322,26 @@ export function outputSchema(tools: ResponseTool[]): Record<string, unknown> {
   };
 }
 
+// Tool results can be content parts. Their images travel as native image blocks
+// (see prepareClaudePrompt); inlining the base64 as text costs several times more
+// tokens than the image itself and hides it from Claude's vision.
+function toolOutputText(parts: unknown[]): string {
+  return parts
+    .map((part) => {
+      if (!part || typeof part !== "object") return JSON.stringify(part);
+      const { type, text, image_url } = part as ResponseContentPart;
+      if (type === "input_image" && typeof image_url === "string")
+        return "[Image attached to this message.]";
+      if (
+        ["input_text", "output_text", "text"].includes(type ?? "") &&
+        typeof text === "string"
+      )
+        return text;
+      return JSON.stringify(part);
+    })
+    .join("\n");
+}
+
 function screenshotUrls(item: ResponseInputItem): string[] {
   if (item.type !== "computer_call_output") return [];
   const values = Array.isArray(item.output) ? item.output : [item.output];
@@ -327,6 +350,38 @@ function screenshotUrls(item: ResponseInputItem): string[] {
     const imageUrl = (value as { image_url?: unknown }).image_url;
     return typeof imageUrl === "string" ? [imageUrl] : [];
   });
+}
+
+function contentImageUrls(parts: unknown): string[] {
+  if (!Array.isArray(parts)) return [];
+  return parts.flatMap((part) =>
+    part &&
+    typeof part === "object" &&
+    (part as ResponseContentPart).type === "input_image" &&
+    typeof (part as ResponseContentPart).image_url === "string"
+      ? [(part as ResponseContentPart).image_url as string]
+      : [],
+  );
+}
+
+/** Every image an item carries, in the order Claude receives them. */
+export function itemImageUrls(item: ResponseInputItem): string[] {
+  const toolOutput =
+    item.type === "function_call_output" ||
+    item.type === "custom_tool_call_output";
+  return [
+    ...screenshotUrls(item),
+    ...contentImageUrls(item.content),
+    ...(toolOutput ? contentImageUrls(item.output) : []),
+  ];
+}
+
+export function requestImageCount(request: ResponsesRequest): number {
+  if (!Array.isArray(request.input)) return 0;
+  return request.input.reduce(
+    (count, item) => count + itemImageUrls(item).length,
+    0,
+  );
 }
 
 export function stableJson(value: unknown): string {
@@ -386,17 +441,7 @@ export async function prepareClaudePrompt(
   const content: ClaudeInputBlock[] = [{ type: "text", text: prompt }];
   if (Array.isArray(request.input)) {
     for (const item of request.input) {
-      const urls = [
-        ...screenshotUrls(item),
-        ...(Array.isArray(item.content)
-          ? item.content.flatMap((part) =>
-              part.type === "input_image" && typeof part.image_url === "string"
-                ? [part.image_url]
-                : [],
-            )
-          : []),
-      ];
-      for (const url of urls) {
+      for (const url of itemImageUrls(item)) {
         content.push({
           type: "text",
           text: `Image for ${item.call_id ? "tool result " + item.call_id : "conversation item " + request.input.indexOf(item)}:`,

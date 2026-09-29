@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildClaudeArgs, estimateVisibleTokens } from "../src/claude";
+import {
+  buildClaudeArgs,
+  estimateRequestTokens,
+  estimateVisibleTokens,
+  IMAGE_TOKEN_ESTIMATE,
+} from "../src/claude";
 
 describe("Claude subprocess permissions", () => {
   test("loads a minimal runtime with all tools routed through Codex", () => {
@@ -32,6 +37,26 @@ describe("Claude subprocess permissions", () => {
     expect(estimateVisibleTokens("hello")).toBe(2);
     expect(estimateVisibleTokens("")).toBe(0);
   });
+
+  test("counts tool-output images per image, not per base64 byte", () => {
+    const tokens = estimateRequestTokens({
+      model: "sonnet",
+      input: [
+        {
+          type: "function_call_output",
+          call_id: "call_1",
+          output: [
+            {
+              type: "input_image",
+              image_url: "data:image/png;base64," + "A".repeat(400_000),
+            },
+          ],
+        },
+      ],
+    });
+    expect(tokens).toBeGreaterThanOrEqual(IMAGE_TOKEN_ESTIMATE);
+    expect(tokens).toBeLessThan(IMAGE_TOKEN_ESTIMATE + 100);
+  });
 });
 
 test("rejects GPT models instead of substituting Claude", () => {
@@ -40,15 +65,14 @@ test("rejects GPT models instead of substituting Claude", () => {
   ).toThrow("Unsupported Claude model");
 });
 
-test("passes exact effort levels and defaults Opus 5.5 to medium", () => {
-  for (const effort of ["low", "medium", "high", "xhigh", "max", undefined]) {
-    const args = buildClaudeArgs({
-      model: "claude-opus-5-5",
-      input: "hello",
-      reasoning: { effort },
-    });
-    expect(args[args.indexOf("--effort") + 1]).toBe(effort ?? "medium");
-  }
+test("passes exact effort levels and defaults Opus and Sonnet 5.5 to medium", () => {
+  for (const model of ["claude-opus-5-5", "claude-sonnet-5-5"])
+    for (const effort of ["low", "medium", "high", "xhigh", "max", undefined]) {
+      const args = buildClaudeArgs({ model, input: "hello", reasoning: { effort } });
+      expect(args[args.indexOf("--effort") + 1]).toBe(effort ?? "medium");
+      expect(args[args.indexOf("--model") + 1]).toBe(model);
+    }
+  expect(buildClaudeArgs({ model: "sonnet", input: "hello" })).not.toContain("--effort");
   expect(() =>
     buildClaudeArgs({
       model: "claude-opus-5-5",

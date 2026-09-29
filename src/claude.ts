@@ -11,6 +11,7 @@ import {
   isCompactionRequest,
   outputSchema,
   prepareClaudePrompt,
+  requestImageCount,
   requestToPrompt,
   requestTools,
   stableJson,
@@ -57,10 +58,13 @@ export function resolveModel(model: string): string {
   return resolved;
 }
 
+// Exact desktop models whose picker offers effort, so an unset effort means the picker default.
+const MEDIUM_DEFAULT_MODELS = new Set(["claude-opus-5-5", "claude-sonnet-5-5"]);
+
 export function resolveEffort(request: ResponsesRequest): string | undefined {
   const effort = request.reasoning?.effort;
   if (effort === undefined)
-    return request.model === "claude-opus-5-5" ? "medium" : undefined;
+    return MEDIUM_DEFAULT_MODELS.has(request.model) ? "medium" : undefined;
   if (!["low", "medium", "high", "xhigh", "max"].includes(effort))
     throw new Error(`Unsupported Claude effort: ${effort}`);
   return effort;
@@ -499,6 +503,18 @@ export function estimateVisibleTokens(value: string): number {
   return Math.max(1, Math.ceil(Buffer.byteLength(value, "utf8") / 4));
 }
 
+// Claude bills an image by its pixel area, capped near 4,800 tokens at the largest
+// size current models accept. Assuming the cap keeps Codex compacting early
+// rather than letting a screenshot-heavy task outgrow the real window.
+export const IMAGE_TOKEN_ESTIMATE = 4_800;
+
+export function estimateRequestTokens(request: ResponsesRequest): number {
+  return (
+    estimateVisibleTokens(requestToPrompt(request)) +
+    requestImageCount(request) * IMAGE_TOKEN_ESTIMATE
+  );
+}
+
 type StructuredOutput = NonNullable<ClaudeResult["structured_output"]>;
 
 function structuredOutput(
@@ -606,7 +622,7 @@ export async function runClaude(
   // plugins, MCP definitions, and cache activity. Reporting that hidden runtime
   // overhead makes Codex believe its own conversation exceeds the context window.
   // Only report the request/output content that Codex can retain or compact.
-  const inputTokens = estimateVisibleTokens(requestToPrompt(request));
+  const inputTokens = estimateRequestTokens(request);
   const outputTokens = estimateVisibleTokens(
     structured.text + JSON.stringify(toolCalls),
   );
@@ -657,7 +673,7 @@ async function compactionOutput(
   }
   // The summary replaces this history, so no later request can extend this worker.
   worker.close();
-  const inputTokens = estimateVisibleTokens(requestToPrompt(request));
+  const inputTokens = estimateRequestTokens(request);
   const outputTokens = estimateVisibleTokens(structured.text);
   return {
     text: "",

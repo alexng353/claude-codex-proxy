@@ -63,7 +63,7 @@ request_max_retries = 1
 stream_max_retries = 1
 ```
 
-Restart Codex Desktop after changing the config. Use `opus`, `sonnet`, or `haiku` as the model. Full Claude model IDs beginning with `claude-` are also accepted.
+Restart Codex Desktop after changing the config. Use `opus`, `sonnet`, or `haiku` as the model. Full Claude model IDs beginning with `claude-` are also accepted. Exact `claude-opus-5-5` and `claude-sonnet-5-5` default to medium effort when a request sets none. Sonnet 5.5 needs Claude Code 2.1.284 or newer; 2.1.283 flags it as an unrecognized model and falls back to a 200,000-token window.
 
 Codex caches model capabilities. After upgrading the proxy, quit Codex Desktop, remove `~/.codex/models_cache.json`, and reopen Codex so browser/plugin capability changes are fetched. Existing tasks retain the model instructions and tool world captured when they were created, so test browser changes in a new task.
 
