@@ -36,6 +36,15 @@ test("finds only completed sessions with the same key and a shorter history", ()
   expect(findSessions({ ...key, toolsHash: "other" }, 10)).toHaveLength(0);
 });
 
+test("a fleet sharing one key does not hide older sessions", () => {
+  const fleet = { ...key, toolsHash: "fleet" };
+  const target = crypto.randomUUID();
+  saveSession({ ...fleet, sessionId: target, seenCount: 4, prefixHash: "target", lastText: "", lastCallIds: [] });
+  for (let i = 0; i < 30; i++)
+    saveSession({ ...fleet, sessionId: crypto.randomUUID(), seenCount: 5, prefixHash: `other-${i}`, lastText: "", lastCallIds: [] });
+  expect(findSessions(fleet, 10).map((s) => s.sessionId)).toContain(target);
+});
+
 test("pruning deletes expired sessions and their transcripts, but not kept ones", () => {
   const old = crypto.randomUUID();
   const kept = crypto.randomUUID();

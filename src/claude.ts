@@ -1,12 +1,23 @@
+import {
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
 import { recordUsage } from "./usage";
 import {
   findSessions,
   pruneSessions,
   registerSession,
   saveSession,
+  stateDir,
   type SessionKey,
 } from "./sessions";
 import {
+  conversationRequest,
   deltaRequest,
   isCompactionRequest,
   outputSchema,
@@ -15,6 +26,7 @@ import {
   requestToPrompt,
   requestTools,
   stableJson,
+  systemContext,
   textFromContent,
   toolDescriptors,
   validateCompactionItems,
@@ -107,11 +119,59 @@ export function buildClaudeArgs(
     '{"mcpServers":{}}',
     "--tools",
     "",
-    "--system-prompt",
-    CODEX_TOOL_SYSTEM_PROMPT,
+    "--system-prompt-file",
+    systemPromptFile(request),
     "--json-schema",
     JSON.stringify(outputSchema(request.tools ?? [])),
   ];
+}
+
+export function systemPrompt(request: ResponsesRequest): string {
+  return [CODEX_TOOL_SYSTEM_PROMPT, systemContext(request)]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+const systemPromptDir = () => join(stateDir(), "system-prompts");
+
+/**
+ * The system prompt goes through a file because a tool registry easily exceeds
+ * Linux's 128 KiB limit on one argv entry. Content addressing lets concurrent
+ * workers share it; rewriting through a rename refreshes its age for pruning
+ * without exposing a partial file to a starting worker.
+ */
+export function systemPromptFile(request: ResponsesRequest): string {
+  const prompt = systemPrompt(request);
+  const directory = systemPromptDir();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, `${sha256(prompt)}.txt`);
+  const temporary = `${path}.${crypto.randomUUID()}.tmp`;
+  writeFileSync(temporary, prompt, { mode: 0o600 });
+  renameSync(temporary, path);
+  return path;
+}
+
+// Claude Code reads the file when a worker starts, and every launch rewrites
+// it, so a day-old file belongs to no worker that could still need it.
+const SYSTEM_PROMPT_RETENTION_MS = 86_400_000;
+
+function pruneSystemPrompts(): void {
+  const directory = systemPromptDir();
+  let names: string[];
+  try {
+    names = readdirSync(directory);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - SYSTEM_PROMPT_RETENTION_MS;
+  for (const name of names) {
+    const path = join(directory, name);
+    try {
+      if (statSync(path).mtimeMs < cutoff) unlinkSync(path);
+    } catch {
+      // Another launch may have replaced or removed it; nothing to clean.
+    }
+  }
 }
 
 type PendingTurn = {
@@ -153,6 +213,7 @@ function maybePrune(): void {
   } catch (error) {
     console.error("Unable to prune Claude sessions:", (error as Error).message);
   }
+  pruneSystemPrompts();
 }
 
 class ClaudeWorker {
@@ -176,7 +237,11 @@ class ClaudeWorker {
   private idleTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
 
+  /** Whether this process forked a stored session instead of starting fresh. */
+  private readonly resumed: boolean;
+
   constructor(request: ResponsesRequest, resumeFrom?: string) {
+    this.resumed = resumeFrom !== undefined;
     this.model = request.model;
     this.effort = resolveEffort(request);
     this.toolSignature = toolSignature(request);
@@ -342,6 +407,7 @@ class ClaudeWorker {
         effort: this.effort,
         attempt: this.attempt,
         launchMode: "minimal",
+        resumed: this.resumed,
       });
       const pending = this.pending;
       this.pending = undefined;
@@ -373,17 +439,33 @@ const MODEL_OUTPUT_TYPES = new Set([
 ]);
 
 export function prefixHash(input: ResponseInputItem[], count: number): string {
+  return prefixHashes(input, [count]).get(count)!;
+}
+
+/** prefixHash for several counts in one pass over the input. */
+export function prefixHashes(
+  input: ResponseInputItem[],
+  counts: Iterable<number>,
+): Map<number, string> {
+  const wanted = new Set(counts);
+  const hashes = new Map<number, string>();
   const hasher = new Bun.CryptoHasher("sha256");
-  for (const item of input.slice(0, count)) {
+  const limit = Math.min(Math.max(0, ...wanted), input.length);
+  for (let count = 0; ; count++) {
+    if (wanted.has(count)) hashes.set(count, hasher.copy().digest("hex"));
+    if (count >= limit) break;
     // Server-assigned ids and statuses are not conversation content.
-    const { id: _id, status: _status, ...content } = item as Record<
+    const { id: _id, status: _status, ...content } = input[count] as Record<
       string,
       unknown
     >;
     hasher.update(stableJson(content));
     hasher.update("\n");
   }
-  return hasher.digest("hex");
+  // A count past the end covers the whole input, as slice() would.
+  for (const count of wanted)
+    if (!hashes.has(count)) hashes.set(count, hasher.copy().digest("hex"));
+  return hashes;
 }
 
 /**
@@ -477,8 +559,12 @@ function findStoredSession(
     console.error("Unable to read Claude sessions:", (error as Error).message);
     return undefined;
   }
+  const hashes = prefixHashes(
+    input,
+    candidates.map((session) => session.seenCount),
+  );
   for (const session of candidates) {
-    if (prefixHash(input, session.seenCount) !== session.prefixHash) continue;
+    if (hashes.get(session.seenCount) !== session.prefixHash) continue;
     const delta = conversationDelta(input.slice(session.seenCount), {
       text: session.lastText,
       callIds: new Set(session.lastCallIds),
@@ -555,7 +641,7 @@ export async function runClaude(
   const delta = live?.delta ?? stored?.delta;
   let worker = live?.worker ?? new ClaudeWorker(request, stored?.resumeFrom);
   let prepared = await prepareClaudePrompt(
-    delta ? deltaRequest(request, delta) : request,
+    delta ? deltaRequest(request, delta) : conversationRequest(request),
   );
   let result: ClaudeResult;
   try {
@@ -566,7 +652,7 @@ export async function runClaude(
     // A parked worker can die while idle, or a transcript can be missing;
     // replay the full request once in a fresh session.
     await prepared.cleanup();
-    prepared = await prepareClaudePrompt(request);
+    prepared = await prepareClaudePrompt(conversationRequest(request));
     worker = new ClaudeWorker(request);
     try {
       result = await worker.run(prepared.content, requestId, 2);

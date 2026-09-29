@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { conversationDelta, prefixHash } from "../src/claude";
+import { conversationDelta, prefixHash, prefixHashes } from "../src/claude";
+import { stableJson } from "../src/request";
 import type { ResponseInputItem } from "../src/types";
 
 const assistant = (text: string): ResponseInputItem => ({
@@ -73,4 +74,27 @@ test("prefixHash ignores ids and statuses but not content", () => {
   expect(prefixHash(a, 2)).toBe(prefixHash(b, 2));
   expect(prefixHash([user("hi!")], 1)).not.toBe(prefixHash([user("hi")], 1));
   expect(prefixHash([...b, user("more")], 2)).toBe(prefixHash(b, 2));
+});
+
+test("prefixHashes matches prefixHash and the hashes already stored in sessions", () => {
+  const input: ResponseInputItem[] = [
+    { role: "user", content: "one", status: "completed" },
+    { type: "function_call", call_id: "c", name: "n", arguments: "{}" },
+    { type: "function_call_output", call_id: "c", output: "out" },
+  ];
+  // The pre-refactor algorithm, which persisted sessions were hashed with.
+  const legacy = (count: number) => {
+    const hasher = new Bun.CryptoHasher("sha256");
+    for (const item of input.slice(0, count)) {
+      const { id: _id, status: _status, ...content } = item as Record<string, unknown>;
+      hasher.update(stableJson(content));
+      hasher.update("\n");
+    }
+    return hasher.digest("hex");
+  };
+  const hashes = prefixHashes(input, [0, 1, 2, 3, 7]);
+  for (const count of [0, 1, 2, 3, 7]) {
+    expect(hashes.get(count)).toBe(legacy(count));
+    expect(prefixHash(input, count)).toBe(legacy(count));
+  }
 });

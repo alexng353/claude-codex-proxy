@@ -283,6 +283,84 @@ export function deltaRequest(
   return { ...request, instructions: undefined, tools: [], input: delta };
 }
 
+/**
+ * A conversation's stable context: its instructions, base tool registry, and
+ * the context items Codex opens every task with. New workers get it in the
+ * system prompt, which Claude Code ends with a cache breakpoint, so every task
+ * and subagent that shares it reads it from cache. At the head of the first
+ * user message no breakpoint ends it, and each new conversation rewrote it
+ * (~80k tokens at the 1-hour cache-write price).
+ */
+export function systemContext(request: ResponsesRequest): string {
+  const input = inputList(request);
+  return requestToPrompt({
+    ...request,
+    input: input.slice(0, leadingContextCount(input)),
+  });
+}
+
+/** A new worker's first message: the conversation after its system context. */
+export function conversationRequest(
+  request: ResponsesRequest,
+): ResponsesRequest {
+  const input = inputList(request);
+  return deltaRequest(request, input.slice(leadingContextCount(input)));
+}
+
+const inputList = (request: ResponsesRequest): ResponseInputItem[] =>
+  typeof request.input === "string"
+    ? [{ role: "user", content: request.input }]
+    : request.input;
+
+// User messages Codex injects before the task's own prompt. Only exact openings
+// count: treating a real prompt as context would hide nothing, but would give
+// every task its own system prompt and cache entry.
+const CONTEXT_OPENINGS = [
+  "<environment_context>",
+  "# AGENTS.md instructions",
+  "<recommended_plugins>",
+  "<user_instructions>",
+];
+
+function textParts(item: ResponseInputItem): string[] | undefined {
+  if (item.type !== undefined && item.type !== "message") return undefined;
+  if (typeof item.content === "string") return [item.content];
+  const parts = item.content ?? [];
+  if (parts.some((part) => part.type !== "input_text" && part.type !== "text"))
+    return undefined;
+  return parts.map((part) => part.text ?? "");
+}
+
+/**
+ * How many leading items are Codex's task context: developer or system
+ * messages followed by the user context message. The run ends after the last
+ * user context message, so per-task items that follow it (a session-start
+ * hook's output names its transcript path) stay in the conversation instead of
+ * making each task's system prompt unique. Without a user context message the
+ * run is not recognisably Codex's and nothing moves.
+ */
+export function leadingContextCount(input: ResponseInputItem[]): number {
+  let end = 0;
+  for (const [index, item] of input.entries()) {
+    const parts = textParts(item);
+    if (!parts) break;
+    if (item.role === "developer" || item.role === "system") continue;
+    if (
+      item.role === "user" &&
+      parts.length > 0 &&
+      parts.every((text) =>
+        CONTEXT_OPENINGS.some((opening) => text.trimStart().startsWith(opening)),
+      )
+    ) {
+      end = index + 1;
+      continue;
+    }
+    break;
+  }
+  // A first message needs something to say.
+  return end < input.length ? end : 0;
+}
+
 // The schema is fixed for a worker's lifetime and heads its prompt-cache
 // prefix, so it must not enumerate tool names: tool_search loads new tools
 // mid-conversation. runClaude validates names and asks Claude to correct them.

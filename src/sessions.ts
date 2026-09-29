@@ -120,11 +120,13 @@ type Row = {
 };
 
 /** Completed sessions with this key whose history is shorter than `inputLength`,
- * most recent first. Callers verify the prefix hash. */
+ * most recent first. Callers verify the prefix hash. Unlimited by default:
+ * parallel subagents share one key, so a fixed cap hid the session a request
+ * actually continues and restarted it from scratch. */
 export function findSessions(
   key: SessionKey,
   inputLength: number,
-  limit = 20,
+  limit = -1,
 ): StoredSession[] {
   const rows = open()
     .query(

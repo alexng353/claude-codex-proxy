@@ -13,6 +13,7 @@ export function recordUsage(
     effort?: string;
     attempt: number;
     launchMode: string;
+    resumed: boolean;
   },
 ): void {
   const directory =
