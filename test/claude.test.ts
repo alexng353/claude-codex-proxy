@@ -37,11 +37,12 @@ describe("Claude subprocess permissions", () => {
     expect(args).toContain("--no-session-persistence");
     const persisted = buildClaudeArgs(
       { model: "sonnet", input: "hello" },
-      { id: "new-id", resumeFrom: "old-id" },
+      { id: "new-id", resumeFrom: "old-id", resumeAt: "reply-id" },
     );
     expect(persisted).not.toContain("--no-session-persistence");
     expect(persisted[persisted.indexOf("--resume") + 1]).toBe("old-id");
     expect(persisted).toContain("--fork-session");
+    expect(persisted[persisted.indexOf("--resume-session-at") + 1]).toBe("reply-id");
     expect(persisted[persisted.indexOf("--session-id") + 1]).toBe("new-id");
     expect(args).toContain("--safe-mode");
     expect(args).toContain("--strict-mcp-config");

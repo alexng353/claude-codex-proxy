@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -65,7 +65,35 @@ function open(): Database {
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS sessions_lookup
     ON sessions (model, effort, instructions_hash, tools_hash, updated_at)`);
+  db.exec(`CREATE TABLE IF NOT EXISTS thread_accounts (
+    thread_id TEXT PRIMARY KEY,
+    account TEXT NOT NULL
+  )`);
   return db;
+}
+
+/** Account ownership outlives transcript pruning and quota resets. */
+export function threadAccount(threadId: string): string | undefined {
+  const row = open().query("SELECT account FROM thread_accounts WHERE thread_id = ?")
+    .get(threadId) as { account: string } | null;
+  return row?.account;
+}
+
+/** Concurrent first requests must use the assignment already recorded. */
+export function claimThreadAccount(threadId: string, account: string): string {
+  open().query("INSERT OR IGNORE INTO thread_accounts (thread_id, account) VALUES (?, ?)")
+    .run(threadId, account);
+  return threadAccount(threadId)!;
+}
+
+export function pinThreadAccount(threadId: string, account: string, expected?: string): void {
+  if (expected !== undefined) {
+    open().query("UPDATE thread_accounts SET account = ? WHERE thread_id = ? AND account = ?")
+      .run(account, threadId, expected);
+    return;
+  }
+  open().query(`INSERT INTO thread_accounts (thread_id, account) VALUES (?, ?)
+    ON CONFLICT(thread_id) DO UPDATE SET account = excluded.account`).run(threadId, account);
 }
 
 /** Record a session as soon as its process starts, so pruning can delete its
@@ -159,6 +187,40 @@ function claudeProjectsDir(): string {
     process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"),
     "projects",
   );
+}
+
+/** Keep the completed StructuredOutput result, excluding later failed attempts. */
+export function resumeCheckpoint(sessionId: string): string | undefined {
+  if (!UUID.test(sessionId)) return undefined;
+  try {
+    const projects = claudeProjectsDir();
+    if (!existsSync(projects)) return undefined;
+    for (const project of readdirSync(projects)) {
+      const path = join(projects, project, `${sessionId}.jsonl`);
+      if (!existsSync(path)) continue;
+      const outputs = new Set<string>();
+      let checkpoint: string | undefined;
+      for (const line of readFileSync(path, "utf8").split("\n")) {
+        try {
+          const entry = JSON.parse(line);
+          const content = entry.message?.content;
+          if (!Array.isArray(content) || !UUID.test(entry.uuid ?? "")) continue;
+          if (entry.type === "assistant" && !entry.isApiErrorMessage) {
+            for (const block of content)
+              if (block.type === "tool_use" && block.name === "StructuredOutput") outputs.add(block.id);
+          } else if (entry.type === "user") {
+            for (const block of content)
+              if (block.type === "tool_result" && !block.is_error && outputs.has(block.tool_use_id))
+                checkpoint = entry.uuid;
+          }
+        } catch {}
+      }
+      return checkpoint;
+    }
+  } catch {
+    // A missing or unreadable cache must not block the normal resume fallback.
+    return undefined;
+  }
 }
 
 /** Delete Claude Code's transcript for a session the proxy created. */

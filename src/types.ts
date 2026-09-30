@@ -46,18 +46,24 @@ export type ResponsesRequest = {
   stream?: boolean;
   max_output_tokens?: number;
   reasoning?: { effort?: string };
+  /** Codex thread key for durable account pinning and usage attribution. */
+  prompt_cache_key?: string;
 };
 
 export type ClaudeResult = {
   type: "result";
   subtype: string;
   is_error: boolean;
+  /** HTTP status of the API error behind an error result, e.g. 429. */
+  api_error_status?: number | null;
   result?: string;
   structured_output?: {
     text: string;
     tool_calls: Array<{ name: string; arguments: string }>;
   };
   modelUsage?: Record<string, unknown>;
+  duration_ms?: number;
+  duration_api_ms?: number;
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -72,4 +78,6 @@ export type ProxyOutput = {
   /** Set for a remote compaction request: the summary that replaces history. */
   compaction?: string;
   usage: { inputTokens: number; outputTokens: number; totalTokens: number };
+  /** Name of the Claude account that answered. */
+  account?: string;
 };

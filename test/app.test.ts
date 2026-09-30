@@ -3,7 +3,10 @@ import { chmod, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { handleRequest } from "../src/app";
-import { closeIdleWorkers } from "../src/claude";
+import { closeIdleWorkers, prefixHash } from "../src/claude";
+import { saveSession } from "../src/sessions";
+import type { ResponseInputItem } from "../src/types";
+import { openUsageDb } from "../src/usage";
 
 let directory = "";
 let oldClaudeBin: string | undefined;
@@ -20,6 +23,7 @@ resumed=0
 case "$*" in *--resume*) resumed=1 ;; esac
 turn=0
 while IFS= read -r input; do
+  printf '%s\\n' "$input" >> '${directory}/inputs'
   if printf '%s' "$input" | grep -q 'CONTEXT CHECKPOINT COMPACTION'; then
     printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"compacted-summary","tool_calls":[]}}'
   elif printf '%s' "$input" | grep -q 'compacted-summary'; then
@@ -87,6 +91,47 @@ test("resumes a persisted session with only new items after its process is gone"
     ],
   });
   expect(second.output[0].content[0].text).toBe("resumed-worker");
+});
+
+test("resumes an older unnormalized prefix before applying context normalization", async () => {
+  closeIdleWorkers();
+  const prior: ResponseInputItem[] = [
+    { role: "developer", content: "<global-memory>same memory</global-memory>" },
+    { role: "developer", content: "<global-memory>same memory</global-memory>" },
+    { role: "user", content: "legacy-first" },
+  ];
+  const hash = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex");
+  saveSession({
+    sessionId: crypto.randomUUID(), model: "sonnet", effort: "",
+    instructionsHash: hash("legacy-resume"), toolsHash: hash("[]"),
+    seenCount: prior.length, prefixHash: prefixHash(prior, prior.length),
+    lastText: "mock-ok", lastCallIds: [],
+  });
+  const response = await handleRequest(new Request("http://local/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "sonnet", instructions: "legacy-resume", input: [
+      ...prior, { role: "assistant", content: "mock-ok" }, { role: "user", content: "legacy-next" },
+    ] }),
+  }));
+  const body = await response.json() as any;
+  expect(body.output[0].content[0].text).toBe("resumed-worker");
+});
+
+test("omits repeated developer context on a live continuation", async () => {
+  closeIdleWorkers();
+  const memory = { role: "developer", content: "<global-memory>repeat-marker</global-memory>" };
+  const prior = [memory, { role: "user", content: "normalize-first" }];
+  const send = async (input: unknown) => handleRequest(new Request("http://local/v1/responses", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "sonnet", instructions: "normalize-continuation", input }),
+  }));
+  const first = await (await send(prior)).json() as any;
+  const second = await send([...prior, { role: "assistant", content: first.output[0].content[0].text }, memory, { role: "user", content: "normalize-next" }]);
+  expect(second.status).toBe(200);
+  const last = (await readFile(join(directory, "inputs"), "utf8")).trim().split("\n").at(-1)!;
+  expect(last).toContain("normalize-next");
+  expect(last).not.toContain("repeat-marker");
+  expect(last).not.toContain("normalize-first");
 });
 
 describe("HTTP app", () => {
@@ -206,6 +251,27 @@ test("logs exact usage with request and worker identities without prompt content
       (row) => row.workerId === continuation.workerId && row.workerTurn === 1,
     ),
   ).toBe(true);
+});
+
+test("attributes usage to the Codex thread from prompt_cache_key", async () => {
+  const response = await handleRequest(
+    new Request("http://local/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-opus-5-5",
+        instructions: "thread-attribution",
+        input: "hello",
+        prompt_cache_key: "thread-under-test",
+      }),
+    }),
+  );
+  expect(response.status).toBe(200);
+  const row = openUsageDb()
+    .query("SELECT thread_id, session_id, input_tokens FROM turns WHERE thread_id = ?")
+    .get("thread-under-test") as { thread_id: string; session_id: string; input_tokens: number };
+  expect(row.input_tokens).toBe(440960);
+  expect(row.session_id).toMatch(/^[a-f0-9-]{36}$/);
 });
 
 for (const change of ["order", "schema", "instructions", "effort"]) {

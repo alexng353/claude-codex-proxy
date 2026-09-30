@@ -12,7 +12,10 @@
     "dev": "bun --watch src/server.ts",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
-    "check": "bun run typecheck && bun test"
+    "check": "bun run typecheck && bun test",
+    "usage": "bun run scripts/usage-report.ts",
+    "account": "bun run scripts/account.ts",
+    "limits": "bun run scripts/limits.ts"
   },
   "keywords": [
     "bun",

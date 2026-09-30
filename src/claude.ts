@@ -1,3 +1,4 @@
+import { normalizeContext } from "./context.mjs";
 import {
   mkdirSync,
   readdirSync,
@@ -7,11 +8,26 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import {
+  accountEnv,
+  listAccounts,
+  isLimitError,
+  isLimited,
+  markLimited,
+  observeRateLimit,
+  pickAccount,
+  soonestAccount,
+  type Account,
+} from "./accounts";
 import { recordUsage } from "./usage";
 import {
   findSessions,
+  threadAccount,
+  claimThreadAccount,
+  pinThreadAccount,
   pruneSessions,
   registerSession,
+  resumeCheckpoint,
   saveSession,
   stateDir,
   type SessionKey,
@@ -71,7 +87,11 @@ export function resolveModel(model: string): string {
 }
 
 // Exact desktop models whose picker offers effort, so an unset effort means the picker default.
-const MEDIUM_DEFAULT_MODELS = new Set(["claude-opus-5-5", "claude-sonnet-5-5"]);
+const MEDIUM_DEFAULT_MODELS = new Set([
+  "claude-opus-5-5",
+  "claude-fable-5-1",
+  "claude-sonnet-5-5",
+]);
 
 export function resolveEffort(request: ResponsesRequest): string | undefined {
   const effort = request.reasoning?.effort;
@@ -84,7 +104,16 @@ export function resolveEffort(request: ResponsesRequest): string | undefined {
 
 /** A fresh session, or a fork of a persisted one (`--resume` + `--fork-session`
  * so concurrent continuations of one history never share a transcript). */
-export type SessionLaunch = { id: string; resumeFrom?: string };
+export type SessionLaunch = { id: string; resumeFrom?: string; resumeAt?: string };
+
+/** Identifies a Codex request in usage records. */
+export type TurnContext = {
+  requestId: string;
+  threadId?: string;
+  pinnedAccount?: string;
+  /** The account that produced the latest result for this request. */
+  account?: Account;
+};
 
 export function buildClaudeArgs(
   request: ResponsesRequest,
@@ -102,6 +131,7 @@ export function buildClaudeArgs(
             : []),
           "--session-id",
           session.id,
+          ...(session.resumeAt ? ["--resume-session-at", session.resumeAt] : []),
         ]
       : ["--no-session-persistence"]),
     "--input-format",
@@ -223,6 +253,7 @@ class ClaudeWorker {
   readonly instructions: string | undefined;
   readonly sessionId = crypto.randomUUID();
   readonly key: SessionKey;
+  readonly account: Account;
   /** Count and hash of the Codex input items this worker has consumed. */
   seenCount = 0;
   prefixHash = "";
@@ -231,7 +262,7 @@ class ClaudeWorker {
   private pending?: PendingTurn;
   private readonly workerId = crypto.randomUUID();
   private workerTurn = 0;
-  private requestId = "";
+  private turn: TurnContext = { requestId: "" };
   private attempt = 1;
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
@@ -239,9 +270,16 @@ class ClaudeWorker {
 
   /** Whether this process forked a stored session instead of starting fresh. */
   private readonly resumed: boolean;
+  private readonly resumedFrom?: string;
 
-  constructor(request: ResponsesRequest, resumeFrom?: string) {
+  constructor(
+    request: ResponsesRequest,
+    resumeFrom?: string,
+    account: Account = pickAccount() ?? soonestAccount(),
+  ) {
+    this.account = account;
     this.resumed = resumeFrom !== undefined;
+    this.resumedFrom = resumeFrom;
     this.model = request.model;
     this.effort = resolveEffort(request);
     this.toolSignature = toolSignature(request);
@@ -257,19 +295,26 @@ class ClaudeWorker {
     this.subprocess = Bun.spawn(
       [
         process.env.CLAUDE_BIN ?? "claude",
-        ...buildClaudeArgs(request, { id: this.sessionId, resumeFrom }),
+        ...buildClaudeArgs(request, {
+          id: this.sessionId,
+          resumeFrom,
+          resumeAt: resumeFrom ? resumeCheckpoint(resumeFrom) : undefined,
+        }),
       ],
       {
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
         cwd: process.env.CLAUDE_CWD || process.cwd(),
-        env: Object.fromEntries(
-          Object.entries(process.env).filter(
-            ([key]) =>
-              key !== "CLAUDECODE" && key !== "CLAUDE_CODE_EFFORT_LEVEL",
-          ),
-        ) as Record<string, string>,
+        env: {
+          ...(Object.fromEntries(
+            Object.entries(process.env).filter(
+              ([key]) =>
+                key !== "CLAUDECODE" && key !== "CLAUDE_CODE_EFFORT_LEVEL",
+            ),
+          ) as Record<string, string>),
+          ...accountEnv(account),
+        },
       },
     ) as unknown as ClaudeProcess;
     liveWorkers.add(this);
@@ -282,6 +327,7 @@ class ClaudeWorker {
       if (this.pending) {
         const message =
           this.stderr.trim() || `Claude CLI exited with code ${exitCode}`;
+        if (isLimitError(undefined, this.stderr)) markLimited(this.account);
         this.pending.reject(new Error(message));
         this.pending = undefined;
       }
@@ -290,10 +336,10 @@ class ClaudeWorker {
 
   async run(
     content: ClaudeInputBlock[],
-    requestId: string,
+    turn: TurnContext,
     attempt = 1,
   ): Promise<ClaudeResult> {
-    this.requestId = requestId;
+    this.turn = turn;
     this.attempt = attempt;
     this.workerTurn++;
     if (this.closed) throw new Error("Claude CLI worker is closed");
@@ -397,10 +443,19 @@ class ClaudeWorker {
 
   private acceptLine(line: string): void {
     try {
-      const value = JSON.parse(line) as ClaudeResult;
+      const value = JSON.parse(line) as
+        | ClaudeResult
+        | { type: "rate_limit_event"; rate_limit_info?: Record<string, unknown> };
+      if (value.type === "rate_limit_event") {
+        observeRateLimit(this.account, value.rate_limit_info ?? {});
+        return;
+      }
       if (value.type !== "result" || !this.pending) return;
+      if (value.is_error && isLimitError(value.api_error_status, value.result))
+        markLimited(this.account);
+      this.turn.account = this.account;
       recordUsage(value, {
-        requestId: this.requestId,
+        requestId: this.turn.requestId,
         workerId: this.workerId,
         workerTurn: this.workerTurn,
         model: this.model,
@@ -408,6 +463,10 @@ class ClaudeWorker {
         attempt: this.attempt,
         launchMode: "minimal",
         resumed: this.resumed,
+        threadId: this.turn.threadId,
+        sessionId: this.sessionId,
+        resumedFrom: this.resumedFrom,
+        account: this.account.name,
       });
       const pending = this.pending;
       this.pending = undefined;
@@ -501,13 +560,20 @@ export function conversationDelta(
 
 function claimWorker(
   request: ResponsesRequest,
+  account?: Account,
 ): { worker: ClaudeWorker; delta: ResponseInputItem[] } | undefined {
   const input = inputItems(request);
   const effort = resolveEffort(request);
   const signature = toolSignature(request);
   // Most recently parked first.
   for (const worker of [...idleWorkers].reverse()) {
+    // A limited account cannot answer; the session resumes on another one.
+    if (isLimited(worker.account)) {
+      worker.close();
+      continue;
+    }
     if (
+      (account && worker.account.name !== account.name) ||
       worker.model !== request.model ||
       worker.effort !== effort ||
       worker.instructions !== request.instructions ||
@@ -634,39 +700,106 @@ function structuredOutput(
 export async function runClaude(
   request: ResponsesRequest,
 ): Promise<ProxyOutput> {
+  let turn: TurnContext = {
+    requestId: crypto.randomUUID(),
+    threadId:
+      typeof request.prompt_cache_key === "string"
+        ? request.prompt_cache_key
+        : undefined,
+  };
+  let output: ProxyOutput;
+  for (;;) {
+    turn = { requestId: turn.requestId, threadId: turn.threadId };
+    try {
+      output = await runClaudeTurn(request, turn);
+      break;
+    } catch (error) {
+      // Corrections can also hit quota; replay before any tool calls are returned.
+      if (!turn.account || !isLimited(turn.account) || !pickAccount()) throw error;
+    }
+  }
+  if (turn.threadId && turn.account) {
+    try {
+      pinThreadAccount(turn.threadId, turn.account.name, turn.pinnedAccount);
+    } catch (error) {
+      // Persistence failure must not discard an already completed response.
+      console.error("Unable to save thread account:", (error as Error).message);
+    }
+  }
+  return { ...output, account: turn.account?.name };
+}
+
+async function runClaudeTurn(
+  request: ResponsesRequest,
+  turn: TurnContext,
+): Promise<ProxyOutput> {
   validateCompactionItems(request);
-  const requestId = crypto.randomUUID();
-  const live = claimWorker(request);
-  const stored = live ? undefined : findStoredSession(request);
-  const delta = live?.delta ?? stored?.delta;
-  let worker = live?.worker ?? new ClaudeWorker(request, stored?.resumeFrom);
+  const original = request;
+  request = normalizeContext(request);
+  const pinnedName = turn.threadId
+    ? threadAccount(turn.threadId) ?? claimThreadAccount(turn.threadId, (pickAccount() ?? soonestAccount()).name)
+    : undefined;
+  const pinned = listAccounts().find((account) => account.name === pinnedName);
+  const account = pinned && !isLimited(pinned) ? pinned : pickAccount() ?? soonestAccount();
+  if (turn.threadId) {
+    turn.pinnedAccount = pinnedName ?? account.name;
+  }
+  let live = claimWorker(request, turn.threadId ? account : undefined);
+  let stored = live ? undefined : findStoredSession(request);
+  // Existing sessions must keep the exact prefix they were originally sent.
+  if (!live && !stored && request !== original) {
+    live = claimWorker(original, turn.threadId ? account : undefined);
+    stored = live ? undefined : findStoredSession(original);
+    if (live || stored) request = original;
+  }
+  let delta = live?.delta ?? stored?.delta;
+  let resumeFrom = live?.worker.sessionId ?? stored?.resumeFrom;
+  let worker = live?.worker ?? new ClaudeWorker(request, resumeFrom, account);
   let prepared = await prepareClaudePrompt(
     delta ? deltaRequest(request, delta) : conversationRequest(request),
   );
   let result: ClaudeResult;
+  let attempt = 1;
   try {
-    result = await worker.run(prepared.content, requestId);
+    while (true) {
+      try {
+        result = await worker.run(prepared.content, turn, attempt++);
+      } catch (error) {
+        worker.close();
+        const next = isLimited(worker.account) ? pickAccount() : undefined;
+        if (next) {
+          worker = new ClaudeWorker(request, resumeFrom, next);
+          continue;
+        }
+        if (isLimited(worker.account) || !delta) throw error;
+        // Missing or unusable transcripts get one full-history fallback.
+        await prepared.cleanup();
+        prepared = await prepareClaudePrompt(conversationRequest(request));
+        delta = undefined;
+        resumeFrom = undefined;
+        worker = new ClaudeWorker(request, undefined, worker.account);
+        continue;
+      }
+      if (!result.is_error || !isLimited(worker.account)) break;
+      const next = pickAccount();
+      if (!next) break;
+      console.error(
+        `Switching Claude account ${worker.account.name} -> ${next.name}`,
+      );
+      worker.close();
+      // Keep the original checkpoint and delta across every rejected account.
+      worker = new ClaudeWorker(request, resumeFrom, next);
+    }
   } catch (error) {
     worker.close();
-    if (!delta) throw error;
-    // A parked worker can die while idle, or a transcript can be missing;
-    // replay the full request once in a fresh session.
-    await prepared.cleanup();
-    prepared = await prepareClaudePrompt(conversationRequest(request));
-    worker = new ClaudeWorker(request);
-    try {
-      result = await worker.run(prepared.content, requestId, 2);
-    } catch (fallbackError) {
-      worker.close();
-      throw fallbackError;
-    }
+    throw error;
   } finally {
     await prepared.cleanup();
   }
 
   let structured = structuredOutput(worker, result);
   if (isCompactionRequest(request))
-    return await compactionOutput(worker, request, requestId, structured);
+    return await compactionOutput(worker, request, turn, structured);
 
   // Tool names are validated here instead of by a schema enum (see
   // outputSchema). Correct them in the same process to keep its cache.
@@ -686,7 +819,7 @@ export async function runClaude(
     try {
       result = await worker.run(
         [{ type: "text", text: correction }],
-        requestId,
+        turn,
         retry + 2,
       );
     } catch (error) {
@@ -732,7 +865,7 @@ export async function runClaude(
 async function compactionOutput(
   worker: ClaudeWorker,
   request: ResponsesRequest,
-  requestId: string,
+  turn: TurnContext,
   structured: StructuredOutput,
 ): Promise<ProxyOutput> {
   for (
@@ -748,7 +881,7 @@ async function compactionOutput(
     try {
       result = await worker.run(
         [{ type: "text", text: COMPACTION_CORRECTION }],
-        requestId,
+        turn,
         retry + 2,
       );
     } catch (error) {

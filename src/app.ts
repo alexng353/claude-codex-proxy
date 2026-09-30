@@ -1,3 +1,4 @@
+import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
@@ -48,6 +49,8 @@ export async function handleRequest(request: Request): Promise<Response> {
   if (url.pathname === "/health" && request.method === "GET")
     return json({ status: "ok" });
   if (!authorized(request)) return error("Invalid API key", 401);
+  if (url.pathname === "/accounts" && request.method === "GET")
+    return json({ accounts: accountStatus() });
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return json({
       models: modelCatalog,
@@ -67,7 +70,10 @@ export async function handleRequest(request: Request): Promise<Response> {
     const body = validateRequest(await request.json());
     const output = await runClaude(body);
     const response = responseObject(body, output);
-    return body.stream ? streamResponse(response) : json(response);
+    const reply = body.stream ? streamResponse(response) : json(response);
+    for (const [name, value] of Object.entries(usageHeaders(output.account)))
+      reply.headers.set(name, value);
+    return reply;
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
     const status = message.startsWith("Unsupported Claude") ? 400 : 502;

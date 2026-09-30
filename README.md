@@ -88,7 +88,7 @@ A spawned sub-agent inherits its parent task's provider; Codex changes only the 
 | `CLAUDE_MAX_IDLE_WORKERS` | `8` | Idle Claude processes kept alive; the least recently used is closed first (~270 MB each) |
 | `CLAUDE_SESSION_RETENTION_MS` | `3600000` | How long a persisted Claude session stays resumable before its mapping and transcript are deleted (Claude Code's cache TTL is 1 hour) |
 | `PROXY_API_KEY` | unset | Optional bearer token |
-| `PROXY_STATE_DIR` | `$XDG_STATE_HOME/claude-codex-proxy` or `~/.local/state/claude-codex-proxy` | Usage JSONL and the `sessions.sqlite` session map; owner-only files |
+| `PROXY_STATE_DIR` | `$XDG_STATE_HOME/claude-codex-proxy` or `~/.local/state/claude-codex-proxy` | `usage.jsonl`, the derived `usage.sqlite`, the `sessions.sqlite` session map, `limits-cache/` probe results, and `limits-history.jsonl` recorded samples; owner-only files |
 
 Binding to a non-loopback address is rejected unless `PROXY_API_KEY` is set. If enabled, add `env_key = "CLAUDE_CODEX_PROXY_KEY"` to the provider and export the same value:
 
@@ -96,6 +96,24 @@ Binding to a non-loopback address is rejected unless `PROXY_API_KEY` is set. If 
 export PROXY_API_KEY='choose-a-long-random-value'
 export CLAUDE_CODEX_PROXY_KEY="$PROXY_API_KEY"
 ```
+
+### Multiple Claude accounts
+
+The proxy uses the account `claude login` signed into first. When Claude reports that an account is rate limited (a `rejected` `rate_limit_event`, or a 429 result), the proxy marks it limited until its reset time and replays the turn on the next available account. Chats are durably pinned by `prompt_cache_key` (normally the root Codex session ID, shared with its subagents) to their selected account, including across proxy restarts, compaction, and transcript expiry. Successful rate-limit failover updates the pin; a quota reset does not move an existing chat back. Pins refer to the configured account name. If the pinned account is removed, the next successful request pins an available account. If the pin database is unreadable or cannot record an initial assignment, threaded requests fail before inference rather than choosing an unverified account. A pin update failure after inference is logged and preserves the completed response. New requests without a thread ID use the first available account; existing live workers keep their account.
+
+```bash
+bun run account add work     # opens the browser to sign in a second account
+bun run account list
+curl -s http://127.0.0.1:3456/accounts   # which accounts are limited, and until when
+bun run limits               # five-hour and weekly usage bars per account
+bun run limits --probe --record --quiet   # append a fresh sample per account to limits-history.jsonl
+```
+
+`bun run limits` reads what the proxy last saw and supplements it with Claude Code's local `/usage` command, which also reports model-specific weekly meters such as Fable. This reads usage without generating a model response or spending model tokens. Query results are cached for five minutes to make repeat queries fast, expiring earlier when a quota window resets; `--probe` refreshes every account. Newer proxy observations update overlapping meters without hiding the cached model-specific meters; supplemented meters show their cache age. The display labels the source and observation age. Usage queries time out after 15 seconds, disable customizations, and do not save chats. They require Claude Code 2.1.282 or newer and structured `usage_report` data for `/usage`; unsupported versions report unavailable data instead of falling back to a model request. If a usage refresh fails, valid proxy data remains available. The `LIMITED` label comes from an explicit rejection observed by the proxy; local usage queries report percentages and reset times. Each proxy response also carries Codex's `x-codex-primary-*` (five-hour) and `x-codex-secondary-*` (weekly) rate-limit headers for the account that answered, so Codex's own usage display shows the Claude account.
+
+Limit readings otherwise arrive only while an account is serving turns, so idle accounts have gaps. `--record` appends one line per account to `$PROXY_STATE_DIR/limits-history.jsonl` with the sample time, source, reset times, and each window's percentage; `--quiet` suppresses the display. Running `bun run limits --probe --record --quiet` from a five-minute systemd user timer gives a continuous history of every account.
+
+Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory keeps its own `.credentials.json` and `.claude.json`; every other entry is a symlink to your main Claude config. Because `projects/` is shared, a conversation can resume its transcript on another account. A switch still misses the prompt cache once, since each account has its own cache.
 
 ## Supported API
 
@@ -145,7 +163,20 @@ Inspired by [wende/claude-max-api-proxy](https://github.com/wende/claude-max-api
 
 ## Cache behavior and diagnostics
 
-`usage.jsonl` records every Claude result, including errors, with UTC timestamp, request ID, worker ID, worker turn number, retry attempt, model, effort, raw `usage`, and `modelUsage`. It does not contain prompts, responses, screenshots, or credentials. Missing usage remains null; it is not fabricated as zero. Logging failures go to stderr without dropping completed inference.
+`usage.jsonl` records every Claude result, including errors, with UTC timestamp, request ID, worker ID, worker turn number, retry attempt, model, effort, Codex thread ID (`prompt_cache_key`), Claude session ID and fork parent, durations, raw `usage`, and `modelUsage`. It does not contain prompts, responses, screenshots, or credentials. Missing usage remains null; it is not fabricated as zero. Logging failures go to stderr without dropping completed inference.
+
+### Usage history
+
+`usage.sqlite` holds one row per Claude turn in the `turns` table, derived from `usage.jsonl`. The proxy syncs it after each turn by byte offset, so deleting the database rebuilds it from the log, including rows written before it existed. The `usage_hourly`, `usage_daily`, `usage_weekly` (Monday-start, local time), and `usage_by_thread` views aggregate turns, errors, input/output/thinking tokens, cache reads and writes, cache hit ratio, cost, and duration.
+
+```bash
+bun run usage                  # last 14 days: daily, per model, per turn, top threads
+bun run usage --days 30 --threads 20
+bun run usage --json
+sqlite3 ~/.local/state/claude-codex-proxy/usage.sqlite 'SELECT * FROM usage_daily'
+```
+
+`cost_usd` is Claude Code's API-list-price equivalent for that turn, not a subscription charge or a share of a subscription limit. Claude Code reports `modelUsage.costUSD` cumulatively per process, and a `--resume` fork inherits its parent's totals, so summing raw `costUSD` values overcounts. Each turn's cost is its cumulative cost minus the cumulative cost it started from: the worker's previous turn, or, for a first turn, a unique matching checkpoint for the same model and recorded parent session (or zero for a fresh process). Legacy records without session ancestry require a unique matching baseline. Unknown or ambiguous starting totals leave `cost_usd` null and reported as unpriced rather than guessed.
 
 Stable instructions and a canonically ordered tool registry precede changing conversation content. Tool schema keys are sorted. Ordinary tool results reuse the existing worker and omit the instructions and registry already in its history. Changes in model, effort, instructions, or tool definitions require a fresh worker; a mere reorder of tools does not. Tool discovery currently requires a fresh worker so the new structured-output schema includes discovered tools.
 
@@ -161,3 +192,22 @@ Alex's existing Linux desktop integration has an incremental
 Arch/Hyprland app in an independent job and verifies that its window returns.
 The restart helper's safety checks run with
 `python3 -m unittest discover -s test -p '*_test.py'`.
+
+### Repeated Codex context
+
+The proxy keeps the first skills catalog and turns later compatible catalogs into
+updates containing changed entries and removals. It resolves new paths without
+reassigning earlier root aliases. Repeated memory is suppressed only when no
+intervening instruction can change its precedence. User messages, tool results,
+unknown catalog formats, and server-side incremental requests are preserved.
+
+Normalization runs before worker selection. Existing sessions whose stored
+prefix predates normalization keep their original history so they can resume;
+this does not retroactively remove duplicates from a cached Claude transcript.
+
+`src/context.mjs` exports the shared `normalizeContext(request)` interface used
+by the Codex model router. It preserves the request object when no rewrite is
+needed and otherwise returns a new request without mutating the original.
+The router loads this module from `CLAUDE_CODEX_PROXY_DIR` (default
+`~/.local/share/claude-codex-proxy`). Update the proxy before dependent router
+patches, and restart both services when this module changes.
