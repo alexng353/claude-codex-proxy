@@ -20,6 +20,7 @@ import {
   type Account,
 } from "./accounts";
 import { recordUsage } from "./usage";
+import { normalizeVisualizeReferences } from "./visualize";
 import {
   findSessions,
   threadAccount,
@@ -833,8 +834,10 @@ async function runClaudeTurn(
     ...call,
     callId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
   }));
+  // Normalize before parking so Codex's echo of this turn matches lastTurn.text.
+  const text = normalizeVisualizeReferences(structured.text);
   worker.park(inputItems(request), {
-    text: structured.text,
+    text,
     callIds: new Set(toolCalls.map((call) => call.callId)),
   });
   // Claude Code's usage includes its private system prompt, native tool schemas,
@@ -843,10 +846,10 @@ async function runClaudeTurn(
   // Only report the request/output content that Codex can retain or compact.
   const inputTokens = estimateRequestTokens(request);
   const outputTokens = estimateVisibleTokens(
-    structured.text + JSON.stringify(toolCalls),
+    text + JSON.stringify(toolCalls),
   );
   return {
-    text: structured.text,
+    text,
     toolCalls,
     usage: {
       inputTokens,
