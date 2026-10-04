@@ -17,6 +17,7 @@ tool catalog from Desktop.
 For Plate or a chat whose tool catalog predates the patch:
 
 ```sh
+node desktop/compaction/call.mjs # calling chat, using CODEX_THREAD_ID
 node desktop/compaction/call.mjs THREAD_UUID
 node desktop/compaction/call.mjs status
 ```
@@ -30,6 +31,14 @@ for the chat to become idle, including any turns started in the meantime.
 
 Validation: `bun test test/desktop-compaction.test.ts` covers queue admission,
 deduplication, restart recovery, completion events, and persisted RPC failures.
+Live verification on October 3, 2026 used throwaway chat
+`01a104c7-fefb-7d02-b004-4beb20a95b85`. Desktop relaunched with a verified new
+window. An idle-chat request returned `started` and produced a `compacted`
+rollout record; its next turn replied `COMPACTION_AFTER_OK`. A request from the
+chat itself, omitting the target UUID, returned `queued` at 19:46:06 PDT.
+The current turn completed at 19:46:08, followed by a compaction turn that
+completed at 19:46:28. Its next turn replied `COMPACTION_SELF_AFTER_OK`.
+The bundled app-tools MCP server's `tools/list` also advertised `compact_thread`.
 
 `visual-consistency.patch` updates Alex's existing Linux patch manager at
 `~/.local/share/codex-patches`. It is an incremental patch for that installation,

@@ -14,7 +14,7 @@ const threadId = process.argv[2] ?? process.env.CODEX_THREAD_ID;
 const pipe = process.env.CODEX_APP_TOOLS_PIPE_PATH ?? readFileSync(join(homedir(), ".local/state/codex-compaction/pipe"), "utf8").trim();
 if (!pipe || !threadId) throw Error("Run inside a Codex Desktop chat, or supply CODEX_APP_TOOLS_PIPE_PATH and a thread UUID");
 const params = {
-  arguments: { threadId }, callerSource: "codex", hostId: "local",
+  arguments: process.argv[2] ? { threadId } : {}, callerSource: "codex", hostId: "local",
   namespace: "codex_app", tool: "compact_thread", threadId,
   callId: randomUUID(), turnId: "local-compact-" + randomUUID(),
 };
