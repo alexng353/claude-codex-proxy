@@ -34,13 +34,20 @@ import {
   type SessionKey,
 } from "./sessions";
 import {
+  estimateRequestTokens,
+  estimateVisibleTokens,
+  fitReplay,
+  promptTooLong,
+  replayBudget,
+  replayTokens,
+  retryBudget,
+} from "./budget";
+import {
   conversationRequest,
   deltaRequest,
   isCompactionRequest,
   outputSchema,
   prepareClaudePrompt,
-  requestImageCount,
-  requestToPrompt,
   requestTools,
   stableJson,
   systemContext,
@@ -651,22 +658,11 @@ function toolSignature(request: ResponsesRequest): string {
   return stableJson(toolDescriptors(request.tools ?? []));
 }
 
-export function estimateVisibleTokens(value: string): number {
-  if (!value) return 0;
-  return Math.max(1, Math.ceil(Buffer.byteLength(value, "utf8") / 4));
-}
-
-// Claude bills an image by its pixel area, capped near 4,800 tokens at the largest
-// size current models accept. Assuming the cap keeps Codex compacting early
-// rather than letting a screenshot-heavy task outgrow the real window.
-export const IMAGE_TOKEN_ESTIMATE = 4_800;
-
-export function estimateRequestTokens(request: ResponsesRequest): number {
-  return (
-    estimateVisibleTokens(requestToPrompt(request)) +
-    requestImageCount(request) * IMAGE_TOKEN_ESTIMATE
-  );
-}
+export {
+  estimateRequestTokens,
+  estimateVisibleTokens,
+  IMAGE_TOKEN_ESTIMATE,
+} from "./budget";
 
 type StructuredOutput = NonNullable<ClaudeResult["structured_output"]>;
 
@@ -756,9 +752,22 @@ async function runClaudeTurn(
   let delta = live?.delta ?? stored?.delta;
   let resumeFrom = live?.worker.sessionId ?? stored?.resumeFrom;
   let worker = live?.worker ?? new ClaudeWorker(request, resumeFrom, account);
-  let prepared = await prepareClaudePrompt(
-    delta ? deltaRequest(request, delta) : conversationRequest(request),
-  );
+  // Estimated tokens of the last full-history prompt, to rescale after a rejection.
+  let replaySent = 0;
+  /** The whole conversation for a fresh worker, shortened to fit Claude's window. */
+  const replayPrompt = (budget = replayBudget(request.model)) => {
+    const fitted = fitReplay(request, budget);
+    replaySent = fitted.tokens;
+    if (fitted.elided)
+      console.error(
+        `Elided ${fitted.elided} older tool output(s) to fit a replay into ~${fitted.tokens} estimated tokens${fitted.fits ? "" : " (still over budget)"}`,
+      );
+    return prepareClaudePrompt(conversationRequest(fitted.request));
+  };
+  let prepared = delta
+    ? await prepareClaudePrompt(deltaRequest(request, delta))
+    : await replayPrompt();
+  let shrunk = false;
   let result: ClaudeResult;
   let attempt = 1;
   try {
@@ -775,7 +784,22 @@ async function runClaudeTurn(
         if (isLimited(worker.account) || !delta) throw error;
         // Missing or unusable transcripts get one full-history fallback.
         await prepared.cleanup();
-        prepared = await prepareClaudePrompt(conversationRequest(request));
+        prepared = await replayPrompt();
+        delta = undefined;
+        resumeFrom = undefined;
+        worker = new ClaudeWorker(request, undefined, worker.account);
+        continue;
+      }
+      const tooLong =
+        result.is_error && !shrunk ? promptTooLong(result.result ?? "") : undefined;
+      if (tooLong) {
+        // The estimate was optimistic (or a resumed session outgrew Claude's
+        // window): replay once more with the error's own sizes as the scale.
+        shrunk = true;
+        worker.close();
+        await prepared.cleanup();
+        const sent = delta ? replayTokens(request) : replaySent;
+        prepared = await replayPrompt(retryBudget(sent, tooLong, request.model));
         delta = undefined;
         resumeFrom = undefined;
         worker = new ClaudeWorker(request, undefined, worker.account);

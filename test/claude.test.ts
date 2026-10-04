@@ -169,7 +169,7 @@ describe("Claude subprocess permissions", () => {
   });
 
   test("estimates only Codex-visible UTF-8 content", () => {
-    expect(estimateVisibleTokens("hello")).toBe(2);
+    expect(estimateVisibleTokens("hello")).toBe(3);
     expect(estimateVisibleTokens("")).toBe(0);
   });
 

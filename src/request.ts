@@ -173,7 +173,7 @@ export const textFromContent = (
     .join("\n");
 };
 
-const serializeItem = (item: ResponseInputItem): string => {
+export const serializeItem = (item: ResponseInputItem): string => {
   if (item.type === "compaction_trigger") {
     return `<user>\n${SUMMARIZATION_PROMPT}\n\nPut the whole summary in text and leave tool_calls empty.\n</user>`;
   }
@@ -403,7 +403,7 @@ export function outputSchema(tools: ResponseTool[]): Record<string, unknown> {
 // Tool results can be content parts. Their images travel as native image blocks
 // (see prepareClaudePrompt); inlining the base64 as text costs several times more
 // tokens than the image itself and hides it from Claude's vision.
-function toolOutputText(parts: unknown[]): string {
+export function toolOutputText(parts: unknown[]): string {
   return parts
     .map((part) => {
       if (!part || typeof part !== "object") return JSON.stringify(part);
