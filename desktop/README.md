@@ -1,5 +1,36 @@
 # Local Codex Desktop UI integration
 
+`compaction/` adds `codex_app.compact_thread({threadId?})` to the desktop's
+existing app-tools socket. Omit the UUID to compact the calling local Codex chat.
+The desktop's own app-server performs `thread/compact/start`; active chats return
+`queued` and wait until idle. `started` means the server accepted the request,
+not that the summary finished. Duplicate pending calls coalesce.
+
+Install with `python3 desktop/compaction/install.py`, then run
+`python3 ~/.local/share/codex-patches/manager.py apply --no-repair` and restart
+Desktop. The installer backs up the patch-manager files. The manager backs up
+the archive, verifies JavaScript and archive readback, and reapplies after app
+updates. Changed anchors fail loudly through its existing failure reports and
+repair mechanism. The bundled MCP server needs no modification: it reads the
+tool catalog from Desktop.
+
+For Plate or a chat whose tool catalog predates the patch:
+
+```sh
+node desktop/compaction/call.mjs THREAD_UUID
+node desktop/compaction/call.mjs status
+```
+
+The CLI uses `CODEX_APP_TOOLS_PIPE_PATH` or Desktop's private pipe marker in
+`~/.local/state/codex-compaction/pipe`. Queue state and errors live beside it in
+`status.json`. Queued requests survive restarts. An accepted request whose
+completion was not observed becomes `interrupted` instead of being replayed;
+inspect its rollout before retrying. Cloud chats are unsupported. Queuing waits
+for the chat to become idle, including any turns started in the meantime.
+
+Validation: `bun test test/desktop-compaction.test.ts` covers queue admission,
+deduplication, restart recovery, completion events, and persisted RPC failures.
+
 `visual-consistency.patch` updates Alex's existing Linux patch manager at
 `~/.local/share/codex-patches`. It is an incremental patch for that installation,
 not a standalone Codex installer or a portable patch for arbitrary app versions.
