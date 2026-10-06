@@ -2,6 +2,7 @@ import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
+import { scrubRequest } from "./scrub.mjs";
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
 const error = (message: string, status = 400) =>
@@ -67,7 +68,9 @@ export async function handleRequest(request: Request): Promise<Response> {
     return error("Not found", 404);
 
   try {
-    const body = validateRequest(await request.json());
+    // Redact before anything else sees the request: prompts, cache hashes,
+    // stored sessions, and Claude itself.
+    const body = scrubRequest(validateRequest(await request.json()));
     const output = await runClaude(body);
     const response = responseObject(body, output);
     const reply = body.stream ? streamResponse(response) : json(response);

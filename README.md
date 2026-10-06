@@ -156,6 +156,7 @@ Tests use a fake Claude executable and do not consume subscription quota. A manu
 - The proxy never reads or exposes Claude OAuth credentials.
 - Every inference subprocess retains `--dangerously-skip-permissions`, but native tools and customizations are disabled. Actual tools execute through Codex and use Codex's configured permissions. Admin-managed Claude policy remains applicable.
 - Keep the server bound to localhost unless you add a bearer token and understand the network exposure.
+- Requests are scrubbed of credentials before anything else sees them (`src/scrub.mjs`). Known values are read into memory at startup from `~/.config/zsh/secrets.zsh` (sourced in a clean `zsh -f` with tracing off) and `~/.config/spotlike/env`, and become `[REDACTED:NAME]`. Override the list with `SECRET_SCRUB_FILES` (colon-separated; `.zsh`/`.sh` files are sourced, others parsed as `KEY=VALUE`). Changed files are reloaded within 5 seconds, and retired values stay redacted until restart. Token shapes are redacted even when unconfigured: GitHub, npm, Hugging Face, AWS key IDs, Mailgun, `sk-` API keys, Slack, PEM private keys, and credential-named assignments such as `CF_API_TOKEN=...`, which is how `set -x` prints them. Opaque `encrypted_content`, `data:` URLs, and tool schemas are skipped. Scrubbing about 1.4 MB of history takes about 13 ms. The Codex model router imports the same module, so GPT requests are scrubbed as well. `SECRET_SCRUB_DISABLE=1` turns it off.
 
 ## Attribution
 
