@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { handleRequest } from "../src/app";
 import { closeIdleWorkers } from "../src/claude";
 import { zonedTime } from "../src/hygiene";
+import { setAuthenticator } from "../src/hygiene-api";
 import { gateRequest, gateStatus, resetGateCache, setGateDeps } from "../src/hygiene-gate";
 import type { Verdict } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
@@ -479,5 +480,104 @@ describe("locked responses through the proxy", () => {
     expect(JSON.stringify(unlocked.request)).toContain("image withheld");
     const status = await (await handleRequest(new Request("http://localhost/hygiene/status"))).json();
     expect(status).toMatchObject({ enabled: true, state: "clear", bypass: { count: 0 } });
+  });
+});
+
+describe("Cairn API", () => {
+  const tokens: Record<string, { id: string; name: string; role: string }> = {
+    phone: { id: "phone-1", name: "iphone", role: "phone" },
+    agent: { id: "agent-1", name: "codex", role: "agent" },
+  };
+  let relayDown = false;
+  beforeEach(() =>
+    setAuthenticator(async (token) => {
+      if (relayDown) throw new Error("down");
+      return tokens[token] ?? null;
+    }),
+  );
+  afterAll(() => setAuthenticator());
+  const api = (path: string, init: RequestInit & { token?: string; headers?: Record<string, string> } = {}) =>
+    handleRequest(
+      new Request(`http://localhost/hygiene/api/v1${path}`, {
+        ...init,
+        headers: { ...(init.token ? { authorization: `Bearer ${init.token}` } : {}), ...init.headers },
+      }),
+    );
+  const submit = (kind: string, name: string, token = "phone") =>
+    api("/proofs", { method: "POST", token, body: JSON.stringify({ kind, image: Buffer.from(name).toString("base64") }) });
+
+  test("auth: no token, unknown token and agent devices are refused; a down relay is 503", async () => {
+    expect((await api("/status")).status).toBe(401);
+    expect((await api("/status", { token: "nope" })).status).toBe(401);
+    expect((await api("/status", { token: "agent" })).status).toBe(403);
+    relayDown = true;
+    setAuthenticator(async () => {
+      throw new Error("down");
+    });
+    expect((await api("/status", { token: "phone" })).status).toBe(503);
+    relayDown = false;
+  });
+
+  test("status reports the gate, delay and bypass", async () => {
+    const body = await (await api("/status", { token: "phone" })).json();
+    expect(body).toMatchObject({
+      enabled: true,
+      state: "armed",
+      today: DAY,
+      outstanding: [{ slot: `${DAY}/morning-teeth`, kind: "teeth" }],
+      bypass: { count: 0, active_until: null },
+      delay: { active: false, expires_at: null, count: 0 },
+    });
+  });
+
+  test("a passing morning proof unlocks the chat gate and appears in the daily photos", async () => {
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    const body = await (await submit("teeth_morning", "cairn-teeth")).json();
+    expect(body).toMatchObject({ result: "pass", verdict: "accepted", slot: `${DAY}/morning-teeth`, gate: { state: "clear" } });
+    expect((await decide(request([env, user("hi")]))).action).toBe("forward");
+    // Resending the same bytes returns the first verdict without a new check.
+    const again = await (await submit("teeth_morning", "cairn-teeth")).json();
+    expect(again).toMatchObject({ result: "pass", slot: `${DAY}/morning-teeth` });
+    expect(classified).toBe(1);
+    const list = await (await api(`/photos?from=${DAY}&to=${DAY}`, { token: "phone" })).json();
+    expect(list.days).toHaveLength(1);
+    expect(list.days[0]).toMatchObject({ day: DAY, photos: [{ kind: "teeth", slot: `${DAY}/morning-teeth`, manual: false }] });
+    const file = await api(list.days[0].photos[0].url.replace("/hygiene/api/v1", ""), { token: "phone" });
+    expect(file.headers.get("content-type")).toBe("image/jpeg");
+    expect(await file.text()).toBe("cairn-teeth");
+    expect((await api(`/photos/${"0".repeat(64)}`, { token: "phone" })).status).toBe(404);
+  });
+
+  test("the stated kind limits which requirement a photo can fill", async () => {
+    const notDue = await (await submit("teeth_night", "early")).json();
+    expect(notDue).toMatchObject({ result: "fail", verdict: "not_due", slot: null });
+    expect(classified).toBe(0);
+    verdicts.push({ kind: "teeth", confidence: 0.9, reason: "brushing" });
+    const wrong = await (await submit("shower", "is-teeth")).json();
+    expect(wrong).toMatchObject({ result: "fail", verdict: "rejected" });
+    expect(gateStatus().state).toBe("armed");
+  });
+
+  test("bad requests and the kill switch", async () => {
+    expect((await api("/proofs", { method: "POST", token: "phone", body: "{" })).status).toBe(400);
+    expect((await submit("selfie", "x")).status).toBe(400);
+    expect((await api("/proofs", { method: "POST", token: "phone", body: JSON.stringify({ kind: "shower" }) })).status).toBe(400);
+    expect((await api("/photos?from=yesterday", { token: "phone" })).status).toBe(400);
+    await writeFile(process.env.HYGIENE_GATE_DISABLED_FILE!, "");
+    expect((await submit("shower", "x")).status).toBe(503);
+  });
+
+  test("requests through Tailscale Serve reach only the hygiene API", async () => {
+    const via = { "x-forwarded-for": "100.64.0.5" };
+    expect((await api("/status", { token: "phone", headers: via })).status).toBe(200);
+    for (const [path, method] of [
+      ["/hygiene/status", "GET"],
+      ["/hygiene/debt/x/resolve", "POST"],
+      ["/hygiene/gate", "POST"],
+      ["/v1/responses", "POST"],
+      ["/accounts", "GET"],
+    ])
+      expect((await handleRequest(new Request(`http://localhost${path}`, { method, headers: via, body: method === "POST" ? "{}" : undefined }))).status).toBe(403);
+    expect((await handleRequest(new Request("http://localhost/hygiene/status", { headers: { "tailscale-user-login": "alex@" } }))).status).toBe(403);
   });
 });

@@ -217,22 +217,42 @@ export type GateDecision =
 
 const forward = (request: ResponsesRequest): GateDecision => ({ action: "forward", request });
 
-type ImageOutcome = { line: string | null };
+type ImageOutcome = { line: string | null; record?: ImageRecord };
+
+/** Restricts a check to one requirement type (Cairn says which proof it sends). */
+export type ProofTarget = { kind: ProofKind; slot: (name: string) => boolean };
+
+async function checkImageRecorded(
+  state: GateState,
+  url: string,
+  source: { thread: string; key: string },
+  now: number,
+  only?: ProofTarget,
+): Promise<ImageOutcome> {
+  const before = state.images.length;
+  const outcome = await checkImage(state, url, source, now, only);
+  return outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
+}
 
 async function checkImage(
   state: GateState,
   url: string,
   source: { thread: string; key: string },
   now: number,
+  only?: ProofTarget,
 ): Promise<ImageOutcome> {
   const decoded = decodeDataUrl(url);
   if (!decoded) return { line: null };
   const hash = sha256(decoded.bytes);
   // A retry or replay of the same message keeps its first verdict.
-  if (state.images.some((r) => r.sha256 === hash && r.source.thread === source.thread && r.source.key === source.key))
-    return { line: null };
-  const kinds = wantedKinds(state, now);
-  if (!kinds.length) return { line: null };
+  const previous = state.images.find(
+    (r) => r.sha256 === hash && r.source.thread === source.thread && r.source.key === source.key,
+  );
+  if (previous) return { line: null, record: previous };
+  const slotsFor = (kind: ProofKind) =>
+    candidateSlots(state, kind, now).filter((name) => !only || (kind === only.kind && only.slot(name)));
+  const kinds = only ? (slotsFor(only.kind).length ? [only.kind] : []) : wantedKinds(state, now);
+  if (!kinds.length) return { line: only ? "❌ nothing of that kind is due right now." : null };
   const record: ImageRecord = {
     sha256: hash,
     dhash: null,
@@ -290,7 +310,7 @@ async function checkImage(
     state.images.push(record);
     return { line: `❌ photo not clear enough to accept: ${verdict.reason || "low confidence"}` };
   }
-  const target = candidateSlots(state, verdict.kind as ProofKind, now)[0];
+  const target = slotsFor(verdict.kind as ProofKind)[0];
   if (!target) {
     state.images.push({ ...record, verdict: "unneeded" });
     return { line: null };
@@ -393,7 +413,7 @@ async function decideHumanTurn(
   const lines: string[] = [];
   for (const image of turn.images) {
     const before = state.images.length;
-    const outcome = await checkImage(state, image.url, { thread, key: keys.get(image.item) ?? "" }, now);
+    const outcome = await checkImageRecorded(state, image.url, { thread, key: keys.get(image.item) ?? "" }, now);
     if (outcome.line) lines.push(outcome.line);
     if (state.images.length !== before) dirty = true;
   }
@@ -501,4 +521,57 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
     return Response.json(result.body, { status: result.status });
   }
   return null;
+}
+
+// ---- Direct submissions (Cairn) ----
+
+export type SubmitResult = {
+  result: "pass" | "fail";
+  /** One line for the UI, same wording the chat lock uses. */
+  message: string;
+  verdict: ImageRecord["verdict"] | "not_due" | "error";
+  slot: string | null;
+  sha256: string;
+};
+
+/**
+ * Runs the chat checks (reuse, EXIF age, classifier) on a photo sent outside
+ * a chat. Resending the same bytes returns the first verdict.
+ */
+export async function submitProof(image: { mediaType: string; bytes: Buffer }, target: ProofTarget): Promise<SubmitResult> {
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    const hash = sha256(image.bytes);
+    const url = `data:${image.mediaType};base64,${image.bytes.toString("base64")}`;
+    const outcome = await checkImageRecorded(state, url, { thread: "cairn", key: hash }, now, target);
+    if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
+    const record = outcome.record;
+    const pass = record?.verdict === "accepted";
+    return {
+      result: pass ? "pass" : "fail",
+      message: outcome.line ?? (record ? imageMarker(record, state) : "❌ photo could not be read."),
+      verdict: record?.verdict ?? (outcome.line?.startsWith("⚠") ? "error" : "not_due"),
+      slot: record?.slot ?? null,
+      sha256: hash,
+    };
+  });
+}
+
+/** Accepted proofs grouped by local day, newest day first. */
+export function proofDays(from: string, to: string) {
+  const days = new Map<string, Array<{ sha256: string; kind: string; slot: string; at: string; manual: boolean }>>();
+  for (const r of loadState().images) {
+    if (r.verdict !== "accepted" || !r.slot || !r.file) continue;
+    const day = localTime(Date.parse(r.at)).day;
+    if (day < from || day > to) continue;
+    if (!days.has(day)) days.set(day, []);
+    days.get(day)!.push({ sha256: r.sha256, kind: r.kind ?? "", slot: r.slot, at: r.at, manual: !!r.manual });
+  }
+  return [...days.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([day, photos]) => ({ day, photos }));
+}
+
+export function proofFile(hash: string): string | null {
+  const record = loadState().images.find((r) => r.sha256 === hash && r.verdict === "accepted" && r.file);
+  return record?.file ?? null;
 }

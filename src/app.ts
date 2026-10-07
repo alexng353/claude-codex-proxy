@@ -1,5 +1,6 @@
 import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
+import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
@@ -76,6 +77,12 @@ export async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/health" && request.method === "GET")
     return json({ status: "ok" });
+  // Tailscale Serve exposes this port for Cairn. Anything that came through a
+  // proxy hop may reach only the separately authenticated hygiene API.
+  const forwarded = request.headers.has("x-forwarded-for") || request.headers.has("tailscale-user-login");
+  const hygieneApi = await handleHygieneApi(request, url);
+  if (hygieneApi) return hygieneApi;
+  if (forwarded) return error(`Only ${API_PREFIX} is reachable from outside this machine`, 403);
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });
