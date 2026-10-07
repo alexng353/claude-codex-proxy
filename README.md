@@ -228,3 +228,43 @@ The file is re-read when it changes, so no restart is needed to change scope. A 
 - **Cursor:** The cursor advances only after Claude returns a successful response. A retry gets the identical block. If a turn fails and Alex sends another message, its events move to the newer message. Compaction requests re-apply stored blocks but never create one.
 - **Failure:** If plate is unreachable, the turn proceeds unchanged and the events wait for the next message. Logs record only error names, never event or note text.
 - **Router:** The logic in `src/plate-activity.mjs` does not depend on the model, so the Codex router can import it like `scrub.mjs`. Today only this proxy applies the block, which covers Claude models, including requests that arrive through the router. A block that is already present is left alone, so a later router hook will not create duplicates.
+
+## Hygiene gate
+
+Alex asked for this: agents refuse to work until he sends a photo proving he brushed his teeth or showered. It covers every chat through this proxy, on both the Claude path and the GPT path through the Codex model router.
+
+**Kill switch.** `touch ~/.local/share/claude-codex-proxy/hygiene-gate/disabled` turns the gate fully off at once, with no restart. Delete the file to turn it back on. While it exists, the gate changes nothing: no locks, no notes, no photo rewriting.
+
+### Daily rules (America/Vancouver)
+
+- **Morning teeth.** From 05:00, the first gated turn is locked until a teeth photo passes.
+- **Night teeth and shower.** Both are due by midnight. A shower photo counts any time that day. A night teeth photo counts only from 17:00, so the morning photo cannot stand in for it. If either is missing at 00:00, the gate locks until it arrives. Clearing that lock does not cover the morning: after 05:00 the morning teeth photo is still needed. One photo fills one requirement.
+- **Locked.** The turn is not sent upstream. The proxy answers with a short final answer, such as `🪥 gate armed: morning teeth photo`, in the client's own format: SSE or JSON on the Claude path, SSE, JSON or websocket frames on the GPT path. The router then closes a GPT websocket, so Codex reconnects instead of chaining to a response OpenAI never saw.
+- **BYPASS.** A message that is exactly `BYPASS` opens the gate for one hour, adds one to the bypass counter, and opens a debt. On Alex's next gated turn in each chat, a hidden note asks the model to find out why and to rule on it with `POST /hygiene/debt/<id>/resolve`, sending either `{"verdict":"justified"}` or `{"verdict":"unjustified","penance":"<photo task>"}`. An unjustified ruling locks the gate until a photo matching the penance passes. BYPASS does nothing when the gate is already clear.
+- **DELAY.** A message that is exactly `delay` (any case, surrounding spaces ignored) postpones the morning teeth photo by two hours. It works once per morning, only between 05:00 and 12:00, and only when the morning photo is the only lock. Otherwise the reply points to BYPASS. Delays have their own counter and open no debt. During the window, each of Alex's messages carries a hidden note asking the model to end its reply with a one-line reminder. A teeth photo ends the delay. When the window expires without one, the gate locks again.
+
+### Which turns are gated
+
+Only turns Alex types. Codex puts `x-codex-turn-metadata` in the body's `client_metadata`, which the router forwards unchanged.
+
+- **Exempt by trigger.** Turns whose `turn_trigger` starts with `automation_` (heartbeats, cron, and scheduled one-shot tasks), `app_tool_send_message` and `app_tool_create_thread` (agent-to-agent prompts), `exec`, `code_review`, resume and onboarding triggers, and the other app-initiated triggers listed in `src/hygiene.ts`.
+- **Exempt by thread, request kind or content.** Turns in a `subagent` thread, any `request_kind` other than `turn`, compaction requests, and turns whose new user messages are all Codex wrappers (`<heartbeat>`, `<codex_delegation>`, `<subagent_notification>`, environment context and similar).
+- **Gated.** Every other trigger is treated as possibly human, including `composer`, queued messages, edits, and triggers the gate has never seen, such as a future mobile client.
+- **Continuations.** A request whose input ends in model output or tool results is a continuation of a turn that was already let through, so a long turn started before 05:00 keeps running.
+
+### Proof checks
+
+1. **Hashes.** Every image in Alex's new messages gets a SHA-256 and a 256-bit dHash, computed with ImageMagick. An exact copy of an accepted proof is rejected, and so is one within 10 bits of an accepted proof. On 30 of Alex's photos, re-encoded copies measured 0–9 bits apart; consecutive burst frames measured 10 or more.
+2. **Content.** A separate one-shot `claude -p --model haiku` call returns a JSON verdict: `teeth`, `shower`, `penance` or `none`. It runs with no session, tools or customizations. A verdict needs confidence 0.6 or higher. On 2026-10-07 the live call took about 5 seconds and classified a real brushing photo as `teeth` with confidence 0.98. If the call fails, the turn stays locked, and the photo can be resent.
+3. **EXIF.** If the photo has a capture time, it must be within 30 minutes of sending. Mobile uploads have none, and that is not a failure.
+4. **Storage.** Accepted photos are saved byte for byte, with EXIF intact, to `~/Documents/private/hygiene/YYYY/MM/DD/<kind>-<HHMMSS>-<sha8>.<ext>` in Vancouver time. Directories are mode 700 and files 600; override the location with `HYGIENE_PHOTO_DIR`. Rejected photos are never saved. The index in `$PROXY_STATE_DIR/hygiene-gate.json` keeps hashes, times, kind, verdict, requirement slot and saved path for 400 days.
+
+Photos that passed, or that looked like a bathroom photo, never reach the working model. In every request the gate replaces them with a fixed marker such as `[hygiene-gate: photo accepted as morning teeth (Oct 7) proof; image withheld]`. Hidden notes are stored against their message and replayed byte for byte, using the same message key as plate-activity. Both keep the prompt cache intact.
+
+### State, status and operations
+
+- **Status.** `curl -s http://127.0.0.1:3456/hygiene/status` reports `state` (`armed`, `clear`, `bypassed` or `disabled`), outstanding and due-today requirements, the bypass count, `delay` (`active`, `expires_at`, `count`), open debts and recent proofs.
+- **State file.** `hygiene-gate.json` is re-read when it changes, so it can be hand-edited without a restart. `startsAt` sets the first arm: nothing that arms earlier is enforced. `extraGatedTriggers` (for example `["exec"]`) temporarily gates `codex exec` turns for live checks. Only the proxy writes the file.
+- **Failure behaviour.** A gate bug fails open: the request is forwarded unchanged and an error is logged. A broken state file fails open the same way. If the proxy is down, the router forwards GPT turns ungated.
+- **Router.** The router (`~/.local/share/codex-patches/router`) imports `src/hygiene-events.mjs` and asks `POST /hygiene/gate` about GPT `/responses` requests and websocket `response.create` frames. Claude requests are gated inside `/v1/responses`. Restart both services when the gate changes.
+- **Tests.** `bun test test/hygiene.test.ts test/hygiene-gate.test.ts` covers the rules, exemptions, hashing, BYPASS, debt and penance, DELAY, the kill switch, and locked replies on both paths. All use an injected clock and classifier. Run the router's suite with `node --test router.test.mjs`.

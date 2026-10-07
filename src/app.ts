@@ -1,9 +1,11 @@
 import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
+import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
 import { scrubRequest } from "./scrub.mjs";
+import type { ProxyOutput, ResponsesRequest } from "./types";
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
 const error = (message: string, status = 400) =>
@@ -46,6 +48,30 @@ function authorized(request: Request): boolean {
   return request.headers.get("authorization") === `Bearer ${apiKey}`;
 }
 
+/** A reply the proxy writes itself (the hygiene gate), shaped like Claude's. */
+const syntheticOutput = (text: string): ProxyOutput => ({
+  text,
+  toolCalls: [],
+  usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+});
+
+/**
+ * The router's question for GPT turns: forward (possibly rewritten) or answer
+ * with this response object. Claude turns are gated inside /v1/responses.
+ */
+async function hygieneGateEndpoint(request: Request): Promise<Response> {
+  let body: ResponsesRequest;
+  try {
+    body = validateRequest(await request.json());
+  } catch (cause) {
+    return error((cause as Error).message);
+  }
+  const decision = await gateRequest(body);
+  if (decision.action === "respond")
+    return json({ action: "respond", response: responseObject(body, syntheticOutput(decision.text)) });
+  return json(decision.request === body ? { action: "forward" } : { action: "forward", request: decision.request });
+}
+
 export async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/health" && request.method === "GET")
@@ -53,6 +79,10 @@ export async function handleRequest(request: Request): Promise<Response> {
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });
+  if (url.pathname === "/hygiene/gate" && request.method === "POST")
+    return hygieneGateEndpoint(request);
+  const hygiene = await handleHygieneRoute(request, url);
+  if (hygiene) return hygiene;
   if (url.pathname === "/v1/models" && request.method === "GET") {
     return json({
       models: modelCatalog,
@@ -72,8 +102,14 @@ export async function handleRequest(request: Request): Promise<Response> {
     // Redact before anything else sees the request: prompts, cache hashes,
     // stored sessions, and Claude itself.
     const body = scrubRequest(validateRequest(await request.json()));
+    // Locked hygiene gate: answer here and never start Claude.
+    const gate = await gateRequest(body);
+    if (gate.action === "respond") {
+      const response = responseObject(body, syntheticOutput(gate.text));
+      return body.stream ? streamResponse(response) : json(response);
+    }
     // Plate dashboard activity rides along on Alex's newest message (scoped threads only).
-    const activity = await preparePlateActivity(body);
+    const activity = await preparePlateActivity(gate.request);
     const output = await runClaude(activity.request);
     activity.commit();
     const response = responseObject(body, output);
