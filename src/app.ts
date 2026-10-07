@@ -1,5 +1,6 @@
 import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
+import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
 import { scrubRequest } from "./scrub.mjs";
@@ -71,7 +72,10 @@ export async function handleRequest(request: Request): Promise<Response> {
     // Redact before anything else sees the request: prompts, cache hashes,
     // stored sessions, and Claude itself.
     const body = scrubRequest(validateRequest(await request.json()));
-    const output = await runClaude(body);
+    // Plate dashboard activity rides along on Alex's newest message (scoped threads only).
+    const activity = await preparePlateActivity(body);
+    const output = await runClaude(activity.request);
+    activity.commit();
     const response = responseObject(body, output);
     const reply = body.stream ? streamResponse(response) : json(response);
     for (const [name, value] of Object.entries(usageHeaders(output.account)))

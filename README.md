@@ -212,3 +212,19 @@ needed and otherwise returns a new request without mutating the original.
 The router loads this module from `CLAUDE_CODEX_PROXY_DIR` (default
 `~/.local/share/claude-codex-proxy`). Update the proxy before dependent router
 patches, and restart both services when this module changes.
+
+## Plate dashboard activity
+
+For the Codex threads listed in `~/.config/claude-codex-proxy/plate-activity.json` (override with `PLATE_ACTIVITY_CONFIG`), the proxy appends a `<plate-activity>` block to Alex's newest message. The block summarizes what changed on his [plate dashboard](http://127.0.0.1:4717) since his previous message, so the model sees it without calling a tool:
+
+```json
+{ "threads": ["01a10494-b499-7af3-986b-3c30d8c94b91"], "plateUrl": "http://127.0.0.1:4717" }
+```
+
+The file is re-read when it changes, so no restart is needed to change scope. A thread is matched by `prompt_cache_key`. Codex sets it to the thread ID.
+
+- **Events:** Read from plate's `GET /api/events?since=<id>`. Everything Alex did is included except `chat-message`. From agents, only finished items (`done`, `resolved`) are included, listed by key. When a thread first enters scope, its cursor starts at plate's newest event, so old history is never sent. If nothing relevant happened, no block is added.
+- **Prompt cache:** Codex replays history without injected text. The proxy therefore stores each block by thread and message key in `$PROXY_STATE_DIR/plate-activity.sqlite` and re-applies it to the same message on every later request, including older messages in the history. A message key is a hash of the message's content plus how many earlier messages have identical content. A message with nothing to report is stored too, so events that arrive mid-turn wait for the next message instead of changing one already sent.
+- **Cursor:** The cursor advances only after Claude returns a successful response. A retry gets the identical block. If a turn fails and Alex sends another message, its events move to the newer message. Compaction requests re-apply stored blocks but never create one.
+- **Failure:** If plate is unreachable, the turn proceeds unchanged and the events wait for the next message. Logs record only error names, never event or note text.
+- **Router:** The logic in `src/plate-activity.mjs` does not depend on the model, so the Codex router can import it like `scrub.mjs`. Today only this proxy applies the block, which covers Claude models, including requests that arrive through the router. A block that is already present is left alone, so a later router hook will not create duplicates.
