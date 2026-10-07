@@ -8,7 +8,13 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isUnavailable, listAccounts, accountEnv } from "./accounts";
+import * as accounts from "./accounts";
+import { accountEnv, isLimited, listAccounts, type Account } from "./accounts";
+
+/** Prefer the newer check that also skips accounts whose login failed. */
+const unavailable =
+  ((accounts as Record<string, unknown>).isUnavailable as ((account: Account) => boolean) | undefined) ??
+  ((account: Account) => isLimited(account));
 import type { ClassifiedKind, ProofKind } from "./hygiene";
 
 export type DecodedImage = { mediaType: string; bytes: Buffer };
@@ -148,7 +154,7 @@ const CLASSIFIER_TIMEOUT_MS = 60_000;
 
 /** One-shot Claude Code call on the cheapest model; no session, tools or customizations. */
 export const claudeClassifier: Classifier = async (image, wanted) => {
-  const account = listAccounts().find((a) => !isUnavailable(a)) ?? listAccounts()[0];
+  const account = listAccounts().find((a) => !unavailable(a)) ?? listAccounts()[0];
   const { CLAUDECODE: _nested, CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
   const child = Bun.spawn(
     [
