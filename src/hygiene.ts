@@ -311,6 +311,60 @@ export function slotLabel(name: string, state?: GateState): string {
   return `${what} (${dayLabel(day)})`;
 }
 
+// ---- Activity for the Today chat ----
+
+/** One gate outcome for the plate-activity block. `key` is stable across reads. */
+export type GateEvent = { key: string; at: string; text: string };
+
+/**
+ * What the gate decided in (since, until], oldest first: which check, the
+ * outcome, and when. Never image bytes, file paths or the classifier's own
+ * description of the photo, which can describe Alex in the shower.
+ */
+export function gateEvents(state: GateState, since: number, until: number): GateEvent[] {
+  const within = (at: number) => at > since && at <= until;
+  const out: GateEvent[] = [];
+  for (const r of state.images) {
+    // Hand-seeded records were verified outside the gate; nothing happened now.
+    if (r.manual || !within(Date.parse(r.at))) continue;
+    const what = r.kind && r.kind !== "none" ? `${r.kind} photo` : "photo";
+    const text =
+      r.verdict === "accepted"
+        ? `${r.slot ? slotLabel(r.slot, state) : what} accepted`
+        : r.verdict === "unneeded"
+          ? `${what} accepted, though nothing was due`
+          : r.verdict === "duplicate"
+            ? `${what} rejected (copy of an earlier proof)`
+            : r.verdict === "stale"
+              ? `${what} rejected (camera timestamp too old)`
+              : r.kind && r.kind !== "none"
+                ? `${what} rejected (not due, or not clear enough)`
+                : "photo rejected (no hygiene proof seen)";
+    out.push({ key: `image:${r.sha256}:${r.at}`, at: r.at, text });
+  }
+  for (const at of state.bypass.history) {
+    if (!within(Date.parse(at))) continue;
+    const skipped = state.debts.find((d) => d.at === at)?.skipped ?? [];
+    out.push({
+      key: `bypass:${at}`,
+      at,
+      text: `BYPASS${skipped.length ? ` (skipped ${skipped.join(", ")})` : ""}`,
+    });
+  }
+  // Only the latest DELAY keeps a time; there is one per morning, so each is read before the next.
+  if (state.delay.until) {
+    const ends = Date.parse(state.delay.until);
+    const at = ends - DELAY_MS;
+    if (within(at))
+      out.push({
+        key: `delay:${state.delay.until}`,
+        at: new Date(at).toISOString(),
+        text: `DELAY (morning teeth postponed until ${clockLabel(ends)})`,
+      });
+  }
+  return out.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+}
+
 // ---- Turn classification ----
 
 /**

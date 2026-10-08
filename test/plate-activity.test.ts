@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   closePlateActivityDb,
+  type HygieneSource,
   preparePlateActivity,
 } from "../src/plate-activity";
+import { emptyState, type GateEvent, gateEvents } from "../src/hygiene";
 import {
   loadConfig,
   messageKeys,
@@ -105,7 +107,7 @@ describe("renderBlock", () => {
     expect(block).toBe(
       [
         '<plate-activity source="plate-dashboard" since="23:10">',
-        "Supplied automatically: what changed on Alex's plate dashboard since his last message. It is not part of what he typed.",
+        "Supplied automatically: what changed on Alex's plate dashboard, and what his hygiene gate decided, since his last message. It is not part of what he typed.",
         "- done: Buy shoes (agent:shoes); Floor mat (agent:mat)",
         "- snoozed: Printer (agent:printer) until Fri, Oct 9",
         '- note: HE keyboard (agent:kb): "wait for the sale"',
@@ -275,6 +277,66 @@ describe("preparePlateActivity", () => {
     const compact = request([...m1, assistant("a"), user("second"), { type: "compaction_trigger" }]);
     const prepared = await preparePlateActivity(compact, config);
     expect(blocksIn(prepared.request).filter(Boolean)).toHaveLength(0);
+  });
+});
+
+describe("hygiene gate events", () => {
+  test("gateEvents names the check, outcome and time, never the photo", () => {
+    const state = emptyState("2026-10-07T12:00:00Z");
+    const base = { dhash: null, source: { thread: THREAD, key: "m" } };
+    state.images.push(
+      { ...base, sha256: "a", at: "2026-10-08T06:41:00Z", kind: "teeth", verdict: "accepted", slot: "2026-10-07/night-teeth", reason: "a man brushing", file: "/private/x.jpg" },
+      { ...base, sha256: "b", at: "2026-10-08T06:43:00Z", kind: "none", verdict: "rejected", reason: "bathroom selfie" },
+      { ...base, sha256: "c", at: "2026-10-08T06:44:00Z", kind: "shower", verdict: "duplicate" },
+      { ...base, sha256: "d", at: "2026-10-08T06:45:00Z", kind: "shower", verdict: "accepted", slot: "2026-10-07/shower", manual: { verifier: "x" } },
+      { ...base, sha256: "e", at: "2026-10-01T06:45:00Z", kind: "shower", verdict: "accepted", slot: "2026-09-30/shower" },
+    );
+    state.bypass.history.push("2026-10-08T06:50:00Z");
+    state.debts.push({ id: "d1", at: "2026-10-08T06:50:00Z", skipped: ["shower (Oct 7)"], status: "open" });
+    state.delay.until = "2026-10-08T17:00:00Z"; // DELAY at 08:00 local, until 10:00
+    const events = gateEvents(state, Date.parse("2026-10-08T00:00:00Z"), Date.parse("2026-10-08T18:00:00Z"));
+    expect(events.map((e) => e.text)).toEqual([
+      "night teeth (Oct 7) accepted",
+      "photo rejected (no hygiene proof seen)",
+      "shower photo rejected (copy of an earlier proof)",
+      "BYPASS (skipped shower (Oct 7))",
+      "DELAY (morning teeth postponed until 10:00)",
+    ]);
+    const all = JSON.stringify(events);
+    for (const secret of ["brushing", "selfie", "/private"]) expect(all).not.toContain(secret);
+  });
+
+  test("outcomes ride on the next message once, alone or with plate events", async () => {
+    let gate: GateEvent[] = [];
+    const source: HygieneSource = (since, until) =>
+      gate.filter((e) => Date.parse(e.at) > since && Date.parse(e.at) <= until);
+    const m1 = [user("first")];
+    (await preparePlateActivity(request(m1), config, source)).commit();
+
+    const at = new Date(Date.now() - 1000).toISOString();
+    gate = [{ key: "image:a", at, text: "night teeth (Oct 7) accepted" }];
+    const m2 = [...m1, assistant("a"), user("second")];
+    const second = await preparePlateActivity(request(m2), config, source);
+    const block = blocksIn(second.request)[2]!;
+    expect(block).toMatch(/- hygiene gate: \d\d:\d\d night teeth \(Oct 7\) accepted/);
+    second.commit();
+
+    // A check that started before the last message but finished after it is still reported,
+    // and the one already sent is not repeated.
+    gate.push({ key: "image:b", at: new Date(Date.now() - 60_000).toISOString(), text: "shower (Oct 7) accepted" });
+    event({ actor: "alex", action: "done", key: "k1", detail: "Item one" });
+    const m3 = [...m2, assistant("b"), user("third")];
+    const third = await preparePlateActivity(request(m3), config, source);
+    const blocks = blocksIn(third.request);
+    expect(blocks[2]).toBe(block);
+    expect(blocks[4]).toContain("shower (Oct 7) accepted");
+    expect(blocks[4]).not.toContain("night teeth");
+    expect(blocks[4]).toContain("done: Item one");
+    third.commit();
+
+    const m4 = [...m3, assistant("c"), user("fourth")];
+    const fourth = await preparePlateActivity(request(m4), config, source);
+    expect(blocksIn(fourth.request)[6]).toBeUndefined();
   });
 });
 

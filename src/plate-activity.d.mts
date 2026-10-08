@@ -19,7 +19,7 @@ export function injectBlock<T extends { input: unknown[] }>(request: T, index: n
 export function relevantEvent(event: PlateEvent): boolean;
 export function renderBlock(
   events: PlateEvent[],
-  options?: { timeZone?: string; truncated?: boolean },
+  options?: { timeZone?: string; truncated?: boolean; hygiene?: { at: string; text: string }[] },
 ): string | null;
 export function configPath(env?: Record<string, string | undefined>): string;
 export function loadConfig(path?: string): PlateActivityConfig | null;

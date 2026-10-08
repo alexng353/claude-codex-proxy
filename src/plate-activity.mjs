@@ -179,10 +179,11 @@ const MAX_AGENT_KEYS = 6;
  * Renders events (oldest first) as one compact block, or null when none are
  * worth mentioning. `cursor` is the newest event id covered, offered so the
  * model can page further with plate_events if the block was truncated.
+ * `hygiene` is the hygiene gate's outcomes, `{ at, text }` oldest first.
  */
-export function renderBlock(events, { timeZone, truncated = false } = {}) {
+export function renderBlock(events, { timeZone, truncated = false, hygiene = [] } = {}) {
   const relevant = events.filter(relevantEvent);
-  if (!relevant.length) return null;
+  if (!relevant.length && !hygiene.length) return null;
   const groups = new Map();
   const agentKeys = [];
   for (const event of relevant) {
@@ -194,24 +195,29 @@ export function renderBlock(events, { timeZone, truncated = false } = {}) {
     if (!groups.has(label)) groups.set(label, []);
     groups.get(label).push(describe(event, timeZone));
   }
-  const lines = [...groups].map(([label, items]) => `- ${label}: ${items.join("; ")}`);
+  const stamps = [...relevant, ...hygiene].map((e) => e.at).sort((a, b) => Date.parse(a) - Date.parse(b));
+  const first = stamps[0];
+  const last = stamps.at(-1);
+  const sameDay =
+    localStamp(first, timeZone, true).split(" ").slice(0, 2).join(" ") ===
+    localStamp(last, timeZone, true).split(" ").slice(0, 2).join(" ");
+  // First, so the length cap drops dashboard lines before the gate's.
+  const lines = hygiene.length
+    ? [`- hygiene gate: ${hygiene.map((h) => `${localStamp(h.at, timeZone, !sameDay)} ${clip(h.text, 120)}`).join("; ")}`]
+    : [];
+  lines.push(...[...groups].map(([label, items]) => `- ${label}: ${items.join("; ")}`));
   if (agentKeys.length) {
     const shown = agentKeys.slice(0, MAX_AGENT_KEYS).join(", ");
     const more = agentKeys.length > MAX_AGENT_KEYS ? ` (+${agentKeys.length - MAX_AGENT_KEYS} more)` : "";
     lines.push(`- agents finished: ${shown}${more}`);
   }
-  const first = relevant[0].at;
-  const last = relevant.at(-1).at;
-  const sameDay =
-    localStamp(first, timeZone, true).split(" ").slice(0, 2).join(" ") ===
-    localStamp(last, timeZone, true).split(" ").slice(0, 2).join(" ");
   const since = localStamp(first, timeZone, !sameDay);
-  const newest = events.at(-1).id;
+  const newest = events.at(-1)?.id;
   const header = `<${BLOCK_TAG} source="plate-dashboard" since="${since}">`;
   const preface =
-    "Supplied automatically: what changed on Alex's plate dashboard since his last message. It is not part of what he typed.";
+    "Supplied automatically: what changed on Alex's plate dashboard, and what his hygiene gate decided, since his last message. It is not part of what he typed.";
   let body = lines.map(safe);
-  const footer = truncated
+  const footer = truncated && newest !== undefined
     ? [`- (older activity omitted; plate_events since_id can page back from ${newest})`]
     : [];
   const size = () => [header, preface, ...body, ...footer].join("\n").length;
