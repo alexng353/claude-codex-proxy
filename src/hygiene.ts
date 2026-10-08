@@ -68,6 +68,8 @@ export type ImageRecord = {
   manual?: { verifier: string };
   /** Where an accepted photo was saved (original bytes, EXIF intact). */
   file?: string;
+  /** The gate was locked (and not bypassed) when this photo was checked. */
+  locked?: boolean;
 };
 
 export type Debt = {
@@ -317,9 +319,22 @@ export function slotLabel(name: string, state?: GateState): string {
 export type GateEvent = { key: string; at: string; text: string };
 
 /**
+ * A failed photo worth telling the Today chat about: one Alex meant as a
+ * proof. Every chat image is checked while anything is due later that day,
+ * so an Amazon screenshot is "rejected" too; reporting that reads as a failed
+ * check. Intent counts when the photo came through Cairn's proof flow, when
+ * the classifier saw teeth, a shower or a penance in it, or when the gate was
+ * locked so any photo was a try at unlocking it. Otherwise: silence.
+ */
+export function attemptedProof(r: ImageRecord): boolean {
+  return r.source.thread === "cairn" || (!!r.kind && r.kind !== "none") || r.locked === true;
+}
+
+/**
  * What the gate decided in (since, until], oldest first: which check, the
- * outcome, and when. Never image bytes, file paths or the classifier's own
- * description of the photo, which can describe Alex in the shower.
+ * outcome, and when. Rejections only for attempted proofs (`attemptedProof`).
+ * Never image bytes, file paths or the classifier's own description of the
+ * photo, which can describe Alex in the shower.
  */
 export function gateEvents(state: GateState, since: number, until: number): GateEvent[] {
   const within = (at: number) => at > since && at <= until;
@@ -327,6 +342,8 @@ export function gateEvents(state: GateState, since: number, until: number): Gate
   for (const r of state.images) {
     // Hand-seeded records were verified outside the gate; nothing happened now.
     if (r.manual || !within(Date.parse(r.at))) continue;
+    const passed = r.verdict === "accepted" || r.verdict === "unneeded";
+    if (!passed && !attemptedProof(r)) continue;
     const what = r.kind && r.kind !== "none" ? `${r.kind} photo` : "photo";
     const text =
       r.verdict === "accepted"

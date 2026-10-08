@@ -260,6 +260,8 @@ async function checkImage(
     source,
     kind: null,
     verdict: "rejected",
+    // Read before this photo can fill anything: was it sent to unlock the gate?
+    locked: outstanding(state, now).length > 0 && !bypassActive(state, now),
   };
   // Only passed proofs count: a retake right after a rejected photo must not collide with it.
   const proofs = state.images.filter((r) => r.verdict === "accepted" || r.verdict === "unneeded");

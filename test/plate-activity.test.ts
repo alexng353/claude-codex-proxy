@@ -297,13 +297,38 @@ describe("hygiene gate events", () => {
     const events = gateEvents(state, Date.parse("2026-10-08T00:00:00Z"), Date.parse("2026-10-08T18:00:00Z"));
     expect(events.map((e) => e.text)).toEqual([
       "night teeth (Oct 7) accepted",
-      "photo rejected (no hygiene proof seen)",
       "shower photo rejected (copy of an earlier proof)",
       "BYPASS (skipped shower (Oct 7))",
       "DELAY (morning teeth postponed until 10:00)",
     ]);
     const all = JSON.stringify(events);
     for (const secret of ["brushing", "selfie", "/private"]) expect(all).not.toContain(secret);
+  });
+
+  test("ordinary images while nothing is locked say nothing; real attempts still report", () => {
+    const state = emptyState("2026-10-07T12:00:00Z");
+    const chat = { dhash: null, source: { thread: THREAD, key: "m" } };
+    const at = (min: number) => `2026-10-08T20:${String(min).padStart(2, "0")}:00Z`;
+    state.images.push(
+      // An Amazon screenshot in chat, shower still open for the day but nothing locked.
+      { ...chat, sha256: "s1", at: at(1), kind: "none", verdict: "rejected", locked: false },
+      // Records from before `locked` existed: unknown intent, so silent.
+      { ...chat, sha256: "s2", at: at(2), kind: "none", verdict: "rejected" },
+      { ...chat, sha256: "s3", at: at(3), kind: null, verdict: "stale" },
+      // Sent while the gate was locked: an attempt to unlock it.
+      { ...chat, sha256: "s4", at: at(4), kind: "none", verdict: "rejected", locked: true },
+      // Through Cairn's proof flow: always an attempt.
+      { dhash: null, source: { thread: "cairn", key: "h" }, sha256: "s5", at: at(5), kind: "none", verdict: "rejected", locked: false },
+      // Classified as a shower photo: an attempt, even unlocked.
+      { ...chat, sha256: "s6", at: at(6), kind: "shower", verdict: "rejected", locked: false },
+    );
+    const texts = gateEvents(state, Date.parse("2026-10-08T19:00:00Z"), Date.parse("2026-10-08T21:00:00Z")).map((e) => e.text);
+    expect(texts).toEqual([
+      "photo rejected (no hygiene proof seen)",
+      "photo rejected (no hygiene proof seen)",
+      "shower photo rejected (not due, or not clear enough)",
+    ]);
+    expect(renderBlock([], { hygiene: gateEvents({ ...state, images: state.images.slice(0, 3) }, 0, Date.now()) })).toBeNull();
   });
 
   test("outcomes ride on the next message once, alone or with plate events", async () => {

@@ -326,7 +326,8 @@ describe("BYPASS, debt and penance", () => {
     const state = JSON.parse(raw);
     const accepted = state.images.find((i: { verdict: string }) => i.verdict === "accepted");
     expect(accepted).toMatchObject({ slot: `${DAY}/morning-teeth`, kind: "teeth" });
-    expect(Object.keys(accepted).sort()).toEqual(["at", "dhash", "file", "kind", "reason", "sha256", "slot", "source", "verdict"]);
+    expect(Object.keys(accepted).sort()).toEqual(["at", "dhash", "file", "kind", "locked", "reason", "sha256", "slot", "source", "verdict"]);
+    expect(accepted.locked).toBe(true);
     const root = process.env.HYGIENE_PHOTO_DIR!;
     expect(accepted.file).toBe(join(root, "2026", "10", "08", `teeth-060000-${accepted.sha256.slice(0, 8)}.jpg`));
     expect(readFileSync(accepted.file, "utf8")).toBe("secret-pixels");
