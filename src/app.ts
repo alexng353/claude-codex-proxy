@@ -2,6 +2,7 @@ import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
+import { perpetualStatus, preparePerpetual } from "./perpetual";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
@@ -86,6 +87,10 @@ export async function handleRequest(request: Request): Promise<Response> {
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });
+  if (url.pathname.startsWith("/perpetual/") && request.method === "GET") {
+    const status = perpetualStatus(decodeURIComponent(url.pathname.slice("/perpetual/".length)));
+    return status ? json(status) : error("No open perpetual chat with that id", 404);
+  }
   if (url.pathname === "/hygiene/gate" && request.method === "POST")
     return hygieneGateEndpoint(request);
   const hygiene = await handleHygieneRoute(request, url);
@@ -117,7 +122,10 @@ export async function handleRequest(request: Request): Promise<Response> {
     }
     // Plate dashboard activity rides along on Alex's newest message (scoped threads only).
     const activity = await preparePlateActivity(gate.request);
-    const output = await runClaude(activity.request);
+    // Perpetual chats (src/perpetual) replace history with a summary view;
+    // every other request goes to Claude exactly as before.
+    const perpetual = preparePerpetual(activity.request);
+    const output = perpetual ? await perpetual.run(runClaude) : await runClaude(activity.request);
     activity.commit();
     const response = responseObject(body, output);
     const reply = body.stream ? streamResponse(response) : json(response);

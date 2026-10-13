@@ -245,28 +245,29 @@ const describeTool = (tool: ToolDescriptor): string => {
     .join("\n");
 };
 
-export function requestToPrompt(request: ResponsesRequest): string {
-  const input =
-    typeof request.input === "string"
-      ? `<user>\n${request.input}\n</user>`
-      : request.input.map(serializeItem).join("\n\n");
+function toolInstructions(request: ResponsesRequest): string {
   const tools = toolDescriptors(requestTools(request));
-  const toolInstructions =
-    tools.length === 0
-      ? ""
-      : `
+  return tools.length === 0
+    ? ""
+    : `
 
 <available_tools>
 ${tools.map(describeTool).join("\n")}
 </available_tools>
 
 You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls even when Claude has an equivalent built-in tool. For a function tool, arguments must be a JSON object encoded as a string. For a custom tool, arguments must be the exact raw input string. For ${TOOL_SEARCH_NAME}, arguments must be {"query":"specific tool names and capabilities","limit":8} encoded as JSON; use it before concluding that an instructed MCP, plugin, app, browser, node_repl, or cua_repl tool is unavailable. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. Images are attached directly to this message; inspect them without calling native tools.`;
+}
 
+export function requestToPrompt(request: ResponsesRequest): string {
+  const input =
+    typeof request.input === "string"
+      ? `<user>\n${request.input}\n</user>`
+      : request.input.map(serializeItem).join("\n\n");
   return [
     request.instructions
       ? `<instructions>\n${request.instructions}\n</instructions>`
       : "",
-    toolInstructions,
+    toolInstructions(request),
     input,
   ]
     .filter(Boolean)
@@ -474,12 +475,31 @@ export function stableJson(value: unknown): string {
   );
 }
 
+/** Anthropic prompt-cache mark; Claude Code passes it through from stream-json input. */
+export type CacheMark = { type: "ephemeral"; ttl?: "5m" | "1h" };
+
 export type ClaudeInputBlock =
-  | { type: "text"; text: string }
+  | { type: "text"; text: string; cache_control?: CacheMark }
   | {
       type: "image";
       source: { type: "base64"; media_type: string; data: string };
     };
+
+/**
+ * A perpetual chat's view (src/perpetual): an input item whose content parts
+ * become separate text blocks, each part with `cache_mark` carrying a cache
+ * mark, so the next turn reads the view's unchanged prefix from cache.
+ */
+export const PERPETUAL_VIEW_TYPE = "perpetual_view";
+
+function viewBlocks(item: ResponseInputItem): ClaudeInputBlock[] {
+  const parts = Array.isArray(item.content) ? item.content : [];
+  return parts.flatMap((part): ClaudeInputBlock[] => {
+    if (typeof part.text !== "string" || part.text === "") return [];
+    const mark = part.cache_mark as CacheMark | undefined;
+    return [mark ? { type: "text", text: part.text, cache_control: mark } : { type: "text", text: part.text }];
+  });
+}
 
 async function imageBlock(url: string): Promise<ClaudeInputBlock> {
   const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s.exec(url);
@@ -516,7 +536,26 @@ export async function prepareClaudePrompt(
   cleanup: () => Promise<void>;
 }> {
   const prompt = requestToPrompt(request);
-  const content: ClaudeInputBlock[] = [{ type: "text", text: prompt }];
+  const input = Array.isArray(request.input) ? request.input : [];
+  const view = input.findIndex((item) => item.type === PERPETUAL_VIEW_TYPE);
+  let content: ClaudeInputBlock[];
+  if (view < 0) content = [{ type: "text", text: prompt }];
+  else {
+    // [what precedes the view] [view blocks] [tools and the rest]: the view
+    // heads the first message so its blocks form a stable cache prefix.
+    const before = [
+      request.instructions ? `<instructions>\n${request.instructions}\n</instructions>` : "",
+      input.slice(0, view).map(serializeItem).join("\n\n"),
+    ].filter(Boolean).join("\n\n");
+    const after = [toolInstructions(request), input.slice(view + 1).map(serializeItem).join("\n\n")]
+      .filter(Boolean)
+      .join("\n\n");
+    content = [
+      ...(before ? [{ type: "text" as const, text: before }] : []),
+      ...viewBlocks(input[view]),
+      ...(after ? [{ type: "text" as const, text: after }] : []),
+    ];
+  }
   if (Array.isArray(request.input)) {
     for (const item of request.input) {
       for (const url of itemImageUrls(item)) {
