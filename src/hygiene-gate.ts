@@ -35,6 +35,7 @@ import {
   lockedText,
   messageKeys,
   noteText,
+  onlyMorningDue,
   outstanding,
   partsOf,
   slotLabel,
@@ -332,8 +333,9 @@ async function checkImage(
     // The proof still counts; only the keepsake copy is missing.
     console.error("hygiene-gate: could not save the photo:", (error as Error).message);
   }
-  state.images.push({ ...record, verdict: "accepted", slot: target, ...(file ? { file } : {}) });
-  return { line: `✅ ${slotLabel(target, state)} photo accepted.` };
+  const reading = verdict.kind === "weight" ? verdict.reading : undefined;
+  state.images.push({ ...record, verdict: "accepted", slot: target, ...(file ? { file } : {}), ...(reading ? { reading } : {}) });
+  return { line: `✅ ${slotLabel(target, state)} photo accepted${reading ? ` (${reading})` : ""}.` };
 }
 
 function bypassReply(state: GateState, now: number): string {
@@ -358,19 +360,20 @@ function bypassReply(state: GateState, now: number): string {
 function delayReply(state: GateState, now: number): string {
   const { day, minutes } = localTime(now);
   const due = outstanding(state, now);
-  const morningOnly = due.length === 1 && due[0].slot === `${day}/morning-teeth`;
+  const morningOnly = onlyMorningDue(state, due, now);
+  const photos = due.length > 1 ? "morning photos" : due[0]?.kind === "weight" ? "weigh-in photo" : "teeth photo";
   if (delayActive(state, now))
-    return `⏰ delay already open until ${clockLabel(Date.parse(state.delay.until!))}. Send the teeth photo when you can.`;
+    return `⏰ delay already open until ${clockLabel(Date.parse(state.delay.until!))}. Send the morning photo when you can.`;
   if (!due.length) return "✅ gate is already clear; no delay used.";
   if (!morningOnly || minutes < MORNING_MINUTE || minutes >= DELAY_END_MINUTE)
-    return "DELAY only postpones the morning teeth photo (05:00 to 12:00). For anything else, send the photo or reply BYPASS.";
+    return "DELAY only postpones the morning photos (05:00 to 12:00). For anything else, send the photo or reply BYPASS.";
   if (state.delay.history.includes(day))
-    return "DELAY was already used this morning. Send the teeth photo, or reply BYPASS.";
+    return `DELAY was already used this morning. Send the ${photos}, or reply BYPASS.`;
   state.delay.count += 1;
   state.delay.until = new Date(now + DELAY_MS).toISOString();
   state.delay.day = day;
   state.delay.history.push(day);
-  return `⏰ delay: gate open until ${clockLabel(now + DELAY_MS)}. Send the teeth photo before then.`;
+  return `⏰ delay: gate open until ${clockLabel(now + DELAY_MS)}. Send the ${photos} before then.`;
 }
 
 /**
@@ -478,7 +481,7 @@ export function gateStatus() {
     lastProofs: state.images
       .filter((r) => r.verdict === "accepted")
       .slice(-5)
-      .map(({ at, kind, slot }) => ({ at, kind, slot })),
+      .map(({ at, kind, slot, reading }) => ({ at, kind, slot, ...(reading ? { reading } : {}) })),
     killSwitch: killSwitchPath(),
   };
 }
@@ -562,13 +565,23 @@ export async function submitProof(image: { mediaType: string; bytes: Buffer }, t
 
 /** Accepted proofs grouped by local day, newest day first. */
 export function proofDays(from: string, to: string) {
-  const days = new Map<string, Array<{ sha256: string; kind: string; slot: string; at: string; manual: boolean }>>();
+  const days = new Map<
+    string,
+    Array<{ sha256: string; kind: string; slot: string; at: string; manual: boolean; reading?: string }>
+  >();
   for (const r of loadState().images) {
     if (r.verdict !== "accepted" || !r.slot || !r.file) continue;
     const day = localTime(Date.parse(r.at)).day;
     if (day < from || day > to) continue;
     if (!days.has(day)) days.set(day, []);
-    days.get(day)!.push({ sha256: r.sha256, kind: r.kind ?? "", slot: r.slot, at: r.at, manual: !!r.manual });
+    days.get(day)!.push({
+      sha256: r.sha256,
+      kind: r.kind ?? "",
+      slot: r.slot,
+      at: r.at,
+      manual: !!r.manual,
+      ...(r.reading ? { reading: r.reading } : {}),
+    });
   }
   return [...days.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([day, photos]) => ({ day, photos }));
 }

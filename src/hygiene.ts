@@ -7,6 +7,9 @@
  * Daily rules (America/Vancouver):
  * - Morning teeth arms at 05:00; the first gated turn after it is locked
  *   until a teeth photo passes.
+ * - Morning weigh-in arms at 05:00 too, once `weighInStartsAt` is set: a
+ *   photo of the bathroom scale's reading. DELAY postpones both morning
+ *   photos together.
  * - Night teeth (taken at or after 17:00) and a shower (any time that day)
  *   are due by midnight. If either is missing at 00:00 the gate locks until
  *   it is supplied. That overdue lock is separate from the next morning's
@@ -36,7 +39,7 @@ export const EXIF_FUTURE_SLACK_MS = 10 * 60 * 1000;
 export const NEAR_DUPLICATE_BITS = 10;
 export const MIN_CONFIDENCE = 0.6;
 
-export type ProofKind = "teeth" | "shower" | "penance";
+export type ProofKind = "teeth" | "shower" | "weight" | "penance";
 export type ClassifiedKind = ProofKind | "none";
 
 export type ImageVerdict =
@@ -70,6 +73,8 @@ export type ImageRecord = {
   file?: string;
   /** The gate was locked (and not bypassed) when this photo was checked. */
   locked?: boolean;
+  /** Weigh-ins: the scale reading as shown, e.g. "72.4 kg". */
+  reading?: string;
 };
 
 export type Debt = {
@@ -89,6 +94,11 @@ export type GateState = {
   version: 1;
   /** Requirements whose arm moment precedes this instant are never enforced. */
   startsAt: string;
+  /**
+   * First morning weigh-in to enforce (same rule as startsAt). Absent means
+   * weigh-ins are off, so adding the check never locks an existing state.
+   */
+  weighInStartsAt?: string;
   images: ImageRecord[];
   /** Requirement slot -> ISO time it was filled. */
   filled: Record<string, string>;
@@ -196,6 +206,7 @@ export type Requirement = {
 
 const slot = {
   morning: (day: string) => `${day}/morning-teeth`,
+  weight: (day: string) => `${day}/morning-weight`,
   night: (day: string) => `${day}/night-teeth`,
   shower: (day: string) => `${day}/shower`,
   penance: (id: string) => `penance/${id}`,
@@ -204,25 +215,39 @@ const slot = {
 /** The instant a slot starts to lock the gate. */
 function armMs(slotName: string): number {
   const [day, name] = slotName.split("/");
-  if (name === "morning-teeth") return zonedTime(day, MORNING_MINUTE);
+  if (name === "morning-teeth" || name === "morning-weight") return zonedTime(day, MORNING_MINUTE);
   return zonedTime(addDays(day, 1), 0);
 }
 
-const enforced = (state: GateState, slotName: string) =>
-  armMs(slotName) >= Date.parse(state.startsAt);
+function enforced(state: GateState, slotName: string): boolean {
+  if (armMs(slotName) < Date.parse(state.startsAt)) return false;
+  if (!slotName.endsWith("/morning-weight")) return true;
+  return !!state.weighInStartsAt && armMs(slotName) >= Date.parse(state.weighInStartsAt);
+}
+
+/** This morning's enforced slots, which DELAY postpones together. */
+function morningSlots(state: GateState, day: string): string[] {
+  return [slot.morning(day), slot.weight(day)].filter((name) => enforced(state, name));
+}
 
 export const bypassActive = (state: GateState, now: number) =>
   state.bypass.until !== null && Date.parse(state.bypass.until) > now;
 
-/** A DELAY window is open and the morning photo it postponed is still missing. */
+/** A DELAY window is open and a morning photo it postponed is still missing. */
 export function delayActive(state: GateState, now: number): boolean {
   const { day } = localTime(now);
   return (
     state.delay.until !== null &&
     state.delay.day === day &&
     Date.parse(state.delay.until) > now &&
-    !state.filled[slot.morning(day)]
+    morningSlots(state, day).some((name) => !state.filled[name])
   );
+}
+
+/** True when every outstanding requirement is one of this morning's photos. */
+export function onlyMorningDue(state: GateState, due: Requirement[], now: number): boolean {
+  const morning = morningSlots(state, localTime(now).day);
+  return due.length > 0 && due.every((r) => morning.includes(r.slot));
 }
 
 /** Requirements that lock the gate right now (ignoring any bypass). */
@@ -236,8 +261,10 @@ export function outstanding(state: GateState, now: number): Requirement[] {
   };
   add(slot.shower(yesterday), "shower", `shower photo${overdue}`);
   add(slot.night(yesterday), "teeth", `night teeth photo${overdue}`);
-  if (minutes >= MORNING_MINUTE && !delayActive(state, now))
+  if (minutes >= MORNING_MINUTE && !delayActive(state, now)) {
     add(slot.morning(day), "teeth", "morning teeth photo");
+    add(slot.weight(day), "weight", "morning weigh-in photo (scale reading)");
+  }
   for (const debt of openPenance(state))
     result.push({
       slot: slot.penance(debt.id),
@@ -265,6 +292,8 @@ export function dueToday(state: GateState, now: number): Requirement[] {
     });
   if (minutes < MORNING_MINUTE && !state.filled[slot.morning(day)] && enforced(state, slot.morning(day)))
     result.push({ slot: slot.morning(day), kind: "teeth", label: "morning teeth photo (from 05:00)" });
+  if (minutes < MORNING_MINUTE && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day)))
+    result.push({ slot: slot.weight(day), kind: "weight", label: "morning weigh-in photo (from 05:00)" });
   return result;
 }
 
@@ -281,6 +310,10 @@ export function candidateSlots(state: GateState, kind: ProofKind, now: number): 
   const yesterday = addDays(day, -1);
   const open = (name: string) => !state.filled[name];
   if (kind === "penance") return openPenance(state).map((d) => slot.penance(d.id));
+  if (kind === "weight")
+    return minutes >= MORNING_MINUTE && open(slot.weight(day)) && enforced(state, slot.weight(day))
+      ? [slot.weight(day)]
+      : [];
   if (kind === "shower") {
     const result: string[] = [];
     if (open(slot.shower(yesterday)) && enforced(state, slot.shower(yesterday)))
@@ -298,7 +331,7 @@ export function candidateSlots(state: GateState, kind: ProofKind, now: number): 
 
 /** Proof kinds worth asking the classifier about right now. */
 export function wantedKinds(state: GateState, now: number): ProofKind[] {
-  return (["teeth", "shower", "penance"] as const).filter(
+  return (["teeth", "shower", "weight", "penance"] as const).filter(
     (kind) => candidateSlots(state, kind, now).length > 0,
   );
 }
@@ -309,7 +342,14 @@ export function slotLabel(name: string, state?: GateState): string {
     return debt?.penance ? `penance (${debt.penance.description})` : "penance";
   }
   const [day, kind] = name.split("/");
-  const what = kind === "morning-teeth" ? "morning teeth" : kind === "night-teeth" ? "night teeth" : "shower";
+  const what =
+    kind === "morning-teeth"
+      ? "morning teeth"
+      : kind === "night-teeth"
+        ? "night teeth"
+        : kind === "morning-weight"
+          ? "morning weigh-in"
+          : "shower";
   return `${what} (${dayLabel(day)})`;
 }
 
@@ -607,7 +647,7 @@ export const hasNote = (item: ResponseInputItem) => partsOf(item).some(isNotePar
 
 // ---- Rendering ----
 
-const EMOJI: Record<ProofKind, string> = { teeth: "🪥", shower: "🚿", penance: "⚖️" };
+const EMOJI: Record<ProofKind, string> = { teeth: "🪥", shower: "🚿", weight: "🏋️", penance: "⚖️" };
 
 export function lockedText(requirements: Requirement[], results: string[] = []): string {
   return [
@@ -655,8 +695,8 @@ export function delayNoteText(until: number): string {
   return [
     `<${NOTE_TAG}>`,
     "Supplied automatically by Alex's hygiene gate; Alex did not type this.",
-    `Alex used DELAY to postpone his morning teeth photo until ${clockLabel(until)}.`,
-    "End your final reply to this message with one short line asking him to send the teeth photo.",
+    `Alex used DELAY to postpone his morning photos (teeth, plus the weigh-in when due) until ${clockLabel(until)}.`,
+    "End your final reply to this message with one short line asking him to send the missing morning photo.",
     `</${NOTE_TAG}>`,
   ].join("\n");
 }

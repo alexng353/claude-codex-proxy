@@ -131,6 +131,22 @@ describe("requirements", () => {
       "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS.",
     );
   });
+
+  test("weigh-in is off by default and arms at 05:00 once enabled", () => {
+    const s = state();
+    s.filled["2026-10-07/shower"] = "x";
+    s.filled["2026-10-07/night-teeth"] = "x";
+    expect(candidateSlots(s, "weight", at(DAY, "06:00"))).toEqual([]);
+    s.weighInStartsAt = new Date(at(DAY, "05:00")).toISOString();
+    expect(dueToday(s, at(DAY, "04:59")).map((r) => r.slot)).toContain(`${DAY}/morning-weight`);
+    expect(slots(s, at(DAY, "04:59"))).toEqual([]);
+    expect(slots(s, at(DAY, "05:00"))).toEqual([`${DAY}/morning-teeth`, `${DAY}/morning-weight`]);
+    expect(wantedKinds(s, at(DAY, "05:00"))).toEqual(["teeth", "shower", "weight"]);
+    s.filled[`${DAY}/morning-weight`] = "x";
+    expect(candidateSlots(s, "weight", at(DAY, "06:00"))).toEqual([]);
+    // A missed weigh-in does not carry past midnight.
+    expect(slots(s, at("2026-10-09", "01:00"))).not.toContain(`${DAY}/morning-weight`);
+  });
 });
 
 const meta = (fields: Record<string, string>) => ({

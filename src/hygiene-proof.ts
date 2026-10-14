@@ -102,14 +102,20 @@ export function parseCaptureTime(raw: string): number | null {
 
 // ---- Vision verdict ----
 
-export type Verdict = { kind: ClassifiedKind; confidence: number; reason: string };
+export type Verdict = {
+  kind: ClassifiedKind;
+  confidence: number;
+  reason: string;
+  /** Weigh-ins: the scale's displayed reading with its unit. */
+  reading?: string;
+};
 export type Classifier = (
   image: DecodedImage,
   wanted: { kinds: ProofKind[]; penance?: string },
 ) => Promise<Verdict>;
 
 export const CLASSIFIER_SYSTEM =
-  "You verify hygiene proof photos for a habit tracker the photographed person set up for himself. Judge only what is visible. Answer through the JSON schema.";
+  "You verify hygiene and weigh-in proof photos for a habit tracker the photographed person set up for himself. Judge only what is visible. Answer through the JSON schema.";
 
 export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string }): string {
   const lines = [
@@ -117,11 +123,16 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
     '- "teeth": a person brushing their teeth, with a toothbrush in or near their mouth.',
     '- "shower": a person who has just showered: visibly wet hair, or wet skin with a shower or bathroom background. A shoulders-up selfie is enough.',
   ];
+  if (wanted.kinds.includes("weight"))
+    lines.push(
+      '- "weight": a real bathroom scale photographed directly, with a weight reading legible on its display. Bare feet on the scale are fine.',
+    );
   if (wanted.penance)
     lines.push(`- "penance": the photo shows this: ${JSON.stringify(wanted.penance)}`);
   lines.push(
     '- "none": anything else, including screenshots, photos of a screen, photos of printed photos, or images with no person.',
     "confidence is your probability (0 to 1) that the chosen kind is right. reason is one short sentence.",
+    'reading is the displayed weight with its unit (e.g. "72.4 kg") for "weight", otherwise an empty string.',
   );
   return lines.join("\n");
 }
@@ -129,23 +140,27 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
 export const VERDICT_SCHEMA = {
   type: "object",
   properties: {
-    kind: { type: "string", enum: ["teeth", "shower", "penance", "none"] },
+    kind: { type: "string", enum: ["teeth", "shower", "weight", "penance", "none"] },
     confidence: { type: "number" },
     reason: { type: "string" },
+    reading: { type: "string" },
   },
-  required: ["kind", "confidence", "reason"],
+  required: ["kind", "confidence", "reason", "reading"],
   additionalProperties: false,
 };
 
 export function parseVerdict(value: unknown): Verdict {
   const v = value as Partial<Verdict> | null;
-  if (!v || !["teeth", "shower", "penance", "none"].includes(v.kind as string))
+  if (!v || !["teeth", "shower", "weight", "penance", "none"].includes(v.kind as string))
     throw new Error("classifier returned no usable verdict");
   const confidence = typeof v.confidence === "number" && Number.isFinite(v.confidence) ? v.confidence : 0;
   return {
     kind: v.kind as ClassifiedKind,
     confidence: Math.max(0, Math.min(1, confidence)),
     reason: typeof v.reason === "string" ? v.reason.slice(0, 200) : "",
+    ...(v.kind === "weight" && typeof v.reading === "string" && v.reading.trim()
+      ? { reading: v.reading.trim().slice(0, 40) }
+      : {}),
   };
 }
 

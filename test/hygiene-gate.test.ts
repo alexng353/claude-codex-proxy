@@ -339,6 +339,54 @@ describe("BYPASS, debt and penance", () => {
   });
 });
 
+describe("weigh-in", () => {
+  const enable = async (from = at(DAY, "05:00")) => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...raw, weighInStartsAt: new Date(from).toISOString() }));
+    resetGateCache();
+  };
+
+  test("locks alongside morning teeth; each photo fills its own slot and the reading is kept", async () => {
+    await enable();
+    expect(text(await decide(request([env, user("hi")])))).toBe(
+      "🪥 gate armed: morning teeth photo, morning weigh-in photo (scale reading)\nSend a fresh photo to unlock, or reply BYPASS.",
+    );
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    expect(text(await decide(request([env, user({ photo: "teeth" })])))).toBe(
+      "✅ morning teeth (Oct 8) photo accepted.\n🏋️ gate armed: morning weigh-in photo (scale reading)\nSend a fresh photo to unlock, or reply BYPASS.",
+    );
+    verdicts.push({ kind: "weight", confidence: 0.9, reason: "scale display", reading: "72.4 kg" });
+    const unlocked = await decide(request([env, user({ photo: "teeth" }), assistant("🏋️"), user({ photo: "scale" })]));
+    expect(unlocked.action).toBe("forward");
+    expect(JSON.stringify(unlocked)).toContain("[hygiene-gate: photo accepted as morning weigh-in (Oct 8) proof; image withheld]");
+    expect(gateStatus().lastProofs.at(-1)).toMatchObject({ kind: "weight", slot: `${DAY}/morning-weight`, reading: "72.4 kg" });
+  });
+
+  test("is off until weighInStartsAt, and only arms from 05:00", async () => {
+    await enable(at("2026-10-09", "05:00"));
+    expect(text(await decide(request([env, user("hi")])))).toBe(
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS.",
+    );
+    clock = at("2026-10-09", "04:00");
+    expect(gateStatus().dueToday.map((r) => r.slot)).toContain("2026-10-09/morning-weight");
+  });
+
+  test("DELAY postpones both morning photos", async () => {
+    await enable();
+    clock = at(DAY, "07:45");
+    expect(text(await decide(request([env, user("DELAY")])))).toBe(
+      "⏰ delay: gate open until 09:45. Send the morning photos before then.",
+    );
+    // Teeth alone keeps the delay open while the weigh-in is missing.
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    expect((await decide(request([env, user("DELAY"), assistant("⏰"), user({ photo: "t" })]))).action).toBe("forward");
+    expect(gateStatus().delay.active).toBe(true);
+    clock = at(DAY, "09:46");
+    expect(text(await decide(request([env, user("later")])))).toStartWith("🏋️ gate armed: morning weigh-in photo");
+  });
+});
+
 describe("DELAY", () => {
   const morningLocked = async () => {
     clock = at(DAY, "07:45");
@@ -361,13 +409,13 @@ describe("DELAY", () => {
   test("is morning-only: refused after noon and against overdue night locks", async () => {
     clock = at(DAY, "12:00");
     expect(text(await decide(request([env, user("DELAY")])))).toBe(
-      "DELAY only postpones the morning teeth photo (05:00 to 12:00). For anything else, send the photo or reply BYPASS.",
+      "DELAY only postpones the morning photos (05:00 to 12:00). For anything else, send the photo or reply BYPASS.",
     );
     clock = at("2026-10-09", "00:30");
-    expect(text(await decide(request([env, user("DELAY")])))).toStartWith("DELAY only postpones the morning teeth photo");
+    expect(text(await decide(request([env, user("DELAY")])))).toStartWith("DELAY only postpones the morning photos");
     // 06:00 with last night's teeth still overdue: DELAY can't open that lock.
     clock = at("2026-10-09", "06:00");
-    expect(text(await decide(request([env, user("DELAY")])))).toStartWith("DELAY only postpones the morning teeth photo");
+    expect(text(await decide(request([env, user("DELAY")])))).toStartWith("DELAY only postpones the morning photos");
     expect(gateStatus().delay.count).toBe(0);
   });
 
@@ -392,10 +440,10 @@ describe("DELAY", () => {
     await decide(request([env, user("DELAY")]));
     const first = [env, user("DELAY"), assistant("⏰"), user("summarise the agenda")];
     const one = await decide(request(first));
-    const nag = "Alex used DELAY to postpone his morning teeth photo until 09:45.";
+    const nag = "Alex used DELAY to postpone his morning photos (teeth, plus the weigh-in when due) until 09:45.";
     const firstInput = one.action === "forward" ? (one.request.input as ResponseInputItem[]) : [];
     expect(JSON.stringify(firstInput[3])).toContain(nag);
-    expect(JSON.stringify(firstInput[3])).toContain("End your final reply to this message with one short line asking him to send the teeth photo.");
+    expect(JSON.stringify(firstInput[3])).toContain("End your final reply to this message with one short line asking him to send the missing morning photo.");
     clock = at(DAY, "08:10");
     const second = [...first, assistant("agenda... (send the teeth photo!)"), user("thanks, next item")];
     const two = await decide(request(second));
@@ -547,6 +595,20 @@ describe("Cairn API", () => {
     expect(file.headers.get("content-type")).toBe("image/jpeg");
     expect(await file.text()).toBe("cairn-teeth");
     expect((await api(`/photos/${"0".repeat(64)}`, { token: "phone" })).status).toBe(404);
+  });
+
+  test("Cairn can send the morning weigh-in once it is enabled", async () => {
+    expect(await (await submit("weight_morning", "too-early")).json()).toMatchObject({ result: "fail", verdict: "not_due" });
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...raw, weighInStartsAt: new Date(at(DAY, "05:00")).toISOString() }));
+    resetGateCache();
+    verdicts.push({ kind: "weight", confidence: 0.9, reason: "scale", reading: "160.2 lb" });
+    expect(await (await submit("weight_morning", "cairn-scale")).json()).toMatchObject({
+      result: "pass",
+      slot: `${DAY}/morning-weight`,
+      message: "✅ morning weigh-in (Oct 8) photo accepted (160.2 lb).",
+    });
   });
 
   test("the stated kind limits which requirement a photo can fill", async () => {

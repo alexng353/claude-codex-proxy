@@ -25,6 +25,7 @@ Sends one proof photo.
 
 - **`kind`** is one of:
   - `teeth_morning`: from 05:00
+  - `weight_morning`: from 05:00, a photo of the bathroom scale's reading, once weigh-ins are enabled
   - `teeth_night`: from 17:00 that day, or an overdue night requirement from the day before
   - `shower`: any time that day, or an overdue shower requirement from the day before
 
@@ -79,7 +80,7 @@ Response (`200`, also when the photo fails):
   - `clear`: nothing is locked
   - `bypassed`: locked, but a BYPASS hour is open
   - `disabled`: the kill switch is on
-- **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower` or `penance`.
+- **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight` or `penance`.
 - **`due_today`** lists what is due later today but does not lock yet.
 - **`open_debts`** lists BYPASS uses that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt } }`. A penance photo is sent in a chat; this API has no penance kind.
 - **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters.
@@ -111,6 +112,7 @@ Accepted proofs grouped by day, newest day first. This feeds the "photo a day" v
 ```
 
 - **`day`** is the day the photo was accepted. **`slot`** is the requirement it filled. A photo sent after midnight for the day before has a `slot` dated the day before.
+- **`reading`** appears on weigh-ins: the scale reading the classifier saw, such as `"72.4 kg"`.
 - **`manual: true`** marks a proof that was checked by hand and seeded into the gate, not checked by the classifier.
 - **Rejected photos** are never stored and never listed.
 
