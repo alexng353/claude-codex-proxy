@@ -7,6 +7,7 @@ import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
 import { scrubRequest } from "./scrub.mjs";
+import { preloadSkills } from "./skill-preload";
 import type { ProxyOutput, ResponsesRequest } from "./types";
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
@@ -71,7 +72,14 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
   const decision = await gateRequest(body);
   if (decision.action === "respond")
     return json({ action: "respond", response: responseObject(body, syntheticOutput(decision.text)) });
-  return json(decision.request === body ? { action: "forward" } : { action: "forward", request: decision.request });
+  try {
+    const prepared = preloadSkills(decision.request);
+    return json(prepared === body ? { action: "forward" } : { action: "forward", request: prepared });
+  } catch (cause) {
+    // The router fails open on HTTP errors. A normal synthetic response keeps a
+    // selected chat from reaching the model without its required skill.
+    return json({ action: "respond", response: responseObject(body, syntheticOutput((cause as Error).message)) });
+  }
 }
 
 export async function handleRequest(request: Request): Promise<Response> {
@@ -124,8 +132,9 @@ export async function handleRequest(request: Request): Promise<Response> {
     const activity = await preparePlateActivity(gate.request);
     // Perpetual chats (src/perpetual) replace history with a summary view;
     // every other request goes to Claude exactly as before.
-    const perpetual = preparePerpetual(activity.request);
-    const output = perpetual ? await perpetual.run(runClaude) : await runClaude(activity.request);
+    const prepared = preloadSkills(activity.request);
+    const perpetual = preparePerpetual(prepared);
+    const output = perpetual ? await perpetual.run(runClaude) : await runClaude(prepared);
     activity.commit();
     const response = responseObject(body, output);
     const reply = body.stream ? streamResponse(response) : json(response);
