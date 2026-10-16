@@ -535,6 +535,36 @@ export function isSyntheticUserMessage(item: ResponseInputItem): boolean {
   );
 }
 
+/**
+ * Plate's relay chat. dthread (~/code/alexng353/dthread) sends Alex's
+ * terminal input from it, so the same variable configures both.
+ */
+const relayThread = () => process.env.DTHREAD_RELAY_THREAD || "01a0fa23-38a5-7ae3-8afa-ff89f646b836";
+
+// `[^<]*` in <input> requires Desktop's escaping: raw markup means someone
+// other than Desktop built the envelope.
+const DELEGATION =
+  /^<codex_delegation>\s*<source_thread_id>([^<]*)<\/source_thread_id>\s*<input>([^<]*)<\/input>\s*<\/codex_delegation>$/;
+const DTHREAD = /^<dthread_message>([\s\S]*)<\/dthread_message>$/;
+const ENTITIES: Record<string, string> = { lt: "<", gt: ">", amp: "&", quot: '"', apos: "'", "#39": "'", "#34": '"' };
+const unescapeXml = (text: string) => text.replace(/&(lt|gt|amp|quot|apos|#39|#34);/g, (_, name: string) => ENTITIES[name]);
+
+/**
+ * What Alex typed in dthread, or null. Only a single-part delegation from the
+ * relay chat whose whole input is a <dthread_message> counts: any other
+ * delegation (agents, [jarvis] voice requests) stays agent-written, so no
+ * agent can spend a BYPASS for Alex.
+ */
+export function dthreadText(item: ResponseInputItem): string | null {
+  if (!isUserMessage(item)) return null;
+  const parts = partsOf(item).filter((part) => !isNotePart(part));
+  if (parts.length !== 1 || typeof parts[0].text !== "string") return null;
+  const envelope = parts[0].text.trim().match(DELEGATION);
+  if (!envelope || envelope[1].trim() !== relayThread()) return null;
+  const typed = unescapeXml(envelope[2]).trim().match(DTHREAD);
+  return typed ? typed[1].trim() : null;
+}
+
 export type TurnImage = { item: number; part: number; url: string };
 
 export type TurnClass =
@@ -569,6 +599,10 @@ function typedText(part: string): string {
  * messages after the last model output include one that is not a Codex
  * wrapper. A request whose input ends in model output or tool results is a
  * continuation of a turn that was already let through.
+ *
+ * dthread input arrives as an agent message from Plate's relay chat
+ * (`dthreadText`). It is human even under the agent-message trigger; any
+ * other text in such a turn is not.
  */
 export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: string[] = []): TurnClass {
   if (!Array.isArray(request.input)) return { type: "exempt", reason: "string input" };
@@ -579,13 +613,6 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
     return { type: "exempt", reason: `request kind ${meta.requestKind}` };
   if (meta.threadSource && EXEMPT_THREAD_SOURCES.has(meta.threadSource))
     return { type: "exempt", reason: `thread source ${meta.threadSource}` };
-  const trigger = meta.turnTrigger;
-  if (
-    trigger &&
-    !extraGatedTriggers.includes(trigger) &&
-    (EXEMPT_TRIGGERS.has(trigger) || EXEMPT_TRIGGER_PREFIXES.some((p) => trigger.startsWith(p)))
-  )
-    return { type: "exempt", reason: `trigger ${trigger}` };
 
   // The turn's own input: user and context messages after the last thing the
   // model produced.
@@ -596,12 +623,33 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
     else if (isContextMessage(item)) continue;
     else break;
   }
-  const human = turnUsers.filter((index) => !isSyntheticUserMessage(input[index]));
+  const dthread = new Map<number, string>();
+  for (const index of turnUsers) {
+    const typed = dthreadText(input[index]);
+    if (typed !== null) dthread.set(index, typed);
+  }
+
+  const trigger = meta.turnTrigger;
+  const exemptTrigger =
+    !!trigger &&
+    !extraGatedTriggers.includes(trigger) &&
+    (EXEMPT_TRIGGERS.has(trigger) || EXEMPT_TRIGGER_PREFIXES.some((p) => trigger.startsWith(p)));
+  const agentSent = exemptTrigger && trigger === "app_tool_send_message";
+  if (exemptTrigger && !(agentSent && dthread.size)) return { type: "exempt", reason: `trigger ${trigger}` };
+
+  const human = agentSent
+    ? [...dthread.keys()]
+    : turnUsers.filter((index) => dthread.has(index) || !isSyntheticUserMessage(input[index]));
   if (!human.length)
     return turnUsers.length ? { type: "exempt", reason: "no human-written message" } : { type: "continuation" };
   const texts: string[] = [];
   const images: TurnImage[] = [];
   for (const index of human) {
+    const typed = dthread.get(index);
+    if (typed !== undefined) {
+      if (typed) texts.push(typed);
+      continue;
+    }
     partsOf(input[index]).forEach((part, partIndex) => {
       if (part.type === "input_image" && typeof part.image_url === "string")
         images.push({ item: index, part: partIndex, url: part.image_url });
