@@ -290,9 +290,10 @@ export function dueToday(state: GateState, now: number): Requirement[] {
           ? "night teeth photo (before midnight)"
           : "night teeth photo (17:00 to midnight)",
     });
-  if (minutes < MORNING_MINUTE && !state.filled[slot.morning(day)] && enforced(state, slot.morning(day)))
+  const morningPending = minutes < MORNING_MINUTE || delayActive(state, now);
+  if (morningPending && !state.filled[slot.morning(day)] && enforced(state, slot.morning(day)))
     result.push({ slot: slot.morning(day), kind: "teeth", label: "morning teeth photo (from 05:00)" });
-  if (minutes < MORNING_MINUTE && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day)))
+  if (morningPending && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day)))
     result.push({ slot: slot.weight(day), kind: "weight", label: "morning weigh-in photo (from 05:00)" });
   return result;
 }

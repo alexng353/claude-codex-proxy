@@ -626,6 +626,25 @@ describe("Cairn API", () => {
     });
   });
 
+  test("status keeps the requested weigh-in visible during DELAY", async () => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...raw, weighInStartsAt: new Date(at(DAY, "05:00")).toISOString() }));
+    resetGateCache();
+    await decide(request([env, user("DELAY")]));
+    const body = await (await api("/status", { token: "phone" })).json();
+    expect(body).toMatchObject({ state: "clear", outstanding: [], delay: { active: true } });
+    expect(body.due_today).toContainEqual({
+      slot: `${DAY}/morning-weight`, kind: "weight", label: "morning weigh-in photo (from 05:00)",
+    });
+    verdicts.push({ kind: "weight", confidence: 0.9, reason: "scale", reading: "160.2 lb" });
+    const accepted = await (await submit("weight_morning", "delayed-scale")).json();
+    expect(accepted).toMatchObject({ result: "pass", slot: `${DAY}/morning-weight` });
+    const after = await (await api("/status", { token: "phone" })).json();
+    expect(after.due_today.map((r: { slot: string }) => r.slot)).not.toContain(`${DAY}/morning-weight`);
+    expect(after.due_today.map((r: { slot: string }) => r.slot)).toContain(`${DAY}/morning-teeth`);
+  });
+
   test("a passing morning proof unlocks the chat gate and appears in the daily photos", async () => {
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
     const body = await (await submit("teeth_morning", "cairn-teeth")).json();
