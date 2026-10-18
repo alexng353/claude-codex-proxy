@@ -53,6 +53,7 @@ import {
   decodeDataUrl,
   dhash,
   hammingDistance,
+  parseWeightReading,
   sha256,
   type Classifier,
 } from "./hygiene-proof";
@@ -537,6 +538,10 @@ export type SubmitResult = {
   verdict: ImageRecord["verdict"] | "not_due" | "error";
   slot: string | null;
   sha256: string;
+  /** Accepted weigh-ins only: the scale reading as the classifier saw it. */
+  reading?: string | null;
+  /** Accepted weigh-ins only: the reading in pounds, null when it can't be parsed. */
+  weight_lb?: number | null;
 };
 
 /**
@@ -553,12 +558,14 @@ export async function submitProof(image: { mediaType: string; bytes: Buffer }, t
     if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
     const record = outcome.record;
     const pass = record?.verdict === "accepted";
+    const weighIn = pass && record?.kind === "weight";
     return {
       result: pass ? "pass" : "fail",
       message: outcome.line ?? (record ? imageMarker(record, state) : "❌ photo could not be read."),
       verdict: record?.verdict ?? (outcome.line?.startsWith("⚠") ? "error" : "not_due"),
       slot: record?.slot ?? null,
       sha256: hash,
+      ...(weighIn ? { reading: record.reading ?? null, weight_lb: parseWeightReading(record.reading) } : {}),
     };
   });
 }

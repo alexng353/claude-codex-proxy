@@ -13,7 +13,7 @@ import {
   zonedTime,
   type GateState,
 } from "../src/hygiene";
-import { dhashFromGray, hammingDistance, parseCaptureTime, parseVerdict } from "../src/hygiene-proof";
+import { dhashFromGray, hammingDistance, parseCaptureTime, parseVerdict, parseWeightReading } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 /** Vancouver wall time on a given day, e.g. at("2026-10-08", "05:00"). */
@@ -309,5 +309,34 @@ describe("proof helpers", () => {
     expect(parseVerdict({ kind: "teeth", confidence: 3, reason: "brush" })).toEqual({ kind: "teeth", confidence: 1, reason: "brush" });
     expect(() => parseVerdict({ kind: "selfie", confidence: 1, reason: "" })).toThrow();
     expect(() => parseVerdict(null)).toThrow();
+  });
+
+  test("scale readings convert to pounds, rounded to 0.1", () => {
+    expect(parseWeightReading("231.4 lb")).toBe(231.4);
+    expect(parseWeightReading("231.4lbs")).toBe(231.4);
+    expect(parseWeightReading("231 LB")).toBe(231);
+    expect(parseWeightReading("104.9 kg")).toBe(231.3);
+    expect(parseWeightReading("72,4 kg")).toBe(159.6);
+    expect(parseWeightReading(" 72.4 Kg ")).toBe(159.6);
+  });
+
+  test("scale readings without a trustworthy number or unit are refused", () => {
+    for (const reading of [
+      undefined,
+      "",
+      "231.4",
+      "16 st 7 lb",
+      "16.5 st",
+      "Err",
+      "--.- kg",
+      "231.4 lb (maybe 281.4 lb)",
+      "59.9 lb",
+      "600.1 lb",
+      "20 kg",
+      "300 kg",
+    ])
+      expect(parseWeightReading(reading)).toBeNull();
+    expect(parseWeightReading("60 lb")).toBe(60);
+    expect(parseWeightReading("600 lb")).toBe(600);
   });
 });

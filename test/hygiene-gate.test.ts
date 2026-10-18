@@ -674,7 +674,33 @@ describe("Cairn API", () => {
       result: "pass",
       slot: `${DAY}/morning-weight`,
       message: "✅ morning weigh-in (Oct 8) photo accepted (160.2 lb).",
+      reading: "160.2 lb",
+      weight_lb: 160.2,
     });
+    // A resend returns the stored reading without another classifier call.
+    const again = await (await submit("weight_morning", "cairn-scale")).json();
+    expect(again).toMatchObject({ result: "pass", reading: "160.2 lb", weight_lb: 160.2 });
+  });
+
+  test("an accepted weigh-in with an unreadable number still passes, with weight_lb null", async () => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...raw, weighInStartsAt: new Date(at(DAY, "05:00")).toISOString() }));
+    resetGateCache();
+    verdicts.push({ kind: "weight", confidence: 0.9, reason: "scale", reading: "11 st 6 lb" });
+    const body = await (await submit("weight_morning", "stone-scale")).json();
+    expect(body).toMatchObject({ result: "pass", reading: "11 st 6 lb", weight_lb: null });
+  });
+
+  test("non-weight and failed proofs carry no weight fields", async () => {
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    const teeth = await (await submit("teeth_morning", "plain-teeth")).json();
+    expect(teeth.result).toBe("pass");
+    expect(teeth).not.toHaveProperty("weight_lb");
+    expect(teeth).not.toHaveProperty("reading");
+    const early = await (await submit("weight_morning", "early-scale")).json();
+    expect(early.result).toBe("fail");
+    expect(early).not.toHaveProperty("weight_lb");
   });
 
   test("the stated kind limits which requirement a photo can fill", async () => {

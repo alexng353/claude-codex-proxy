@@ -132,9 +132,28 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
   lines.push(
     '- "none": anything else, including screenshots, photos of a screen, photos of printed photos, or images with no person.',
     "confidence is your probability (0 to 1) that the chosen kind is right. reason is one short sentence.",
-    'reading is the displayed weight with its unit (e.g. "72.4 kg") for "weight", otherwise an empty string.',
+    'reading is the displayed weight with its unit (e.g. "72.4 kg" or "231.4 lb") for "weight", otherwise an empty string. Scales often use 7-segment LCD digits: read every digit and the decimal point exactly as shown, and take the unit from the display or the scale\'s unit label. Leave the unit out only if none is visible.',
   );
   return lines.join("\n");
+}
+
+const KG_TO_LB = 2.20462;
+export const WEIGHT_LB_RANGE = { min: 60, max: 600 } as const;
+
+/**
+ * The classifier's scale reading in pounds, rounded to 0.1, or null when it
+ * cannot be trusted: no number, no unit (kg and lb ranges overlap), stones,
+ * extra numbers, or a value outside 60-600 lb.
+ */
+export function parseWeightReading(reading: string | null | undefined): number | null {
+  if (!reading) return null;
+  const match = /^\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(kgs?|kilograms?|lbs?|pounds?)\.?\s*$/i.exec(reading);
+  if (!match) return null;
+  const value = Number(match[1].replace(",", "."));
+  const lb = /^k/i.test(match[2]) ? value * KG_TO_LB : value;
+  const rounded = Math.round(lb * 10) / 10;
+  if (!Number.isFinite(rounded) || rounded < WEIGHT_LB_RANGE.min || rounded > WEIGHT_LB_RANGE.max) return null;
+  return rounded;
 }
 
 export const VERDICT_SCHEMA = {
