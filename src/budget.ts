@@ -1,5 +1,6 @@
 import {
   conversationRequest,
+  isCompactionRequest,
   itemImageUrls,
   leadingContextCount,
   requestImageCount,
@@ -140,8 +141,58 @@ export type FittedReplay = {
   tokens: number;
   /** How many tool outputs were shortened or replaced. */
   elided: number;
+  /** How many of the oldest items a compaction left out to fit. */
+  omitted: number;
   fits: boolean;
 };
+
+const SUMMARY_TYPES = new Set(["compaction", "compaction_summary", "context_compaction"]);
+
+const isUserTurnStart = (item: ResponseInputItem): boolean =>
+  (item.type === undefined || item.type === "message") && item.role === "user";
+
+/**
+ * Last resort for a compaction whose messages alone overflow the window: leave
+ * out the oldest whole turns, keeping earlier compaction summaries, so the
+ * summary covers the most recent history instead of the request failing.
+ * Ordinary turns never take this path; they must not silently lose history.
+ */
+function omitOldestTurns(
+  items: ResponseInputItem[],
+  start: number,
+  tokens: number,
+  budget: number,
+): { items: ResponseInputItem[]; tokens: number; omitted: number } {
+  // The trigger and the turn just before it are what the summary must end on.
+  let lastTurn = items.length - 1;
+  while (lastTurn > start && !isUserTurnStart(items[lastTurn])) lastTurn--;
+  let cut = start;
+  let dropped = 0;
+  for (let index = start; index < lastTurn && tokens - dropped > budget; index++) {
+    if (!SUMMARY_TYPES.has(items[index].type ?? "")) dropped += itemTokens(items[index]);
+    cut = index + 1;
+  }
+  // Finish at a turn boundary so no call is separated from its output.
+  while (cut < lastTurn && !isUserTurnStart(items[cut])) {
+    if (!SUMMARY_TYPES.has(items[cut].type ?? "")) dropped += itemTokens(items[cut]);
+    cut++;
+  }
+  const removed = items.slice(start, cut).filter((item) => !SUMMARY_TYPES.has(item.type ?? ""));
+  if (!removed.length) return { items, tokens, omitted: 0 };
+  const kept = items.slice(start, cut).filter((item) => SUMMARY_TYPES.has(item.type ?? ""));
+  const marker: ResponseInputItem = {
+    type: "message",
+    role: "user",
+    content: [
+      {
+        type: "input_text",
+        text: `[${MARKER} the ${removed.length} oldest items of this conversation to fit Claude's context window for this compaction. Summarize what follows; say in the summary that earlier history was not visible.]`,
+      },
+    ],
+  };
+  const next = [...items.slice(0, start), ...kept, marker, ...items.slice(cut)];
+  return { items: next, tokens: tokens - dropped + itemTokens(marker), omitted: removed.length };
+}
 
 /**
  * Shrinks a history whose full replay would not fit `budget` estimated tokens.
@@ -157,8 +208,8 @@ export function fitReplay(
 ): FittedReplay {
   let tokens = replayTokens(request);
   if (tokens <= budget || typeof request.input === "string")
-    return { request, tokens, elided: 0, fits: tokens <= budget };
-  const items = [...request.input];
+    return { request, tokens, elided: 0, omitted: 0, fits: tokens <= budget };
+  let items = [...request.input];
   const start = leadingContextCount(items);
   const recent = Math.max(start, items.length - RECENT_ITEMS);
   const protectedFrom = Math.max(start, items.length - PROTECTED_ITEMS);
@@ -180,10 +231,18 @@ export function fitReplay(
       elided.add(index);
     }
   }
+  let omitted = 0;
+  if (tokens > budget && isCompactionRequest(request)) {
+    const trimmed = omitOldestTurns(items, start, tokens, budget);
+    items = trimmed.items;
+    tokens = trimmed.tokens;
+    omitted = trimmed.omitted;
+  }
   return {
-    request: elided.size ? { ...request, input: items } : request,
+    request: elided.size || omitted ? { ...request, input: items } : request,
     tokens: Math.ceil(tokens),
     elided: elided.size,
+    omitted,
     fits: tokens <= budget,
   };
 }

@@ -10,6 +10,7 @@ import {
   retryBudget,
 } from "../src/budget";
 import { closeIdleWorkers, runClaude } from "../src/claude";
+import { encodeCompaction } from "../src/request";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 const MARKER = "claude-codex-proxy elided";
@@ -96,6 +97,54 @@ test("elided outputs drop their images; tool_search outputs keep loaded tools", 
   expect(after[2]).toBe(search);
   expect(typeof after[3].output).toBe("string");
   expect(JSON.stringify(after)).not.toContain("data:image");
+});
+
+/** A chat whose messages alone are large: elision of tool outputs cannot save it. */
+function chatty(turns: number, compaction: boolean): ResponsesRequest {
+  const input: ResponseInputItem[] = [
+    { role: "user", content: "<environment_context>cwd</environment_context>" },
+    { type: "compaction", encrypted_content: encodeCompaction("earlier-summary") } as ResponseInputItem,
+  ];
+  for (let index = 0; index < turns; index++) {
+    input.push({ role: "user", content: `question-${index} ` + "q".repeat(4_000) });
+    input.push({ type: "function_call", name: "shell", call_id: `c${index}`, arguments: "{}" });
+    input.push({ type: "function_call_output", call_id: `c${index}`, output: "ok" });
+    input.push({ role: "assistant", content: `answer-${index} ` + "a".repeat(4_000) });
+  }
+  if (compaction) input.push({ type: "compaction_trigger" } as ResponseInputItem);
+  return { model: "claude-opus-5-5", input };
+}
+
+test("an oversized compaction leaves out the oldest whole turns, keeping summaries and the latest turn", () => {
+  const request = chatty(40, true);
+  const budget = Math.floor(replayTokens(request) / 3);
+  const fitted = fitReplay(request, budget);
+  expect(fitted.fits).toBe(true);
+  expect(fitted.omitted).toBeGreaterThan(0);
+  expect(replayTokens(fitted.request)).toBeLessThanOrEqual(budget + 1);
+  const after = items(fitted.request);
+  const texts = after.map((item) => JSON.stringify(item));
+  // Leading context and the earlier summary survive; the marker says what was left out.
+  expect(after[0]).toBe(items(request)[0]);
+  expect(after[1]).toBe(items(request)[1]);
+  expect(texts[2]).toContain(`${MARKER} the ${fitted.omitted} oldest items`);
+  // The cut lands on a turn boundary: the first kept item opens a user turn.
+  expect((after[3] as ResponseInputItem).role).toBe("user");
+  expect(texts.some((text) => text.includes("question-0 "))).toBe(false);
+  expect(texts.some((text) => text.includes("answer-39 "))).toBe(true);
+  expect(after.at(-1)?.type).toBe("compaction_trigger");
+  // Every kept call still has its output.
+  const calls = after.filter((item) => item.type === "function_call").map((item) => item.call_id);
+  const outputs = after.filter((item) => item.type === "function_call_output").map((item) => item.call_id);
+  expect(outputs).toEqual(calls);
+});
+
+test("an ordinary turn never loses messages to fit", () => {
+  const request = chatty(40, false);
+  const fitted = fitReplay(request, Math.floor(replayTokens(request) / 3));
+  expect(fitted.fits).toBe(false);
+  expect(fitted.omitted).toBe(0);
+  expect(items(fitted.request)).toHaveLength(items(request).length);
 });
 
 test("parses Claude Code and API prompt-too-long errors", () => {

@@ -762,6 +762,10 @@ async function runClaudeTurn(
       console.error(
         `Elided ${fitted.elided} older tool output(s) to fit a replay into ~${fitted.tokens} estimated tokens${fitted.fits ? "" : " (still over budget)"}`,
       );
+    if (fitted.omitted)
+      console.error(
+        `Compaction left out the ${fitted.omitted} oldest item(s) to fit ~${fitted.tokens} estimated tokens${fitted.fits ? "" : " (still over budget)"}`,
+      );
     return prepareClaudePrompt(conversationRequest(fitted.request));
   };
   let prepared = delta

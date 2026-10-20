@@ -151,10 +151,14 @@ function prepare(request: ResponsesRequest): PerpetualPlan | undefined {
   const meta = turnMetadata(request);
   // Subagents share their parent's prompt_cache_key; they keep their own history.
   if (meta.threadSource === "subagent" || meta.threadSource === "memory_consolidation") return undefined;
-  if (meta.requestKind && meta.requestKind !== "turn") return undefined;
+  const compaction = isCompactionRequest(request);
+  // Codex tags remote compaction request_kind "compaction". Passing it through
+  // would replay the chat's whole raw history, which outgrows Claude's window.
+  if (meta.requestKind && meta.requestKind !== "turn" && !(compaction && meta.requestKind === "compaction"))
+    return undefined;
   const config = (deps.config ?? loadConfig)();
   if (!config || !inScope(config, threadId, deps.title ?? codexTitle)) return undefined;
-  if (isCompactionRequest(request))
+  if (compaction)
     return {
       request,
       run: async () => ({

@@ -411,6 +411,20 @@ test("a Codex compaction in a perpetual chat costs no model call", async () => {
   expect(Buffer.from(item.encrypted_content.split(":")[1], "base64").toString()).toBe(COMPACTION_NOTE);
 });
 
+test("a compaction tagged request_kind compaction, as Codex sends it, still costs no model call", async () => {
+  const id = "compact-thread-tagged";
+  TITLES[id] = "Today (beta)";
+  const before = (await recorded()).length;
+  // codex-rs core/src/responses_metadata.rs: CodexResponsesRequestKind::Compaction => "compaction".
+  const metadata = { "x-codex-turn-metadata": JSON.stringify({ request_kind: "compaction", thread_source: "user" }) };
+  const body = await send(id, [...CONTEXT, user("hi"), { type: "compaction_trigger" } as ResponseInputItem], {
+    client_metadata: metadata,
+  });
+  expect((await recorded()).length).toBe(before);
+  const item = body.output.find((entry: any) => entry.type === "compaction");
+  expect(Buffer.from(item.encrypted_content.split(":")[1], "base64").toString()).toBe(COMPACTION_NOTE);
+});
+
 test("summarizer: free nodes, merges, the too-long retry, and failure backoff", async () => {
   const dir = await mkdtemp(join(directory, "compactor-"));
   const store = new ThreadStore(dir);
