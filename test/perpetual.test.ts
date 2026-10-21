@@ -288,6 +288,32 @@ test("the sawtooth batch rewrites the view once, then it grows at its end again"
   expect(at).toBe(view.end);
 });
 
+test("recentBytes keeps the newest finished messages raw after the view", async () => {
+  const id = "recent-thread";
+  TITLES[id] = "Today (beta)";
+  config = { ...config!, recentBytes: 200 };
+  let history: ResponseInputItem[] = [...CONTEXT];
+  for (let turn = 0; turn < 8; turn++) {
+    history = [...history, user(`m${turn} ${"w".repeat(60)}`)];
+    history = [...history, ...echo(await send(id, history))];
+    await perpetualThread(id)!.compactor.idle();
+  }
+  history = [...history, user("now")];
+  const before = (await recorded()).length;
+  await send(id, history);
+  const [entry] = (await recorded()).slice(before);
+  const text = textOf(entry);
+  const store = perpetualThread(id)!.store;
+  const held = store.messages.slice(store.view.end, store.length - 1);
+  expect(held.length).toBeGreaterThan(0);
+  expect(held.reduce((sum, message) => sum + message.size, 0)).toBeLessThanOrEqual(200);
+  expect(store.view.end).toBeGreaterThan(0);
+  // Held messages arrive whole; older ones only as view lines.
+  expect(text).toContain(`m7 ${"w".repeat(60)}`);
+  expect(text).toContain("0+1|");
+  expect(text.split(`m0 ${"w".repeat(60)}`).length - 1).toBeLessThanOrEqual(1);
+});
+
 test("an in-flight tool loop continues in the same Claude worker with only the new items", async () => {
   const id = "loop-thread";
   TITLES[id] = "Today (beta)";

@@ -214,7 +214,7 @@ class Turn {
     const start = currentTurnStart(this.conv);
     const turn = this.conv.slice(start);
     const startsTurn = turn.length > 0 && turn.every((item) => isMessage(item) && item.role !== "assistant");
-    if (startsTurn) this.advance(this.boundary(start));
+    if (startsTurn) this.advance(this.recentCut(this.boundary(start)));
     const raw = this.rawItems(start);
     if (startsTurn) this.pruneInjections(raw.anchors);
     const anchor = this.keys.at(-1) ?? "^";
@@ -256,6 +256,31 @@ class Turn {
     for (let k = start; k < this.conv.length; k++)
       for (const id of this.store.idsOf(this.keys[k]) ?? []) boundary = Math.min(boundary, id);
     return boundary;
+  }
+
+  /**
+   * Holds the newest messages before `boundary` out of the view, up to
+   * `recentBytes`, so they reach the model raw (short-term memory). Only
+   * messages Codex still sends can stay raw; the view never moves back.
+   */
+  private recentCut(boundary: number): number {
+    const budget = this.config.recentBytes ?? 0;
+    if (budget <= 0) return boundary;
+    const present = new Set<number>();
+    for (const key of this.keys) for (const id of this.store.idsOf(key) ?? []) present.add(id);
+    let cut = boundary;
+    let used = 0;
+    const local = (i: number) => this.store.messages[i]?.key.startsWith("local:") ?? false;
+    while (cut > this.store.view.end) {
+      const message = this.store.messages[cut - 1];
+      if (!message || !(present.has(message.i) || local(message.i)) || used + message.size > budget) break;
+      used += message.size;
+      cut--;
+    }
+    // Proxy-answered items stay raw only beside their anchor, so a cut that
+    // would strand them without it leaves them in the view.
+    while (cut < boundary && local(cut)) cut++;
+    return cut;
   }
 
   /** Appends built leaves up to the turn and runs the sawtooth; only at a turn start. */

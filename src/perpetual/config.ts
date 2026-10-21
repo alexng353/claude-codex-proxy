@@ -21,6 +21,12 @@ export type PerpetualConfig = {
   /** View sawtooth bounds in bytes (gist: 64,000 and 128,000). */
   viewMin: number;
   viewMax: number;
+  /**
+   * Short-term memory: the newest messages before the current turn, up to
+   * this many bytes, stay raw after the view instead of joining it as
+   * one-line leaves. 0 turns it off.
+   */
+  recentBytes?: number;
   /** The summarizer's model, on the same Claude Code route and accounts. */
   summaryModel: string;
   summaryEffort?: string;
@@ -30,6 +36,7 @@ const DEFAULTS: PerpetualConfig = {
   titlePrefix: "Today",
   viewMin: 64_000,
   viewMax: 128_000,
+  recentBytes: 48_000,
   summaryModel: "haiku",
 };
 
