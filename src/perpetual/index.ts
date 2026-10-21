@@ -26,7 +26,7 @@ import {
 } from "./messages";
 import { TURN_PROMPT } from "./prompts";
 import { LockedError, ThreadStore, type Injection, type NewMessage } from "./store";
-import { Compactor, claudeRunner, viewBlocks, type SummaryRunner } from "./summarizer";
+import { Compactor, summaryRunner, viewBlocks, type SummaryRunner } from "./summarizer";
 import { BLOCK_LINES, advanceView, nextMark, nodeStart, viewLine, type NodeRef } from "./view";
 
 /**
@@ -109,7 +109,7 @@ function openThread(threadId: string, config: PerpetualConfig): Thread {
   const store = new ThreadStore(join(root(), safeName(threadId)));
   const compactor = new Compactor(store, {
     threadId,
-    runner: deps.runner ?? claudeRunner(config.summaryModel, config.summaryEffort),
+    runner: deps.runner ?? summaryRunner(config.summaryModel, config.summaryEffort),
   });
   const thread = { store, compactor };
   threads.set(threadId, thread);

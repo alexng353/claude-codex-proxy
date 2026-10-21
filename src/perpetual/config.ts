@@ -27,7 +27,7 @@ export type PerpetualConfig = {
    * one-line leaves. 0 turns it off.
    */
   recentBytes?: number;
-  /** The summarizer's model, on the same Claude Code route and accounts. */
+  /** The summarizer model: gpt-* runs via `codex exec` on the ChatGPT login, anything else via Claude Code. */
   summaryModel: string;
   summaryEffort?: string;
 };

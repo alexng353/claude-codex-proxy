@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as accounts from "../accounts";
 import { accountEnv, isLimited, listAccounts, type Account } from "../accounts";
@@ -278,6 +279,107 @@ function imageBlock(path: string, caption: string): ClaudeInputBlock | undefined
 }
 
 export { imageBlock as loggedImageBlock };
+
+// ---- Alternative runner: one `codex exec` per call (gpt-* models) ----
+
+/**
+ * A private CODEX_HOME so summaries skip Alex's config, hooks, MCP servers and
+ * AGENTS.md, and never show up as threads. It shares his ChatGPT login through
+ * a symlink to ~/.codex/auth.json.
+ */
+function summaryCodexHome(): string {
+  const home = join(stateDir(), "perpetual", "codex-home");
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const auth = join(home, "auth.json");
+  const target = join(process.env.HOME ?? "", ".codex", "auth.json");
+  let linked = false;
+  try {
+    linked = lstatSync(auth).isSymbolicLink();
+  } catch {}
+  if (!linked) {
+    rmSync(auth, { force: true });
+    symlinkSync(target, auth);
+  }
+  if (!existsSync(join(home, "config.toml"))) writeFileSync(join(home, "config.toml"), "", { mode: 0o600 });
+  return home;
+}
+
+const IMAGE_EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
+
+export function codexRunner(model: string, effort?: string): SummaryRunner {
+  return () => {
+    // Codex exec is one-shot, so a follow-up (the "too long" retry) replays the earlier exchange as text.
+    const history: string[] = [];
+    return {
+      async ask(content) {
+        const directory = mkdtempSync(join(tmpdir(), "perp-summary-"));
+        try {
+          const texts: string[] = [];
+          const images: string[] = [];
+          for (const block of content as any[]) {
+            if (block.type === "text") texts.push(block.text);
+            else if (block.type === "image" && block.source?.type === "base64") {
+              const path = join(directory, `image-${images.length}.${IMAGE_EXT[block.source.media_type] ?? "png"}`);
+              writeFileSync(path, Buffer.from(block.source.data, "base64"));
+              images.push(path);
+            }
+          }
+          const task = texts.join("\n\n");
+          const prompt = [
+            COMPACTION_PROMPT,
+            "Reply with the line only. Do not run commands or use tools.",
+            ...(history.length ? ["Earlier in this task:", ...history] : []),
+            task,
+          ].join("\n\n");
+          const out = join(directory, "out.txt");
+          const child = Bun.spawn(
+            [
+              process.env.CODEX_BIN ?? "codex",
+              "exec",
+              "--ephemeral",
+              "--skip-git-repo-check",
+              "-s",
+              "read-only",
+              "-C",
+              directory,
+              "-m",
+              model,
+              ...(effort ? ["-c", `model_reasoning_effort="${effort}"`] : []),
+              ...images.flatMap((path) => ["-i", path]),
+              "-o",
+              out,
+              "-",
+            ],
+            {
+              stdin: new TextEncoder().encode(prompt),
+              stdout: "ignore",
+              stderr: "ignore",
+              cwd: directory,
+              env: { ...process.env, CODEX_HOME: summaryCodexHome() },
+            },
+          );
+          const deadline = setTimeout(() => child.kill(), SUMMARY_TIMEOUT_MS);
+          const code = await child.exited.finally(() => clearTimeout(deadline));
+          let reply = "";
+          try {
+            reply = readFileSync(out, "utf8");
+          } catch {}
+          if (code !== 0 || !reply.trim()) throw new Error(`summarizer (codex ${model}) exited ${code}`);
+          history.push(`Task:\n${task}`, `Your reply:\n${reply.trim()}`);
+          return reply;
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+      },
+      close() {},
+    };
+  };
+}
+
+/** gpt-* (and o-series) models run through Codex; everything else through Claude Code. */
+export function summaryRunner(model: string, effort?: string): SummaryRunner {
+  return /^(gpt-|o\d)/.test(model) ? codexRunner(model, effort) : claudeRunner(model, effort);
+}
 
 // ---- The default runner: one Claude Code process per compaction ----
 
