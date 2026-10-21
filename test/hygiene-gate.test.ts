@@ -736,3 +736,98 @@ describe("Cairn API", () => {
     expect((await handleRequest(new Request("http://localhost/hygiene/status", { headers: { "tailscale-user-login": "alex@" } }))).status).toBe(403);
   });
 });
+
+/**
+ * Oct 21: Today on Forge ran its own gate. Proofs reached only arch's, so
+ * Forge's locked Today all afternoon and answered Alex with the lock text. Now
+ * one machine holds the gate and the other follows it (HYGIENE_GATE_REMOTE).
+ * The authority here is a real server running this same proxy on its own state.
+ */
+describe("following another machine's gate", () => {
+  let authority: ReturnType<typeof Bun.serve> | null = null;
+  let authorityState = "";
+  let followerState = "";
+
+  /** Run the authority's side as its own proxy: its state, no remote. */
+  async function asAuthority<T>(work: () => Promise<T>): Promise<T> {
+    const env = { remote: process.env.HYGIENE_GATE_REMOTE, state: process.env.HYGIENE_GATE_STATE };
+    delete process.env.HYGIENE_GATE_REMOTE;
+    process.env.HYGIENE_GATE_STATE = authorityState;
+    try {
+      return await work();
+    } finally {
+      process.env.HYGIENE_GATE_REMOTE = env.remote;
+      process.env.HYGIENE_GATE_STATE = env.state;
+    }
+  }
+
+  beforeEach(async () => {
+    authorityState = process.env.HYGIENE_GATE_STATE!;
+    // The follower's own file says nothing is due for a month: any lock it shows came from the authority.
+    followerState = join(directory, `state-${run}`, "follower.json");
+    const own = JSON.parse(await readFile(authorityState, "utf8"));
+    await writeFile(followerState, JSON.stringify({ ...own, startsAt: new Date(at(DAY, "05:00") + 30 * 86_400_000).toISOString() }));
+    authority = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => asAuthority(() => handleRequest(req)) });
+    process.env.HYGIENE_GATE_STATE = followerState;
+    process.env.HYGIENE_GATE_REMOTE = `http://127.0.0.1:${authority.port}/`;
+    setAuthenticator(async (token) => (token === "phone" ? { id: "phone-1", name: "iphone", role: "phone" } : null));
+  });
+  const stop = () => {
+    authority?.stop(true);
+    authority = null;
+  };
+  afterAll(() => {
+    stop();
+    delete process.env.HYGIENE_GATE_REMOTE;
+    setAuthenticator();
+  });
+
+  const reply = async (input: ResponseInputItem[]) => {
+    const response = await handleRequest(
+      new Request("http://localhost/v1/responses", { method: "POST", body: JSON.stringify(request(input)) }),
+    );
+    const body = (await response.json()) as { output: Array<{ content?: Array<{ text?: string }> }> };
+    return body.output.flatMap((o) => o.content ?? []).map((c) => c.text).join("");
+  };
+
+  test("the authority's lock and bypass apply here, and only its state changes", async () => {
+    expect(await reply([env, user("hi")])).toContain("gate armed: morning teeth photo");
+    expect(await reply([env, user("hi"), assistant("locked"), user("BYPASS")])).toContain("bypass #1");
+    expect(JSON.parse(await readFile(authorityState, "utf8")).bypass.count).toBe(1);
+    expect(JSON.parse(await readFile(followerState, "utf8")).bypass.count).toBe(0);
+    // Bypassed: the turn reaches the model.
+    expect(await reply([env, user("hi"), assistant("locked"), user("BYPASS"), assistant("open"), user("now answer")])).toBe("model-ran");
+  });
+
+  test("status, rulings and Cairn's API are the authority's", async () => {
+    const status = await (await handleRequest(new Request("http://localhost/hygiene/status"))).json();
+    expect(status).toMatchObject({ state: "armed", startsAt: new Date(at(DAY, "05:00")).toISOString() });
+    expect((await handleRequest(new Request("http://localhost/hygiene/debt/nope/resolve", { method: "POST", body: "{}" }))).status).toBe(404);
+    // Cairn reaches the follower through Tailscale Serve; the authority checks the token.
+    const cairn = (token?: string) =>
+      handleRequest(
+        new Request("http://localhost/hygiene/api/v1/status", {
+          headers: { "x-forwarded-for": "100.64.0.5", ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        }),
+      );
+    expect(await (await cairn("phone")).json()).toMatchObject({ state: "armed", today: DAY });
+    expect((await cairn()).status).toBe(401);
+    // Its whole state is for local callers only.
+    expect(
+      (await handleRequest(new Request("http://localhost/hygiene/state", { headers: { "x-forwarded-for": "100.64.0.5" } }))).status,
+    ).toBe(403);
+  });
+
+  test("the router's GPT question is answered by the authority too", async () => {
+    const ask = await handleRequest(
+      new Request("http://localhost/hygiene/gate", { method: "POST", body: JSON.stringify(request([env, user("hi")])) }),
+    );
+    expect(await ask.json()).toMatchObject({ action: "respond" });
+  });
+
+  test("with the authority unreachable, turns go through untouched", async () => {
+    stop();
+    expect(await reply([env, user("hi")])).toBe("model-ran");
+    expect((await handleRequest(new Request("http://localhost/hygiene/status"))).status).toBe(502);
+  });
+});

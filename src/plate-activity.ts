@@ -11,6 +11,7 @@ import {
 } from "./plate-activity.mjs";
 import { type GateEvent, gateEvents } from "./hygiene";
 import { loadState } from "./hygiene-gate";
+import { cachedRemoteState, remoteGate } from "./hygiene-remote";
 import { isCompactionRequest } from "./request";
 import { stateDir } from "./sessions";
 import type { ResponsesRequest } from "./types";
@@ -47,7 +48,9 @@ export type HygieneSource = (since: number, until: number) => GateEvent[];
 
 const gateSource: HygieneSource = (since, until) => {
   try {
-    return gateEvents(loadState(), since, until);
+    const remote = remoteGate();
+    const state = remote ? cachedRemoteState(remote) : loadState();
+    return state ? gateEvents(state, since, until) : [];
   } catch (error) {
     console.error("plate-activity: hygiene state unavailable:", (error as Error).name);
     return [];

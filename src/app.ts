@@ -2,6 +2,7 @@ import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
+import { GATE_ONLY_HEADER } from "./hygiene-remote";
 import { perpetualStatus, preparePerpetual } from "./perpetual";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
@@ -70,6 +71,13 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
     return error((cause as Error).message);
   }
   const decision = await gateRequest(body);
+  // Another proxy following this gate asks for the decision alone; it preloads its own skills.
+  if (request.headers.has(GATE_ONLY_HEADER))
+    return json(
+      decision.action === "respond"
+        ? { action: "respond", text: decision.text }
+        : { action: "forward", request: decision.request },
+    );
   if (decision.action === "respond")
     return json({ action: "respond", response: responseObject(body, syntheticOutput(decision.text)) });
   try {

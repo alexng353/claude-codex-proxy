@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, type ProofKind } from "./hygiene";
 import { gateDisabled, gateStatus, proofDays, proofFile, submitProof, type ProofTarget } from "./hygiene-gate";
+import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
 
@@ -115,6 +116,9 @@ function status() {
 /** Routes under /hygiene/api/v1. Null for other paths. */
 export async function handleHygieneApi(request: Request, url: URL): Promise<Response | null> {
   if (url.pathname !== API_PREFIX && !url.pathname.startsWith(`${API_PREFIX}/`)) return null;
+  // Another machine holds the gate: it checks the token and keeps the proofs.
+  const remote = remoteGate();
+  if (remote) return passThrough(remote, request, url);
   const who = await device(request);
   if (who instanceof Response) return who;
   const path = url.pathname.slice(API_PREFIX.length);

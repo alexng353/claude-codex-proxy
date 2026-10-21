@@ -9,6 +9,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { passThrough, remoteGate, remoteGateRequest } from "./hygiene-remote";
 import {
   BYPASS_MS,
   DELAY_END_MINUTE,
@@ -383,6 +384,8 @@ function delayReply(state: GateState, now: number): string {
  */
 export async function gateRequest(request: ResponsesRequest): Promise<GateDecision> {
   if (gateDisabled()) return forward(request);
+  const remote = remoteGate();
+  if (remote) return remoteGateRequest(remote, request);
   try {
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
@@ -514,7 +517,11 @@ export async function resolveDebt(
 /** /hygiene/* routes. Returns null for paths that are not ours. */
 export async function handleHygieneRoute(request: Request, url: URL): Promise<Response | null> {
   if (!url.pathname.startsWith("/hygiene/")) return null;
+  const remote = remoteGate();
+  if (remote) return passThrough(remote, request, url);
   if (url.pathname === "/hygiene/status" && request.method === "GET") return Response.json(gateStatus());
+  // The whole state, for proxies that follow this gate (hygiene-remote.ts). Local callers only.
+  if (url.pathname === "/hygiene/state" && request.method === "GET") return Response.json(loadState());
   const ruling = /^\/hygiene\/debt\/([A-Za-z0-9-]+)\/resolve$/.exec(url.pathname);
   if (ruling && request.method === "POST") {
     let body: Record<string, unknown> = {};
