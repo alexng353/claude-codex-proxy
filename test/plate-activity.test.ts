@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -369,20 +369,27 @@ describe("hygiene gate events", () => {
     const gate: GateEvent[] = [];
     const source: HygieneSource = (since, until) =>
       known ? gate.filter((e) => Date.parse(e.at) > since && Date.parse(e.at) <= until) : null;
+    const start = Date.now();
+    const minutes = (m: number) => setSystemTime(new Date(start + m * 60_000));
+    minutes(0);
     const m1 = [user("first")];
     (await preparePlateActivity(request(m1), config, source)).commit();
 
-    // A follower that hasn't heard from Forge can't tell; the outcome waits rather than being skipped.
-    gate.push({ key: "image:late", at: new Date(Date.now() - 1000).toISOString(), text: "shower (Oct 7) accepted" });
+    // A follower that can't reach Forge can't tell; the outcome waits rather than being skipped,
+    // even once it is older than the 5-minute look-back.
+    gate.push({ key: "image:late", at: new Date(start + 1000).toISOString(), text: "shower (Oct 7) accepted" });
     known = false;
+    minutes(10);
     const m2 = [...m1, assistant("a"), user("second")];
     const second = await preparePlateActivity(request(m2), config, source);
     expect(blocksIn(second.request)[2]).toBeUndefined();
     second.commit();
 
     known = true;
+    minutes(20);
     const m3 = [...m2, assistant("b"), user("third")];
     const third = await preparePlateActivity(request(m3), config, source);
+    setSystemTime();
     expect(blocksIn(third.request)[4]).toContain("shower (Oct 7) accepted");
   });
 });

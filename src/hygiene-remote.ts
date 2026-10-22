@@ -28,10 +28,8 @@ export const HOP_HEADER = "x-hygiene-gate-hop";
 const DECISION_TIMEOUT_MS = 85_000;
 /** A proof is classified by a model before the answer comes back. */
 const PASS_THROUGH_TIMEOUT_MS = 180_000;
-const STATE_TTL_MS = 30_000;
-const UNCHECKED_MAX = 500;
 
-export const UNCHECKED_MARKER = "[hygiene-gate: photo not checked (gate unreachable); image withheld]";
+const UNCHECKED_MARKER = "[hygiene-gate: photo not checked (gate unreachable); image withheld]";
 
 /** The authority's base URL, or null when this proxy is the gate. */
 export function remoteGate(): string | null {
@@ -43,7 +41,11 @@ export function remoteGate(): string | null {
 export const loopResponse = () =>
   Response.json({ error: "hygiene gate loop: HYGIENE_GATE_REMOTE points at a follower" }, { status: 508 });
 
-/** The authority's decision for one Responses request, or null when it couldn't answer. */
+/**
+ * The authority's decision for one Responses request, or null when it can't be
+ * reached. A timeout is different: the authority is up but still deciding (a
+ * proof is classified by a model), so it may yet lock; the turn waits for it.
+ */
 export async function remoteGateRequest(base: string, request: ResponsesRequest): Promise<GateDecision | null> {
   try {
     const reply = await fetch(`${base}/hygiene/gate`, {
@@ -60,6 +62,8 @@ export async function remoteGateRequest(base: string, request: ResponsesRequest)
       return { action: "forward", request: (body.request as ResponsesRequest | undefined) ?? request };
     throw new Error("unexpected answer");
   } catch (error) {
+    if ((error as Error).name === "TimeoutError")
+      return { action: "respond", text: "⏳ the hygiene gate is still checking. Send that again in a minute." };
     console.error("hygiene-gate: remote gate unavailable:", (error as Error).message);
     return null;
   }
@@ -94,78 +98,85 @@ export async function passThrough(base: string, request: Request, url: URL): Pro
   }
 }
 
-let remoteState: { state: GateState | null; fetchedAt: number; triedAt: number; pending: boolean } = {
-  state: null,
-  fetchedAt: 0,
-  triedAt: 0,
-  pending: false,
-};
-
-/**
- * The authority's state for readers that can't wait: the last copy fetched,
- * refreshed in the background every 30 s. Null until a fetch lands, or when
- * the copy is older than maxAgeMs.
- */
-export function cachedRemoteState(base: string, now = Date.now(), maxAgeMs = Number.POSITIVE_INFINITY): GateState | null {
-  if (!remoteState.pending && now - remoteState.triedAt >= STATE_TTL_MS) {
-    remoteState.pending = true;
-    remoteState.triedAt = now;
-    void fetch(`${base}/hygiene/state`, { headers: { [HOP_HEADER]: "1" }, signal: AbortSignal.timeout(10_000) })
-      .then(async (reply) => {
-        if (!reply.ok) throw new Error(`answered ${reply.status}`);
-        const state = (await reply.json()) as GateState;
-        remoteState = { ...remoteState, state, fetchedAt: Date.now(), pending: false };
-      })
-      .catch((error) => {
-        console.error("hygiene-gate: remote state unavailable:", (error as Error).message);
-        remoteState = { ...remoteState, pending: false };
-      });
+/** The authority's whole state now, or null when it doesn't answer within `timeoutMs`. */
+export async function fetchRemoteState(base: string, timeoutMs: number): Promise<GateState | null> {
+  try {
+    const reply = await fetch(`${base}/hygiene/state`, {
+      headers: { [HOP_HEADER]: "1" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!reply.ok) throw new Error(`answered ${reply.status}`);
+    return (await reply.json()) as GateState;
+  } catch (error) {
+    console.error("hygiene-gate: remote state unavailable:", (error as Error).message);
+    return null;
   }
-  return remoteState.state && now - remoteState.fetchedAt <= maxAgeMs ? remoteState.state : null;
 }
 
 // ---- Photos no gate checked ----
 
 const uncheckedPath = () => join(stateDir(), "hygiene-unchecked.json");
 
-function loadUnchecked(): string[] {
+/**
+ * A photo's key: the hash of its bytes, or of its URL when it is fetched rather
+ * than inline (the model adapter fetches http URLs too).
+ */
+function imageKey(url: string): string {
+  const decoded = decodeDataUrl(url);
+  return decoded ? sha256(decoded.bytes) : `url:${sha256(Buffer.from(url))}`;
+}
+
+/**
+ * Keys of photos no gate checked. Kept in memory too, so a photo stays withheld
+ * in this process even if saving the list fails. Never trimmed: a trimmed key
+ * would release its photo the next time history carries it. Null when the file
+ * can't be read: then every photo is withheld (fail closed).
+ */
+let unchecked: { path: string; keys: Set<string> | null } | null = null;
+
+function uncheckedKeys(): Set<string> | null {
   const path = uncheckedPath();
-  if (!existsSync(path)) return [];
+  if (unchecked?.path === path) return unchecked.keys;
+  let keys: Set<string> | null = new Set();
+  if (existsSync(path)) {
+    try {
+      const value = JSON.parse(readFileSync(path, "utf8")) as { keys?: unknown; sha256?: unknown };
+      const list = value.keys ?? value.sha256;
+      if (!Array.isArray(list)) throw new Error("no key list");
+      keys = new Set(list.filter((s): s is string => typeof s === "string"));
+    } catch (error) {
+      console.error("hygiene-gate: unchecked photo list unreadable; withholding every photo:", (error as Error).message);
+      keys = null;
+    }
+  }
+  unchecked = { path, keys };
+  return keys;
+}
+
+/** Remembers photos sent while the authority was unreachable. Saving may fail; the memory copy holds. */
+function markUnchecked(urls: string[]): void {
+  const keys = uncheckedKeys();
+  if (!keys || !urls.length) return;
+  for (const url of urls) keys.add(imageKey(url));
   try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as { sha256?: unknown };
-    return Array.isArray(value.sha256) ? value.sha256.filter((s): s is string => typeof s === "string") : [];
-  } catch {
-    return [];
+    const path = uncheckedPath();
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(`${path}.tmp`, JSON.stringify({ keys: [...keys] }), { mode: 0o600 });
+    renameSync(`${path}.tmp`, path);
+  } catch (error) {
+    console.error("hygiene-gate: could not save the unchecked photo list:", (error as Error).message);
   }
 }
 
-/** Remembers photos sent while the authority was unreachable. */
-export function markUnchecked(urls: string[]): void {
-  const hashes = urls.flatMap((url) => {
-    const decoded = decodeDataUrl(url);
-    return decoded ? [sha256(decoded.bytes)] : [];
-  });
-  if (!hashes.length) return;
-  const next = [...loadUnchecked().filter((h) => !hashes.includes(h)), ...hashes].slice(-UNCHECKED_MAX);
-  const path = uncheckedPath();
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(`${path}.tmp`, JSON.stringify({ sha256: next }), { mode: 0o600 });
-  renameSync(`${path}.tmp`, path);
-}
-
-/** Replaces each photo no gate checked with a marker, in every user message. */
-export function withholdUnchecked(request: ResponsesRequest): ResponsesRequest {
+/** `request` with each user photo `hide` picks replaced by the marker. */
+function replaceImages(request: ResponsesRequest, hide: (url: string) => boolean): ResponsesRequest {
   if (!Array.isArray(request.input)) return request;
-  const unchecked = new Set(loadUnchecked());
-  if (!unchecked.size) return request;
   let changed = false;
   const input = (request.input as ResponseInputItem[]).map((item) => {
     if (item?.role !== "user" || !Array.isArray(item.content)) return item;
     let hit = false;
     const content = partsOf(item).map((part) => {
-      if (part.type !== "input_image" || typeof part.image_url !== "string") return part;
-      const decoded = decodeDataUrl(part.image_url);
-      if (!decoded || !unchecked.has(sha256(decoded.bytes))) return part;
+      if (part.type !== "input_image" || typeof part.image_url !== "string" || !hide(part.image_url)) return part;
       hit = true;
       return { type: "input_text", text: UNCHECKED_MARKER };
     });
@@ -174,4 +185,28 @@ export function withholdUnchecked(request: ResponsesRequest): ResponsesRequest {
     return { ...item, content } as ResponseInputItem;
   });
   return changed ? { ...request, input } : request;
+}
+
+/** Replaces each photo no gate checked with a marker (every photo when the list is unreadable). */
+export function withholdUnchecked(request: ResponsesRequest): ResponsesRequest {
+  const keys = uncheckedKeys();
+  if (keys && !keys.size) return request;
+  return replaceImages(request, (url) => !keys || keys.has(imageKey(url)));
+}
+
+/**
+ * The authority can't be asked: every user photo in the request is withheld,
+ * since nothing here knows which ones it accepted or withheld. The photos of
+ * the turn's own messages (the trailing user messages, the ones no gate saw)
+ * are remembered, so they stay withheld after the authority is back.
+ */
+export function withholdForOutage(request: ResponsesRequest): ResponsesRequest {
+  if (!Array.isArray(request.input)) return request;
+  const input = request.input as ResponseInputItem[];
+  const fresh: string[] = [];
+  for (let index = input.length - 1; index >= 0 && input[index]?.role === "user"; index--)
+    for (const part of partsOf(input[index]))
+      if (part.type === "input_image" && typeof part.image_url === "string") fresh.push(part.image_url);
+  markUnchecked(fresh);
+  return replaceImages(request, () => true);
 }

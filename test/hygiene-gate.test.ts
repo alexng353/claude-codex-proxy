@@ -873,4 +873,52 @@ describe("following another machine's gate", () => {
     inputs = await readFile(join(directory, "inputs"), "utf8");
     expect(inputs).not.toContain(bytes);
   });
+
+  /** What the model got since `before` bytes into the fake Claude's log. */
+  const sentSince = async (before: number) =>
+    existsSync(join(directory, "inputs")) ? (await readFile(join(directory, "inputs"), "utf8")).slice(before) : "";
+  const logLength = async () =>
+    existsSync(join(directory, "inputs")) ? (await readFile(join(directory, "inputs"), "utf8")).length : 0;
+
+  test("a proof the authority accepted stays withheld when it goes down, with no cached state here", async () => {
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    const proof = [env, user("hi"), assistant("locked"), user({ photo: "accepted-teeth" })];
+    expect(await reply(proof)).toBe("model-ran");
+    stop();
+    const before = await logLength();
+    expect(await reply([...proof, assistant("model-ran"), user("later")])).toBe("model-ran");
+    const sent = await sentSince(before);
+    expect(sent).toContain("later");
+    expect(sent).not.toContain(Buffer.from("accepted-teeth").toString("base64"));
+  });
+
+  test("a photo by URL is withheld too while the authority is down", async () => {
+    stop();
+    const before = await logLength();
+    const byUrl = {
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "see this" },
+        { type: "input_image", image_url: "http://127.0.0.1:9/bathroom.jpg", detail: "auto" },
+      ],
+    } as ResponseInputItem;
+    expect(await reply([env, byUrl])).toBe("model-ran");
+    const sent = await sentSince(before);
+    expect(sent).toContain("photo not checked (gate unreachable); image withheld");
+    expect(sent).not.toContain("bathroom.jpg");
+  });
+
+  test("a photo is withheld even when the unchecked list can't be saved", async () => {
+    stop();
+    // The state directory is under a regular file: every save fails.
+    process.env.PROXY_STATE_DIR = join(directory, "inputs-blocker", "state");
+    await writeFile(join(directory, "inputs-blocker"), "not a directory");
+    // The gate's own decision (the rest of the proxy needs that directory too).
+    const decision = await decide(request([env, user("look", { photo: "unsaved-bathroom" })]));
+    expect(decision.action).toBe("forward");
+    const forwarded = JSON.stringify(decision.action === "forward" ? decision.request : null);
+    expect(forwarded).toContain("look");
+    expect(forwarded).not.toContain(Buffer.from("unsaved-bathroom").toString("base64"));
+  });
 });
