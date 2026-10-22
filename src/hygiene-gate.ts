@@ -2,14 +2,22 @@
  * Hygiene gate: state, decisions and HTTP routes. See hygiene.ts for the
  * rules and README "Hygiene gate" for the operator view.
  *
- * One process owns the state: this proxy. The Codex model router asks it
+ * One process owns the state: this proxy, or the proxy it follows when
+ * HYGIENE_GATE_REMOTE is set (hygiene-remote.ts). The Codex model router asks it
  * about GPT turns through POST /hygiene/gate; Claude turns are gated inline
  * in /v1/responses. Decisions for new human turns are serialized so two
  * chats cannot spend the same photo or bypass.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { passThrough, remoteGate, remoteGateRequest } from "./hygiene-remote";
+import {
+  cachedRemoteState,
+  markUnchecked,
+  passThrough,
+  remoteGate,
+  remoteGateRequest,
+  withholdUnchecked,
+} from "./hygiene-remote";
 import {
   BYPASS_MS,
   DELAY_END_MINUTE,
@@ -385,8 +393,8 @@ function delayReply(state: GateState, now: number): string {
 export async function gateRequest(request: ResponsesRequest): Promise<GateDecision> {
   if (gateDisabled()) return forward(request);
   const remote = remoteGate();
-  if (remote) return remoteGateRequest(remote, request);
   try {
+    if (remote) return await followRemote(remote, request);
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
     if (turn.type !== "human") return forward(reapply(request, state));
@@ -395,6 +403,17 @@ export async function gateRequest(request: ResponsesRequest): Promise<GateDecisi
     console.error("hygiene-gate: failed open:", (error as Error).message);
     return forward(request);
   }
+}
+
+/** This proxy follows another machine's gate (hygiene-remote.ts). */
+async function followRemote(remote: string, request: ResponsesRequest): Promise<GateDecision> {
+  const decision = await remoteGateRequest(remote, request);
+  if (decision) return decision.action === "forward" ? forward(withholdUnchecked(decision.request)) : decision;
+  // Unreachable: the turn goes on, but no photo the authority hasn't seen does.
+  const known = cachedRemoteState(remote);
+  const turn = classifyTurn(request, known?.extraGatedTriggers ?? []);
+  if (turn.type === "human" && turn.images.length) markUnchecked(turn.images.map((image) => image.url));
+  return forward(withholdUnchecked(known ? reapply(request, known) : request));
 }
 
 async function decideHumanTurn(

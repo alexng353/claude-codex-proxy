@@ -363,6 +363,28 @@ describe("hygiene gate events", () => {
     const fourth = await preparePlateActivity(request(m4), config, source);
     expect(blocksIn(fourth.request)[6]).toBeUndefined();
   });
+
+  test("an unknown gate state reports nothing and keeps the outcome for a later message", async () => {
+    let known = true;
+    const gate: GateEvent[] = [];
+    const source: HygieneSource = (since, until) =>
+      known ? gate.filter((e) => Date.parse(e.at) > since && Date.parse(e.at) <= until) : null;
+    const m1 = [user("first")];
+    (await preparePlateActivity(request(m1), config, source)).commit();
+
+    // A follower that hasn't heard from Forge can't tell; the outcome waits rather than being skipped.
+    gate.push({ key: "image:late", at: new Date(Date.now() - 1000).toISOString(), text: "shower (Oct 7) accepted" });
+    known = false;
+    const m2 = [...m1, assistant("a"), user("second")];
+    const second = await preparePlateActivity(request(m2), config, source);
+    expect(blocksIn(second.request)[2]).toBeUndefined();
+    second.commit();
+
+    known = true;
+    const m3 = [...m2, assistant("b"), user("third")];
+    const third = await preparePlateActivity(request(m3), config, source);
+    expect(blocksIn(third.request)[4]).toContain("shower (Oct 7) accepted");
+  });
 });
 
 describe("loadConfig", () => {

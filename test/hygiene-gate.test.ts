@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -747,6 +747,7 @@ describe("following another machine's gate", () => {
   let authority: ReturnType<typeof Bun.serve> | null = null;
   let authorityState = "";
   let followerState = "";
+  const remoteBefore = process.env.HYGIENE_GATE_REMOTE;
 
   /** Run the authority's side as its own proxy: its state, no remote. */
   async function asAuthority<T>(work: () => Promise<T>): Promise<T> {
@@ -761,24 +762,33 @@ describe("following another machine's gate", () => {
     }
   }
 
+  const serve = () => {
+    authority = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => asAuthority(() => handleRequest(req)) });
+    process.env.HYGIENE_GATE_REMOTE = `http://127.0.0.1:${authority.port}/`;
+  };
+  /** The follower's own gate file, with nothing due before startsAt. */
+  const writeFollower = async (startsAt: number) => {
+    const own = JSON.parse(await readFile(authorityState, "utf8"));
+    await writeFile(followerState, JSON.stringify({ ...own, startsAt: new Date(startsAt).toISOString() }));
+  };
+
   beforeEach(async () => {
     authorityState = process.env.HYGIENE_GATE_STATE!;
     // The follower's own file says nothing is due for a month: any lock it shows came from the authority.
     followerState = join(directory, `state-${run}`, "follower.json");
-    const own = JSON.parse(await readFile(authorityState, "utf8"));
-    await writeFile(followerState, JSON.stringify({ ...own, startsAt: new Date(at(DAY, "05:00") + 30 * 86_400_000).toISOString() }));
-    authority = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => asAuthority(() => handleRequest(req)) });
+    await writeFollower(at(DAY, "05:00") + 30 * 86_400_000);
+    serve();
     process.env.HYGIENE_GATE_STATE = followerState;
-    process.env.HYGIENE_GATE_REMOTE = `http://127.0.0.1:${authority.port}/`;
     setAuthenticator(async (token) => (token === "phone" ? { id: "phone-1", name: "iphone", role: "phone" } : null));
   });
   const stop = () => {
     authority?.stop(true);
     authority = null;
   };
+  afterEach(stop);
   afterAll(() => {
-    stop();
-    delete process.env.HYGIENE_GATE_REMOTE;
+    if (remoteBefore === undefined) delete process.env.HYGIENE_GATE_REMOTE;
+    else process.env.HYGIENE_GATE_REMOTE = remoteBefore;
     setAuthenticator();
   });
 
@@ -822,12 +832,45 @@ describe("following another machine's gate", () => {
     const ask = await handleRequest(
       new Request("http://localhost/hygiene/gate", { method: "POST", body: JSON.stringify(request([env, user("hi")])) }),
     );
-    expect(await ask.json()).toMatchObject({ action: "respond" });
+    const answer = (await ask.json()) as { action: string; response: { output: Array<{ content: Array<{ text: string }> }> } };
+    expect(answer.action).toBe("respond");
+    expect(answer.response.output[0].content[0].text).toContain("gate armed: morning teeth photo");
   });
 
-  test("with the authority unreachable, turns go through untouched", async () => {
+  test("the authority's whole state is readable by a local caller", async () => {
+    const reply = await handleRequest(new Request("http://localhost/hygiene/state"));
+    expect(reply.status).toBe(200);
+    expect(await reply.json()).toMatchObject({ startsAt: new Date(at(DAY, "05:00")).toISOString() });
+  });
+
+  test("a follower asked by another follower refuses instead of looping", async () => {
+    const hop = { "x-hygiene-gate-hop": "1" };
+    const gate = await handleRequest(
+      new Request("http://localhost/hygiene/gate", { method: "POST", headers: hop, body: JSON.stringify(request([env, user("hi")])) }),
+    );
+    expect(gate.status).toBe(508);
+    expect((await handleRequest(new Request("http://localhost/hygiene/status", { headers: hop }))).status).toBe(508);
+  });
+
+  test("with the authority unreachable, turns go through but unchecked photos never do", async () => {
+    // Even an armed gate file here must not lock: this machine follows, it doesn't decide.
+    await writeFollower(at(DAY, "05:00"));
     stop();
     expect(await reply([env, user("hi")])).toBe("model-ran");
     expect((await handleRequest(new Request("http://localhost/hygiene/status"))).status).toBe(502);
+
+    const bytes = Buffer.from("unchecked-bathroom").toString("base64");
+    const withPhoto = [env, user("hi"), assistant("model-ran"), user("look", { photo: "unchecked-bathroom" })];
+    expect(await reply(withPhoto)).toBe("model-ran");
+    let inputs = await readFile(join(directory, "inputs"), "utf8");
+    expect(inputs).toContain("photo not checked (gate unreachable); image withheld");
+    expect(inputs).not.toContain(bytes);
+
+    // Forge is back. The photo is old history now, so no gate checks it; it stays withheld.
+    serve();
+    await writeFile(authorityState, JSON.stringify({ ...JSON.parse(await readFile(authorityState, "utf8")), startsAt: new Date(at(DAY, "05:00") + 30 * 86_400_000).toISOString() }));
+    expect(await reply([...withPhoto, assistant("model-ran"), user("and now?")])).toBe("model-ran");
+    inputs = await readFile(join(directory, "inputs"), "utf8");
+    expect(inputs).not.toContain(bytes);
   });
 });

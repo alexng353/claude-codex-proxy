@@ -20,8 +20,17 @@ Forge now holds the only gate. Any other proxy follows it:
   bearer token and content type go along, but proxy-hop headers do not.
 - **Plate activity** reads the authority's state from `GET /hygiene/state` (local
   callers only; 403 through Tailscale Serve), cached for 30 s.
-- **Authority unreachable.** Turns go through untouched, as when a local gate
-  fails. A gate outage never stops a chat. Status calls answer 502.
+- **Authority unreachable.** Turns still go through: a gate outage never stops
+  a chat. Photos do not. Each photo in the turn is replaced with "photo not
+  checked (gate unreachable); image withheld", and its hash is saved in
+  `hygiene-unchecked.json` in the proxy's state directory. That photo stays
+  withheld in every later request, also after the authority is back. Photos
+  the authority has already ruled on are withheld from its last known state.
+  Status calls answer 502. The follower waits up to 85 s for a decision, below
+  the model router's 90 s.
+- **Loop guard.** Requests between proxies carry `x-hygiene-gate-hop`. A
+  follower that receives one answers 508, so two followers pointed at each
+  other fail at once instead of looping.
 
 To gate locally again, delete the drop-in and restart the proxy:
 `systemctl --user daemon-reload && systemctl --user restart claude-codex-proxy`.
