@@ -217,6 +217,17 @@ describe("classifyTurn", () => {
     expect(notBypass).toMatchObject({ text: "BYPASS please" });
   });
 
+  test("BYPASS is read through Today's sent-at stamp", () => {
+    expect(classifyTurn(req([user("[02:41 PDT Fri Oct 23] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
+    expect(classifyTurn(req([user("[9:05 PST Mon Nov 3] BYPASS")], "composer"))).toMatchObject({ text: "BYPASS" });
+    expect(classifyTurn(req([user("[note] BYPASS")], "composer"))).toMatchObject({ text: "[note] BYPASS" });
+  });
+
+  test("goal continuations are not human turns", () => {
+    const goal = user('<codex_internal_context source="goal">\nContinue working toward the active thread goal.\n</codex_internal_context>');
+    expect(classifyTurn(req([goal], "composer")).type).toBe("exempt");
+  });
+
   describe("dthread delegations", () => {
     const RELAY = "01a0fa23-38a5-7ae3-8afa-ff89f646b836";
     const delegation = (escapedInput: string, source = RELAY) =>

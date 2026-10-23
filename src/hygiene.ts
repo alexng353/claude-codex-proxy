@@ -485,6 +485,8 @@ const SYNTHETIC_PREFIXES = [
   "<codex_delegation>",
   "<skill>",
   "<hygiene-gate-note",
+  // Goal continuations: Codex re-prompts the thread on its own.
+  "<codex_internal_context",
 ];
 
 export type TurnMetadata = {
@@ -588,8 +590,12 @@ function typedText(part: string): string {
   if (/^<image\b[^>]*>$/s.test(text) || text === "</image>") return "";
   return text
     .replace(/<(in-app-browser-context|plate-activity|hygiene-gate-note)\b[\s\S]*?<\/\1>/g, "")
-    .trim();
+    .trim()
+    .replace(SENT_AT_STAMP, "");
 }
+
+/** Today stamps each message it sends, e.g. "[02:41 PDT Fri Oct 23] BYPASS". */
+const SENT_AT_STAMP = /^\[\d{1,2}:\d{2} [A-Z]{2,5} [A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}\]\s*/;
 
 /**
  * Decides whether this request starts a turn Alex typed.
