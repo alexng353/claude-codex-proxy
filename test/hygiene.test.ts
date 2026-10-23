@@ -228,6 +228,21 @@ describe("classifyTurn", () => {
     expect(classifyTurn(req([goal], "composer")).type).toBe("exempt");
   });
 
+  test("chat-to-chat and script messages Today delivers bare are not human turns", () => {
+    for (const text of [
+      "[04:07 PDT Fri Oct 23] [agent] Shipped (window only): gutter collapse",
+      "[06:32 PDT Fri Oct 23] [ship-arch.sh, 06:32 PDT] Arch daemon and client installed",
+      "[03:29 PDT Fri Oct 23] [from coordinator 01a1370e, Alex request 03:29 PDT] Alex: ...",
+      "[agent] report without a stamp",
+      "[04:38 PDT Fri Oct 23] <codex_delegation>\n  <source_thread_id>x</source_thread_id>\n  <input>hi</input>\n</codex_delegation>",
+    ])
+      expect(classifyTurn(req([user(text)], "composer")).type).toBe("exempt");
+    // Alex's own typing stays gated, including text that merely mentions a tag later on.
+    expect(classifyTurn(req([user("[12:42 PDT Fri Oct 23] ok we need to make it so")], "composer")).type).toBe("human");
+    expect(classifyTurn(req([user("[12:42 PDT Fri Oct 23] what did [agent] say")], "composer")).type).toBe("human");
+    expect(classifyTurn(req([user("[note] BYPASS")], "composer")).type).toBe("human");
+  });
+
   describe("dthread delegations", () => {
     const RELAY = "01a0fa23-38a5-7ae3-8afa-ff89f646b836";
     const delegation = (escapedInput: string, source = RELAY) =>

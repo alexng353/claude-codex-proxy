@@ -530,13 +530,24 @@ const isContextMessage = (item: ResponseInputItem) =>
 
 export function isSyntheticUserMessage(item: ResponseInputItem): boolean {
   const texts = partsOf(item).map((part) =>
-    typeof part.text === "string" ? part.text.trimStart() : null,
+    typeof part.text === "string" ? part.text.trimStart().replace(SENT_AT_STAMP, "") : null,
   );
   return (
     texts.length > 0 &&
-    texts.every((text) => text !== null && SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)))
+    texts.every(
+      (text) =>
+        text !== null && (SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)) || AGENT_TAG.test(text)),
+    )
   );
 }
+
+/**
+ * Tags agents and scripts open their messages with when Today delivers them
+ * bare (no delegation envelope, no turn trigger): "[agent] Shipped...",
+ * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...". Alex asked
+ * (Oct 23) that chat-to-chat traffic never be gated, so overnight work goes on.
+ */
+const AGENT_TAG = /^\[(?:agent\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
 
 /**
  * Plate's relay chat. dthread (~/code/alexng353/dthread) sends Alex's
