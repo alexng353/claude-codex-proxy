@@ -135,6 +135,34 @@ test("a restart between the answer and its echo still maps the echo", async () =
   expect(existsSync(join(root, id, "aliases"))).toBe(true);
 });
 
+test("a retry after a restart is still one answer, and later ids don't shift", async () => {
+  const id = "final-restart-retry";
+  let history = [...CONTEXT, user("q")];
+  await turn(id, history, say("ok"));
+  // New process, then Codex retries the same request and gets the same answer.
+  setPerpetualDeps({ config: () => config, title: () => "Today (beta)", runner, root });
+  const answer = await turn(id, history, say("ok"));
+  history = [...history, ...answer, user("next")];
+  await turn(id, history, say("fine"));
+  expect(log(id)).toEqual(["0|user|q", "1|assistant|ok", "2|user|next", "3|assistant|fine"]);
+});
+
+test("a secret in an answer is redacted in the log, and the echo still maps onto it", async () => {
+  const id = "final-scrub";
+  const secret = "AKIAABCDEFGHIJKLMNOP";
+  let history = [...CONTEXT, user("what key")];
+  const answer = await turn(id, history, say(`the key is ${secret}`));
+  expect(store(id).messages[1].text).not.toContain(secret);
+  expect(mainLines(id).join("\n")).not.toContain(secret);
+  history = [...history, ...answer, user("thanks")];
+  // The proxy scrubs every request before planning; Codex's echo arrives redacted.
+  const { scrubRequest } = await import("../src/scrub.mjs");
+  const plan = preparePerpetual(scrubRequest(request(id, history)));
+  await plan!.run(async () => say("np"));
+  expect(log(id)).toHaveLength(4);
+  expect(log(id)[2]).toBe("2|user|thanks");
+});
+
 test("proxy-answered lookups are not logged twice, and the final answer still maps", async () => {
   const id = "final-local";
   let history = [...CONTEXT, user("hello")];

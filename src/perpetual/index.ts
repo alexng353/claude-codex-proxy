@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { turnMetadata } from "../hygiene";
+import { scrubText } from "../scrub.mjs";
 import {
   PERPETUAL_VIEW_TYPE,
   isCompactionRequest,
@@ -93,8 +94,6 @@ const LOCAL_HOP_STOP = LOCAL_HOP_LIMIT + 4;
 type Thread = {
   store: ThreadStore;
   compactor: Compactor;
-  /** The last provisional final answer and the request it answered (its last item key). */
-  lastFinal?: { key: string; anchor: string };
 };
 const threads = new Map<string, Thread>();
 
@@ -275,16 +274,20 @@ class Turn {
    * logged again after it.
    */
   private logFinal(text: string, anchor: string): void {
+    // The same redaction every incoming item gets (scrubRequest): a secret in an
+    // answer must not reach the log, and the scrubbed echo must match this copy.
+    text = scrubText(text);
     const item: ResponseInputItem = { type: "message", role: "assistant", content: [{ type: "output_text", text }] };
-    const hash = new Bun.CryptoHasher("sha256").update(text).digest("hex").slice(0, 32);
-    const key = `${FINAL_PREFIX}${hash}@${this.store.length}`;
+    const digest = (value: string) => new Bun.CryptoHasher("sha256").update(value).digest("hex").slice(0, 32);
+    // The key carries the answer and the request it answers, so a retry after a
+    // restart is still recognised (the log is the only durable record).
+    const identity = `${FINAL_PREFIX}${digest(text)}~${digest(anchor)}@`;
+    const key = `${identity}${this.store.length}`;
     const messages = itemMessages(item, key, (type, data) => this.store.saveImage(type, data));
     // A retried request (same history) answered the same way: Codex keeps one copy.
     const pending = this.store.pendingFinal();
-    const last = this.thread.lastFinal;
-    if (pending && last?.key === pending[0].key && last.anchor === anchor && sameMessages(messages, pending)) return;
+    if (pending && pending[0].key.startsWith(identity) && sameMessages(messages, pending)) return;
     this.store.append(messages);
-    this.thread.lastFinal = { key, anchor };
     this.kick();
   }
 
