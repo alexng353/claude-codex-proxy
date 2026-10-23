@@ -459,9 +459,10 @@ class Turn {
   private logLocal(text: string, calls: ProxyOutput["toolCalls"], results: ResponseInputItem[]): void {
     const messages: NewMessage[] = [];
     const first = calls[0]?.callId ?? crypto.randomUUID();
-    if (text) messages.push({ kind: "assistant", text, key: `local:${first}:text` });
+    // Claude's own text, logged here only: redact it like anything else that is stored.
+    if (text) messages.push({ kind: "assistant", text: scrubText(text), key: `local:${first}:text` });
     for (const [k, call] of calls.entries()) {
-      messages.push({ kind: "tool", text: `${call.name} ${call.arguments}`, key: `local:${call.callId}` });
+      messages.push({ kind: "tool", text: scrubText(`${call.name} ${call.arguments}`), key: `local:${call.callId}` });
       const output = String(results[k].output ?? "");
       messages.push({
         kind: "echo",
