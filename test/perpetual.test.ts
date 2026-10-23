@@ -222,9 +222,9 @@ test("completed turns collapse into the view; whole view blocks stay a cache pre
     await perpetualThread(id)!.compactor.idle();
   }
   const store = perpetualThread(id)!.store;
-  // 12 user messages and 11 echoed answers are logged once each, in order
-  // (Codex echoes the last answer with the next request).
-  expect(store.length).toBe(23);
+  // 12 user messages and 12 answers are logged once each, in order; the last
+  // answer is logged when its turn ends, before Codex echoes it.
+  expect(store.length).toBe(24);
   expect(store.messages.map((message) => message.kind).slice(0, 4)).toEqual(["user", "assistant", "user", "assistant"]);
   // Long messages went through the summarizer; short ones are their own lines.
   expect(store.node(0, 0)).toStartWith("S[");

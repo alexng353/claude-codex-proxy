@@ -25,7 +25,14 @@ import {
   itemMessages,
 } from "./messages";
 import { TURN_PROMPT } from "./prompts";
-import { LockedError, ThreadStore, type Injection, type NewMessage } from "./store";
+import {
+  FINAL_PREFIX,
+  LockedError,
+  ThreadStore,
+  type Injection,
+  type LogMessage,
+  type NewMessage,
+} from "./store";
 import { Compactor, summaryRunner, viewBlocks, type SummaryRunner } from "./summarizer";
 import { BLOCK_LINES, advanceView, nextMark, nodeStart, viewLine, type NodeRef } from "./view";
 
@@ -83,7 +90,12 @@ const LOCAL_HOP_LIMIT = 24;
 /** Hops after which the answer goes to Codex without its proxy calls. */
 const LOCAL_HOP_STOP = LOCAL_HOP_LIMIT + 4;
 
-type Thread = { store: ThreadStore; compactor: Compactor };
+type Thread = {
+  store: ThreadStore;
+  compactor: Compactor;
+  /** The last provisional final answer and the request it answered (its last item key). */
+  lastFinal?: { key: string; anchor: string };
+};
 const threads = new Map<string, Thread>();
 
 export type PerpetualDeps = {
@@ -122,8 +134,11 @@ export const perpetualThread = (threadId: string): Thread | undefined => threads
 export type PerpetualPlan = {
   /** The request Claude receives on the first hop. */
   request: ResponsesRequest;
-  /** Runs the turn, answering zoom and date itself; Codex sees only the rest. */
-  run(runClaude: (request: ResponsesRequest) => Promise<ProxyOutput>): Promise<ProxyOutput>;
+  /**
+   * Runs the turn, answering zoom and date itself; Codex sees only the rest.
+   * `signal` is Codex's connection: once it is gone, the answer is not logged.
+   */
+  run(runClaude: (request: ResponsesRequest) => Promise<ProxyOutput>, signal?: AbortSignal): Promise<ProxyOutput>;
 };
 
 /**
@@ -226,19 +241,50 @@ class Turn {
         ...LOCAL_TOOLS.filter((tool) => !(this.original.tools ?? []).some((other) => other.name === tool.name)),
       ],
     };
-    return { request, run: (runClaude) => this.run(request, anchor, runClaude) };
+    return { request, run: (runClaude, signal) => this.run(request, anchor, runClaude, signal) };
   }
 
   private logNewItems(): void {
     const fresh: NewMessage[] = [];
     const seen = new Set<string>();
+    const save = (type: string, data: Buffer) => this.store.saveImage(type, data);
     for (const [k, item] of this.conv.entries()) {
       const key = this.keys[k];
       if (!isLogged(item) || this.store.idsOf(key) || seen.has(key)) continue;
       seen.add(key);
-      fresh.push(...itemMessages(item, key, (type, data) => this.store.saveImage(type, data)));
+      const messages = itemMessages(item, key, save);
+      // The echo of a final answer logged when its turn ended: nothing new
+      // comes before it, so it would have landed exactly on those ids.
+      const pending = fresh.length === 0 ? this.store.pendingFinal() : undefined;
+      if (pending && isMessage(item) && item.role === "assistant" && sameMessages(messages, pending)) {
+        this.store.alias(key, pending[0].key);
+        continue;
+      }
+      fresh.push(...messages);
     }
     if (fresh.length) this.store.append(fresh);
+    this.kick();
+  }
+
+  /**
+   * Logs a turn's final answer as soon as it is returned, instead of when
+   * Codex echoes it on the next request; logNewItems then aliases the echo.
+   * Two rare cases keep an extra message without reordering ids: an answer
+   * Codex loses after the proxy returned it (a hang-up during delivery, or a
+   * retry answered differently), and an echo whose text differs, which is
+   * logged again after it.
+   */
+  private logFinal(text: string, anchor: string): void {
+    const item: ResponseInputItem = { type: "message", role: "assistant", content: [{ type: "output_text", text }] };
+    const hash = new Bun.CryptoHasher("sha256").update(text).digest("hex").slice(0, 32);
+    const key = `${FINAL_PREFIX}${hash}@${this.store.length}`;
+    const messages = itemMessages(item, key, (type, data) => this.store.saveImage(type, data));
+    // A retried request (same history) answered the same way: Codex keeps one copy.
+    const pending = this.store.pendingFinal();
+    const last = this.thread.lastFinal;
+    if (pending && last?.key === pending[0].key && last.anchor === anchor && sameMessages(messages, pending)) return;
+    this.store.append(messages);
+    this.thread.lastFinal = { key, anchor };
     this.kick();
   }
 
@@ -353,6 +399,25 @@ class Turn {
     first: ResponsesRequest,
     anchor: string,
     runClaude: (request: ResponsesRequest) => Promise<ProxyOutput>,
+    signal?: AbortSignal,
+  ): Promise<ProxyOutput> {
+    const output = await this.hops(first, anchor, runClaude);
+    // An interrupted turn's answer never reaches Codex, so it is never echoed
+    // and the old path never logged it either.
+    if (output.toolCalls.length === 0 && output.text && !signal?.aborted)
+      try {
+        this.logFinal(output.text, anchor);
+      } catch (error) {
+        // The echo still logs it on the next request.
+        console.error("perpetual: logging the final answer failed:", (error as Error).name);
+      }
+    return output;
+  }
+
+  private async hops(
+    first: ResponsesRequest,
+    anchor: string,
+    runClaude: (request: ResponsesRequest) => Promise<ProxyOutput>,
   ): Promise<ProxyOutput> {
     let request = first;
     for (let hop = 1; ; hop++) {
@@ -446,6 +511,18 @@ class Turn {
     return result(lines.join("\n"));
   }
 }
+
+/** Whether an item's log messages are exactly ones already logged. */
+const sameMessages = (fresh: NewMessage[], logged: LogMessage[]): boolean =>
+  fresh.length === logged.length &&
+  fresh.every(
+    (message, k) =>
+      message.kind === logged[k].kind &&
+      message.text === logged[k].text &&
+      message.part === logged[k].part &&
+      !message.images?.length &&
+      !logged[k].images?.length,
+  );
 
 /** Turns stored image references into the content parts Claude receives. */
 function materialize(item: ResponseInputItem): ResponseInputItem {

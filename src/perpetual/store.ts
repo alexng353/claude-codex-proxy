@@ -18,6 +18,8 @@ import { emptyView, type ViewState } from "./view";
  * One perpetual chat on disk (gist section 1):
  *
  *   main/YYYY-MM-DD.jsonl   messages {i, kind, text, size, date, key, ...}
+ *   aliases/YYYY-MM-DD.jsonl  {key, of, ids}: a Codex item key that names
+ *                           messages logged earlier under the provisional key `of`
  *   tree/YYYY-MM-DD.jsonl   tree nodes {l, i, text, size}
  *   view.json               the turn view; never rebuilt from the log
  *   cview.json              the compactions' smaller view
@@ -50,6 +52,11 @@ export type NewMessage = Omit<LogMessage, "i" | "size" | "date">;
 
 /** A group of proxy-answered items Codex never saw, re-inserted after `anchor`. */
 export type Injection = { anchor: string; items: unknown[] };
+
+/** Key prefix of a final answer logged before Codex echoes it (see Turn.logFinal). */
+export const FINAL_PREFIX = "final:";
+
+type Alias = { key: string; of: string; ids: number[] };
 
 type ThreadState = { injections: Injection[] };
 
@@ -149,6 +156,8 @@ export class ThreadStore {
   readonly messages: LogMessage[] = [];
   private readonly nodes = new Map<string, string>();
   private readonly keyIds = new Map<string, number[]>();
+  /** Provisional keys whose Codex echo has arrived. */
+  private readonly echoed = new Set<string>();
   view: ViewState;
   cview: ViewState;
   private state: ThreadState;
@@ -161,6 +170,12 @@ export class ThreadStore {
       // message out of place is worse than one missing.
       if (message.i !== this.messages.length) continue;
       this.remember(message);
+    }
+    for (const alias of readJsonl<Alias>(join(dir, "aliases"))) {
+      const ids = this.keyIds.get(alias.of);
+      if (!ids || this.keyIds.has(alias.key) || ids.join() !== alias.ids?.join()) continue;
+      this.keyIds.set(alias.key, ids);
+      this.echoed.add(alias.of);
     }
     for (const node of readJsonl<{ l: number; i: number; text: string }>(join(dir, "tree")))
       if (!this.nodes.has(nodeKey(node.l, node.i))) this.nodes.set(nodeKey(node.l, node.i), node.text);
@@ -182,6 +197,26 @@ export class ThreadStore {
 
   idsOf(key: string): number[] | undefined {
     return this.keyIds.get(key);
+  }
+
+  /**
+   * The provisional final answer at the log's tail that Codex has not echoed
+   * yet. Only the tail counts: the echo is then the next item the old path
+   * would have logged, so aliasing it keeps every id where it would have been.
+   */
+  pendingFinal(): LogMessage[] | undefined {
+    const last = this.messages.at(-1);
+    if (!last?.key.startsWith(FINAL_PREFIX) || this.echoed.has(last.key)) return undefined;
+    return (this.keyIds.get(last.key) ?? []).map((id) => this.messages[id]);
+  }
+
+  /** Records that Codex item `key` is the messages already logged under `of`. */
+  alias(key: string, of: string): void {
+    const ids = this.keyIds.get(of);
+    if (!ids || this.keyIds.has(key)) return;
+    appendLines(join(this.dir, "aliases"), [JSON.stringify({ key, of, ids } satisfies Alias)]);
+    this.keyIds.set(key, ids);
+    this.echoed.add(of);
   }
 
   append(messages: NewMessage[], now = new Date()): LogMessage[] {

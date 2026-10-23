@@ -147,7 +147,7 @@ export async function handleRequest(request: Request): Promise<Response> {
     // every other request goes to Claude exactly as before.
     const prepared = preloadSkills(activity.request);
     const perpetual = preparePerpetual(prepared);
-    const output = perpetual ? await perpetual.run(runClaude) : await runClaude(prepared);
+    const output = perpetual ? await perpetual.run(runClaude, request.signal) : await runClaude(prepared);
     activity.commit();
     const response = responseObject(body, output);
     const reply = body.stream ? streamResponse(response) : json(response);

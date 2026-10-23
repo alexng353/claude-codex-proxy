@@ -64,6 +64,7 @@ Each chat lives in `$PROXY_STATE_DIR/perpetual/<thread id>/`:
 | Path | Content |
 | --- | --- |
 | `main/YYYY-MM-DD.jsonl` | Messages `{i, kind, text, size, date, key}`. Append-only, flushed per write. |
+| `aliases/YYYY-MM-DD.jsonl` | `{key, of, ids}`: the Codex echo `key` of a final answer logged earlier under `of`. Append-only. |
 | `tree/YYYY-MM-DD.jsonl` | Tree nodes `{l, i, text, size}`. Each node is built once. |
 | `view.json` | The view's lines and its cache-mark block. Never rebuilt from the log. |
 | `cview.json` | The summarizer's own 16-32 KB view. |
@@ -78,6 +79,14 @@ Each chat lives in `$PROXY_STATE_DIR/perpetual/<thread id>/`:
   characters; other text longer than 30,000 characters becomes several
   messages. An image is saved under `images/` and logged as its path and a
   caption (media type and size).
+- **Final answers.** A turn's final answer (text with no tool calls left) is
+  logged when the proxy returns it, under a `final:` key, not when Codex
+  echoes it on the next request. When that echo arrives with nothing new
+  before it and the same text, it is recorded as an alias of those ids and
+  not logged again, so ids, kinds and texts are the same as with echo-time
+  logging. An answer finished after Codex hung up is not logged early. Two
+  rare cases keep an extra message: Codex loses an answer after the proxy
+  returned it, or echoes different text (that echo is logged after it).
 - **Lock.** One process owns a chat. A request for a chat another live
   process owns passes through unchanged; a dead owner's lock is reclaimed.
 - **Tree.** `node(0, i)` is message `i` in at most 512 bytes. `node(l, i)`
@@ -165,3 +174,7 @@ order against Taelin's push, the sawtooth, cache-prefix stability and the mark
 step, scope and byte-identical passthrough, turn detection, tool-loop
 continuation in one worker, zoom and date (including chained and mixed calls),
 images, compaction, the summarizer's retries and backoff, and the lock.
+`test/perpetual-final.test.ts` covers final answers logged at turn end: the
+echo alias and its reload, split answers, repeated answers and retries, a
+restart before the echo, proxy-answered lookups, a differing echo, and a
+hang-up.
