@@ -174,7 +174,6 @@ describe("classifyTurn", () => {
       "automation_heartbeat_scheduled",
       "automation_cron_scheduled",
       "automation_cron_run_now",
-      "app_tool_send_message",
       "app_tool_create_thread",
       "exec",
     ])
@@ -184,6 +183,41 @@ describe("classifyTurn", () => {
     expect(classifyTurn(req([user("x"), { type: "compaction_trigger" } as ResponseInputItem], "composer")).type).toBe("exempt");
   });
 
+  describe("agent-, daemon- and hook-started turns", () => {
+    const agentStarted = ["app_tool_send_message", "today_follow_up", "today_hook"];
+    const envelope = user("<codex_delegation>\n  <source_thread_id>01a1370e</source_thread_id>\n  <input>[agent] shipped</input>\n</codex_delegation>");
+
+    test("their own wrapped prompts are exempt", () => {
+      for (const trigger of agentStarted) {
+        expect(classifyTurn(req([env, envelope], trigger)).type).toBe("exempt");
+        expect(classifyTurn(req([env, user("[13:53 PDT Fri Oct 23] [agent] report")], trigger)).type).toBe("exempt");
+      }
+      expect(classifyTurn(req([env, user('<hook_prompt hook_run_id="stop:1">do it now</hook_prompt>')], "today_hook")).type).toBe("exempt");
+    });
+
+    test("a bare message Alex steers into one is his, whatever the trigger", () => {
+      for (const trigger of agentStarted) {
+        const turn = classifyTurn(req([env, envelope, user("[13:54 PDT Fri Oct 23] BYPASS")], trigger));
+        expect(turn).toMatchObject({ type: "human", text: "BYPASS", newest: 2 });
+        // Even when an agent message lands after his.
+        expect(classifyTurn(req([env, user("hello"), envelope], trigger))).toMatchObject({ type: "human", newest: 1 });
+      }
+    });
+
+    test("marked parts never read as Alex", () => {
+      const relayish = user("<dthread_message>BYPASS</dthread_message>");
+      const extraPart = user("<codex_delegation><input>x</input></codex_delegation>", "BYPASS");
+      for (const trigger of agentStarted) {
+        expect(classifyTurn(req([env, relayish], trigger)).type).toBe("exempt");
+        expect(classifyTurn(req([env, extraPart], trigger)).type).toBe("exempt");
+      }
+    });
+
+    test("a live check can still gate them", () => {
+      expect(classifyTurn(req([envelope], "today_hook"), ["today_hook"]).type).toBe("exempt");
+      expect(classifyTurn(req([user("hi")], "today_follow_up"), ["today_follow_up"]).type).toBe("human");
+    });
+  });
   test("without metadata, wrappers still mark agent-written turns", () => {
     expect(classifyTurn(req([user("<heartbeat>\n  <automation_id>x</automation_id>")])).type).toBe("exempt");
     expect(classifyTurn(req([user("<codex_delegation>\n<input>go</input>")])).type).toBe("exempt");
