@@ -2,6 +2,7 @@ import { accountStatus, usageHeaders } from "./accounts";
 import { runClaude } from "./claude";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
+import { GATE_ONLY_HEADER, HOP_HEADER, loopResponse, remoteGate } from "./hygiene-remote";
 import { perpetualStatus, preparePerpetual } from "./perpetual";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
@@ -63,6 +64,8 @@ const syntheticOutput = (text: string): ProxyOutput => ({
  * with this response object. Claude turns are gated inside /v1/responses.
  */
 async function hygieneGateEndpoint(request: Request): Promise<Response> {
+  // A follower asking a follower: the remotes point at each other.
+  if (request.headers.has(HOP_HEADER) && remoteGate()) return loopResponse();
   let body: ResponsesRequest;
   try {
     body = validateRequest(await request.json());
@@ -70,6 +73,16 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
     return error((cause as Error).message);
   }
   const decision = await gateRequest(body);
+  // Another proxy following this gate asks for the decision alone; it preloads its own skills
+  // and keeps its own copy of the request when nothing changed.
+  if (request.headers.has(GATE_ONLY_HEADER))
+    return json(
+      decision.action === "respond"
+        ? { action: "respond", text: decision.text }
+        : decision.request === body
+          ? { action: "forward" }
+          : { action: "forward", request: decision.request },
+    );
   if (decision.action === "respond")
     return json({ action: "respond", response: responseObject(body, syntheticOutput(decision.text)) });
   try {

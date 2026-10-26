@@ -136,7 +136,10 @@ describe("gate decisions", () => {
 
   test("exempt turns and continuations pass a locked gate", async () => {
     expect((await decide(request([env, user("<heartbeat>\n<automation_id>x</automation_id>")], "automation_heartbeat_scheduled"))).action).toBe("forward");
-    expect((await decide(request([env, user("prompt from another chat")], "app_tool_send_message"))).action).toBe("forward");
+    const fromChat = user("<codex_delegation>\n<source_thread_id>01a1370e</source_thread_id>\n<input>prompt from another chat</input>\n</codex_delegation>");
+    expect((await decide(request([env, fromChat], "app_tool_send_message"))).action).toBe("forward");
+    // Alex steering into that turn is still Alex.
+    expect((await decide(request([env, fromChat, user("fix the bug")], "app_tool_send_message"))).action).toBe("respond");
     expect((await decide(request([env, user("weekly report")], "automation_cron_scheduled"))).action).toBe("forward");
     const continuation = request([
       env,

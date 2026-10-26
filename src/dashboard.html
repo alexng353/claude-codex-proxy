@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude usage dashboard</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --background: light-dark(#fafafa, #181818);
+        --foreground: light-dark(#202020, #eeeeee);
+        --border: light-dark(#d4d4d4, #414141);
+        --muted-foreground: light-dark(#626262, #aaaaaa);
+        --popover: light-dark(#ffffff, #282828);
+        --popover-foreground: var(--foreground);
+        --viz-series-1: light-dark(#1976d2, #64b5f6);
+        --viz-series-2: light-dark(#bf6200, #ffad5c);
+        --viz-series-3: light-dark(#21844b, #71ce95);
+        --viz-series-4: light-dark(#7651b5, #b39ddd);
+        --viz-series-5: light-dark(#b6365d, #f283a3);
+        --viz-series-6: light-dark(#168783, #69cfc9);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--background);
+        color: var(--foreground);
+        font:
+          15px/1.5 system-ui,
+          sans-serif;
+      }
+      main {
+        max-width: 1100px;
+        margin: auto;
+        padding: 24px;
+      }
+      h2,
+      h3 {
+        font-weight: 500;
+        margin: 16px 0 8px;
+      }
+      h2 {
+        margin: 0;
+      }
+      h3 {
+        font-size: 17px;
+      }
+      .dashboard-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .viz-row,
+      .viz-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 18px;
+        margin: 12px 0;
+      }
+      .form-label {
+        display: grid;
+        gap: 4px;
+      }
+      .form-select,
+      .btn {
+        font: inherit;
+        color: var(--foreground);
+        background: var(--background);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 7px 12px;
+      }
+      .btn:disabled {
+        opacity: 0.5;
+      }
+      .text-small {
+        font-size: 13px;
+      }
+      .tabular-nums {
+        font-variant-numeric: tabular-nums;
+      }
+      .table-responsive {
+        overflow-x: auto;
+      }
+      .table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 16px;
+      }
+      .table th {
+        font-weight: 500;
+      }
+      .table td,
+      .table th {
+        padding: 9px 8px;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+      }
+      .table caption {
+        text-align: left;
+        color: var(--muted-foreground);
+        padding: 8px;
+      }
+      .table .text-end {
+        text-align: right;
+      }
+      .tooltip[hidden] {
+        display: none;
+      }
+      .tooltip {
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        box-shadow: 0 2px 8px #0002;
+      }
+      .swatch {
+        flex: none;
+      }
+      #dashboard-update {
+        color: var(--muted-foreground);
+        margin-top: 8px;
+      }
+      footer {
+        color: var(--muted-foreground);
+        margin-top: 24px;
+        font-size: 13px;
+      }
+      @media (max-width: 500px) {
+        main {
+          padding: 16px;
+        }
+        .dashboard-header {
+          align-items: flex-start;
+        }
+        h2 {
+          font-size: 20px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div id="claude-quota">
+        <div class="dashboard-header">
+          <h2>Claude quota and model usage</h2>
+          <button class="btn" id="dashboard-reload" type="button">
+            Reload
+          </button>
+        </div>
+        <div id="dashboard-update" class="text-small" aria-live="polite">
+          Refreshes every 30 seconds · quota samples every 5 minutes · last 24
+          hours
+        </div>
+        <div
+          id="quota-accounts"
+          class="viz-row"
+          aria-label="Quota chart accounts"
+        ></div>
+        <div id="quota-status" class="text-small" aria-live="polite"></div>
+        <h3>Five-hour usage</h3>
+        <div id="quota-short"></div>
+        <h3>Weekly usage</h3>
+        <div id="quota-week"></div>
+        <h3>Completed output tokens · 15-minute bins</h3>
+        <div class="viz-controls">
+          <label class="form-label" for="quota-account"
+            >Token usage account<select
+              class="form-select"
+              id="quota-account"
+            ></select
+          ></label>
+        </div>
+        <div id="quota-models" class="viz-row"></div>
+        <div id="quota-output"></div>
+        <div id="quota-token-mix" class="tabular-nums" aria-live="polite"></div>
+        <div class="table-responsive">
+          <table class="table table-sm">
+            <caption class="text-small">
+              Successful turns in the displayed timeline · percentages of each
+              model's recorded tokens; incomplete measurements are marked
+            </caption>
+            <thead>
+              <tr>
+                <th>Model</th>
+                <th class="text-end">Turns</th>
+                <th class="text-end">Input</th>
+                <th class="text-end">Output</th>
+                <th class="text-end">Cache read</th>
+                <th class="text-end">Cache write</th>
+                <th class="text-end">API equivalent</th>
+              </tr>
+            </thead>
+            <tbody id="quota-totals"></tbody>
+          </table>
+        </div>
+        <div id="quota-tooltip" class="tooltip" role="tooltip" hidden></div>
+      </div>
+      <style>
+        #claude-quota {
+          position: relative;
+          color: var(--foreground);
+        }
+        #claude-quota .quota-svg {
+          display: block;
+          width: 100%;
+          overflow: visible;
+        }
+        #claude-quota .quota-svg text {
+          fill: var(--foreground);
+          font-size: 12px;
+          font-weight: 400;
+        }
+        #claude-quota .quota-svg .domain,
+        #claude-quota .quota-svg .tick line {
+          stroke: var(--border);
+        }
+        #claude-quota .model-key {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        #claude-quota .swatch {
+          width: 12px;
+          height: 12px;
+          display: inline-block;
+        }
+        #claude-quota #quota-tooltip {
+          position: absolute;
+          pointer-events: none;
+          background: var(--popover);
+          color: var(--popover-foreground);
+          padding: 8px;
+          z-index: 2;
+          white-space: pre-line;
+        }
+        #claude-quota .account-toggle {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          background: transparent;
+          border: 0;
+          color: var(--foreground);
+          font: inherit;
+          padding: 4px 0;
+        }
+        #claude-quota .account-toggle[aria-pressed="false"] .swatch {
+          opacity: 0.3;
+        }
+      </style>
+      <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+      <script>
+        (() => {
+          let DATA = __QUOTA_DATA__;
+          const root = document.getElementById("claude-quota"),
+            picker = root.querySelector("#quota-account"),
+            tip = root.querySelector("#quota-tooltip");
+          const zone = "America/Vancouver";
+          const time = (t) =>
+            new Intl.DateTimeFormat("en-CA", {
+              timeZone: zone,
+              hour: "numeric",
+              minute: "2-digit",
+            }).format(new Date(t));
+          const full = (t) =>
+            new Intl.DateTimeFormat("en-CA", {
+              timeZone: zone,
+              month: "short",
+              day: "numeric",
+              hour: "numeric",
+              minute: "2-digit",
+            }).format(new Date(t));
+          const num = (n) =>
+            new Intl.NumberFormat("en-CA", {
+              notation: "compact",
+              maximumFractionDigits: 1,
+            }).format(n);
+          let accounts = [
+            ...new Set([
+              ...DATA.samples.map((s) => s.a),
+              ...DATA.turns.map((s) => s.a),
+            ]),
+          ];
+          const accountNames = {
+            default: "Alex",
+            hinson: "Hinson",
+            martin: "Martin",
+          };
+          const accountColor = (a) =>
+            `var(--viz-series-${(accounts.indexOf(a) % 6) + 1})`;
+          let visibleAccounts = new Set(accounts);
+          let models = [...new Set(DATA.turns.map((s) => s.m))].sort();
+          const color = (m) =>
+            `var(--viz-series-${(models.indexOf(m) % 6) + 1})`;
+          let domain = [DATA.at - 86400000, DATA.at];
+          const save = () => {
+            try {
+              localStorage.setItem(
+                "claude-dashboard",
+                JSON.stringify({
+                  modelContent: {
+                    account: picker.value,
+                    visibleAccounts: [...visibleAccounts],
+                  },
+                }),
+              );
+            } catch {}
+          };
+          function restore(state) {
+            const a = state?.modelContent?.account;
+            if (accounts.includes(a)) picker.value = a;
+            const chosen = state?.modelContent?.visibleAccounts;
+            if (Array.isArray(chosen))
+              visibleAccounts = new Set(
+                chosen.filter((a) => accounts.includes(a)),
+              );
+          }
+          let savedState;
+          try {
+            savedState = JSON.parse(
+              localStorage.getItem("claude-dashboard") ?? "null",
+            );
+          } catch {}
+          function base(id, label, max) {
+            const host = root.querySelector(id);
+            host.replaceChildren();
+            const width = Math.max(280, host.getBoundingClientRect().width),
+              height = 215;
+            const left = 64,
+              right = 18,
+              top = 12,
+              bottom = 48;
+            const svg = d3
+              .select(host)
+              .append("svg")
+              .attr("class", "quota-svg")
+              .attr("viewBox", `0 0 ${width} ${height}`)
+              .attr("role", "img")
+              .attr("aria-label", label);
+            svg.append("title").text(label);
+            const x = d3
+              .scaleLinear()
+              .domain(domain)
+              .range([left + 3, width - right - 3]);
+            const y = d3
+              .scaleLinear()
+              .domain([0, max])
+              .range([height - bottom - 3, top + 3]);
+            svg
+              .append("rect")
+              .attr("data-chart-frame", "")
+              .attr("x", left)
+              .attr("y", top)
+              .attr("width", width - left - right)
+              .attr("height", height - top - bottom)
+              .attr("fill", "none")
+              .attr("stroke", "var(--border)");
+            svg
+              .append("g")
+              .attr("transform", `translate(0,${height - bottom})`)
+              .call(
+                d3
+                  .axisBottom(x)
+                  .ticks(width < 400 ? 3 : 5)
+                  .tickFormat(time)
+                  .tickSizeOuter(0),
+              );
+            svg
+              .append("g")
+              .attr("transform", `translate(${left},0)`)
+              .call(
+                d3
+                  .axisLeft(y)
+                  .ticks(4)
+                  .tickFormat((v) => (max === 100 ? `${v}%` : num(v)))
+                  .tickSizeOuter(0),
+              );
+            svg
+              .append("text")
+              .attr("class", "axis-title")
+              .attr("data-axis", "x")
+              .attr("x", (width + left - right) / 2)
+              .attr("y", height - 4)
+              .attr("text-anchor", "middle")
+              .text("Time (America/Vancouver)");
+            svg
+              .append("text")
+              .attr("class", "axis-title")
+              .attr("data-axis", "y")
+              .attr("transform", "rotate(-90)")
+              .attr("x", -(height - bottom + top) / 2)
+              .attr("y", 14)
+              .attr("text-anchor", "middle")
+              .text(max === 100 ? "Quota used (%)" : "Output tokens");
+            return { svg, x, y, width, height, left, right, top, bottom };
+          }
+          function hover(c, get) {
+            const guide = c.svg
+              .append("line")
+              .attr("data-chart-hover-guide", "")
+              .attr("y1", c.top)
+              .attr("y2", c.height - c.bottom)
+              .attr("stroke", "var(--muted-foreground)")
+              .attr("visibility", "hidden");
+            const markers = c.svg.append("g");
+            const overlay = c.svg
+              .append("rect")
+              .attr("data-chart-hit", "")
+              .attr("data-chart-hover-overlay", "cross-series")
+              .attr("x", c.left)
+              .attr("y", c.top)
+              .attr("width", c.width - c.left - c.right)
+              .attr("height", c.height - c.top - c.bottom)
+              .attr("fill", "transparent");
+            const show = (e) => {
+              const [px] = d3.pointer(e, overlay.node()),
+                t = c.x.invert(px),
+                info = get(t);
+              guide.attr("x1", px).attr("x2", px).attr("visibility", "visible");
+              markers
+                .selectAll("circle")
+                .data(info.markers ?? [])
+                .join("circle")
+                .attr("data-chart-hover-marker", "")
+                .attr("r", 4)
+                .attr("fill", (d) => d.color)
+                .attr("cx", px)
+                .attr("cy", (d) => c.y(d.value));
+              tip.textContent = `${time(t)} · ${info.text}`;
+              tip.hidden = false;
+              const rect = root.getBoundingClientRect(),
+                ev = e.touches?.[0] ?? e;
+              tip.style.left = `${Math.max(0, Math.min(root.clientWidth - tip.offsetWidth, ev.clientX - rect.left + 8))}px`;
+              tip.style.top = `${ev.clientY - rect.top + 14}px`;
+            };
+            overlay
+              .on("pointermove", show)
+              .on("click", show)
+              .on("pointerleave", () => {
+                tip.hidden = true;
+                guide.attr("visibility", "hidden");
+                markers.selectAll("circle").remove();
+              });
+          }
+          function series(window, id, label) {
+            const c = base(id, label, 100),
+              byAccount = new Map();
+            const line = d3
+              .line()
+              .x((s) => c.x(s.t))
+              .y((s) => c.y(s.v));
+            for (const account of accounts.filter((a) =>
+              visibleAccounts.has(a),
+            )) {
+              const rows = DATA.samples
+                .filter((s) => s.a === account && s.w[window])
+                .map((s) => ({
+                  t: s.w[window].t,
+                  v: s.w[window].v,
+                  r: Date.parse(s.w[window].r),
+                }))
+                .filter((s) => s.t >= domain[0] && s.t <= domain[1])
+                .sort((a, b) => a.t - b.t)
+                .filter((s, i, all) => i === 0 || s.t !== all[i - 1].t);
+              const segments = [];
+              let current = [];
+              for (const s of rows) {
+                const prev = current.at(-1);
+                if (
+                  prev &&
+                  (s.t - prev.t > 12 * 60000 ||
+                    s.v < prev.v ||
+                    (Number.isFinite(prev.r) &&
+                      s.t >= prev.r &&
+                      Number.isFinite(s.r) &&
+                      Math.abs(s.r - prev.r) > 120000))
+                ) {
+                  segments.push(current);
+                  current = [];
+                }
+                current.push(s);
+              }
+              if (current.length) segments.push(current);
+              byAccount.set(account, segments);
+              const g = c.svg.append("g").attr("data-account", account);
+              for (const segment of segments)
+                g.append("path")
+                  .datum(segment)
+                  .attr("d", line)
+                  .attr("fill", "none")
+                  .attr("stroke", accountColor(account))
+                  .attr("stroke-width", 2)
+                  .attr(
+                    "stroke-dasharray",
+                    accounts.indexOf(account) === 2 ? "5 3" : null,
+                  );
+              g.selectAll(".point")
+                .data(rows)
+                .join("circle")
+                .attr("class", "point")
+                .attr("cx", (s) => c.x(s.t))
+                .attr("cy", (s) => c.y(s.v))
+                .attr("r", 1.7)
+                .attr("fill", accountColor(account));
+            }
+            hover(c, (t) => {
+              const details = [],
+                markers = [];
+              for (const [account, segments] of byAccount) {
+                let value = null;
+                for (const seg of segments) {
+                  if (t < seg[0].t || t > seg.at(-1).t) continue;
+                  const i = d3.bisector((s) => s.t).left(seg, t),
+                    b = seg[Math.min(i, seg.length - 1)],
+                    a = seg[Math.max(0, i - 1)];
+                  value =
+                    a.t === b.t
+                      ? a.v
+                      : a.v + ((b.v - a.v) * (t - a.t)) / (b.t - a.t);
+                  break;
+                }
+                details.push(
+                  `${accountNames[account] ?? account}: ${value === null ? "no observation" : `${value.toFixed(1)}% used`}`,
+                );
+                if (value !== null)
+                  markers.push({ value, color: accountColor(account) });
+              }
+              return {
+                value: null,
+                markers,
+                text: `interpolated\n${details.join("\n")}`,
+              };
+            });
+          }
+          function draw() {
+            root.querySelector("#quota-status").textContent =
+              `Updated ${full(DATA.at)} · Gaps and resets are not connected`;
+            const accountLegend = root.querySelector("#quota-accounts");
+            accountLegend.replaceChildren();
+            for (const account of accounts) {
+              const latest = DATA.samples
+                  .filter((s) => s.a === account)
+                  .at(-1) ?? { w: {} },
+                button = document.createElement("button");
+              button.type = "button";
+              button.className = "account-toggle cursor-interaction";
+              button.setAttribute(
+                "aria-pressed",
+                String(visibleAccounts.has(account)),
+              );
+              const sw = document.createElement("span");
+              sw.className = "swatch";
+              sw.style.background = accountColor(account);
+              button.append(
+                sw,
+                document.createTextNode(
+                  `${accountNames[account] ?? account} · 5h ${latest.w.five_hour?.v ?? "—"}% · week ${latest.w.seven_day?.v ?? "—"}%`,
+                ),
+              );
+              button.setAttribute(
+                "aria-label",
+                `${accountNames[account] ?? account}: five-hour ${latest.w.five_hour?.v ?? "unavailable"} percent, weekly ${latest.w.seven_day?.v ?? "unavailable"} percent. Toggle quota lines`,
+              );
+              button.addEventListener("click", () => {
+                visibleAccounts.has(account)
+                  ? visibleAccounts.delete(account)
+                  : visibleAccounts.add(account);
+                draw();
+                save();
+              });
+              accountLegend.append(button);
+            }
+            series(
+              "five_hour",
+              "#quota-short",
+              "Five-hour quota used over time. Gaps and resets are not connected.",
+            );
+            series("seven_day", "#quota-week", "Weekly quota used over time.");
+            const turns = DATA.turns.filter(
+                (s) => s.a === picker.value && s.t <= domain[1],
+              ),
+              bins = new Map();
+            for (const t of turns) {
+              const k = Math.floor(t.t / 900000) * 900000;
+              if (!bins.has(k))
+                bins.set(k, {
+                  t: k,
+                  ...Object.fromEntries(models.map((m) => [m, 0])),
+                });
+              if (!t.e) bins.get(k)[t.m] += t.o ?? 0;
+            }
+            const b = [...bins.values()].sort((a, b) => a.t - b.t),
+              stack = d3.stack().keys(models)(b),
+              max = d3.max(b, (s) => d3.sum(models, (m) => s[m])) ?? 0;
+            const c = base(
+              "#quota-output",
+              "Output tokens from successful proxy turns, stacked by model in fifteen-minute bins.",
+              Math.max(1, max * 1.1),
+            );
+            // Clip partial bins to the sampled timeline.
+            for (const layer of stack)
+              c.svg
+                .append("g")
+                .attr("fill", color(layer.key))
+                .selectAll("rect")
+                .data(layer)
+                .join("rect")
+                .attr("x", (d) => c.x(Math.max(domain[0], d.data.t)))
+                .attr("width", (d) =>
+                  Math.max(
+                    0,
+                    c.x(Math.min(domain[1], d.data.t + 900000)) -
+                      c.x(Math.max(domain[0], d.data.t)) -
+                      1,
+                  ),
+                )
+                .attr("y", (d) => c.y(d[1]))
+                .attr("height", (d) => c.y(d[0]) - c.y(d[1]));
+            const used = models.filter((m) => turns.some((t) => t.m === m));
+            const legend = root.querySelector("#quota-models");
+            legend.replaceChildren();
+            for (const m of used) {
+              const item = document.createElement("span");
+              item.className = "model-key text-small";
+              const sw = document.createElement("span");
+              sw.className = "swatch";
+              sw.style.background = color(m);
+              item.append(
+                sw,
+                document.createTextNode(m.replace("claude-", "")),
+              );
+              legend.append(item);
+            }
+            hover(c, (t) => {
+              const bin = bins.get(Math.floor(t / 900000) * 900000);
+              return {
+                value: null,
+                text: bin
+                  ? used
+                      .map(
+                        (m) =>
+                          `${m.replace("claude-", "")}: ${num(bin[m])} tokens`,
+                      )
+                      .join(" · ")
+                  : "No completed turns",
+              };
+            });
+            const successful = turns.filter((t) => !t.e),
+              keys = ["i", "o", "cr", "cw"];
+            const incomplete = successful.filter((t) =>
+              keys.some((k) => typeof t[k] !== "number"),
+            ).length;
+            const totals = Object.fromEntries(
+                keys.map((k) => [k, d3.sum(successful, (t) => t[k] ?? 0)]),
+              ),
+              total = d3.sum(keys, (k) => totals[k]);
+            const pct = (v, n) =>
+              n > 0
+                ? v > 0 && (100 * v) / n < 0.01
+                  ? "<0.01%"
+                  : `${((100 * v) / n).toFixed(2)}%`
+                : "—";
+            root.querySelector("#quota-token-mix").textContent =
+              `Recorded token mix${incomplete ? ` (${incomplete} turns have incomplete measurements)` : ""} · Input ${pct(totals.i, total)} · Output ${pct(totals.o, total)} · Cache ${pct(totals.cr + totals.cw, total)} (read ${pct(totals.cr, total)}, write ${pct(totals.cw, total)})`;
+            const body = root.querySelector("#quota-totals");
+            body.replaceChildren();
+            for (const m of used) {
+              const rows = turns.filter((t) => t.m === m && !t.e),
+                sum = (k) => d3.sum(rows, (t) => t[k] ?? 0),
+                unknown = rows.filter((t) => t.c === null).length,
+                modelTotal = d3.sum(keys, (k) => sum(k));
+              const tr = document.createElement("tr");
+              for (const [i, v] of [
+                m.replace("claude-", ""),
+                String(rows.length),
+                ...keys.map(
+                  (k) =>
+                    `${num(sum(k))} (${pct(sum(k), modelTotal)})${rows.some((t) => typeof t[k] !== "number") ? " · partial" : ""}`,
+                ),
+                `$${sum("c").toFixed(2)}${unknown ? ` · ${unknown} unpriced` : ""}`,
+              ].entries()) {
+                const td = document.createElement("td");
+                td.textContent = v;
+                if (i) td.className = "text-end tabular-nums";
+                tr.append(td);
+              }
+              body.append(tr);
+            }
+          }
+          function updateAccounts() {
+            const selected = picker.value;
+            picker.replaceChildren();
+            for (const account of accounts) {
+              const option = document.createElement("option");
+              option.value = account;
+              option.textContent = accountNames[account] ?? account;
+              picker.append(option);
+            }
+            if (accounts.includes(selected)) picker.value = selected;
+          }
+          updateAccounts();
+          restore(savedState);
+          const reload = root.querySelector("#dashboard-reload"),
+            update = root.querySelector("#dashboard-update");
+          let loading = false;
+          async function refresh() {
+            if (loading) return;
+            loading = true;
+            reload.disabled = true;
+            try {
+              const response = await fetch("/data", {
+                cache: "no-store",
+                signal: AbortSignal.timeout(10000),
+              });
+              if (!response.ok) throw new Error("Usage data unavailable");
+              const next = await response.json();
+              const oldAccounts = accounts;
+              DATA = next;
+              accounts = [
+                ...new Set([
+                  ...DATA.samples.map((s) => s.a),
+                  ...DATA.turns.map((s) => s.a),
+                ]),
+              ];
+              models = [...new Set(DATA.turns.map((s) => s.m))].sort();
+              domain = [DATA.at - 86400000, DATA.at];
+              for (const a of accounts)
+                if (!oldAccounts.includes(a)) visibleAccounts.add(a);
+              updateAccounts();
+              draw();
+              update.textContent =
+                "Refreshes every 30 seconds · quota samples every 5 minutes · last 24 hours";
+            } catch {
+              update.textContent =
+                "Refresh failed; showing the last successful reading. Use Reload to retry.";
+            } finally {
+              loading = false;
+              reload.disabled = false;
+            }
+          }
+          async function tick() {
+            if (!document.hidden) await refresh();
+            setTimeout(tick, 30000);
+          }
+          reload.addEventListener("click", refresh);
+          document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) refresh();
+          });
+          picker.addEventListener("change", () => {
+            draw();
+            save();
+          });
+          new ResizeObserver(draw).observe(root);
+          draw();
+          setTimeout(tick, 30000);
+        })();
+      </script>
+      <footer>
+        Token percentages measure volume. API equivalents are list-price
+        estimates, not subscription charges. Quota lines use observation times;
+        stale cached readings do not extend the curves.
+      </footer>
+    </main>
+  </body>
+</html>

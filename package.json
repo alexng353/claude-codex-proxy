@@ -15,7 +15,8 @@
     "check": "bun run typecheck && bun test",
     "usage": "bun run scripts/usage-report.ts",
     "account": "bun run scripts/account.ts",
-    "limits": "bun run scripts/limits.ts"
+    "limits": "bun run scripts/limits.ts",
+    "dashboard": "bun run scripts/dashboard.ts"
   },
   "keywords": [
     "bun",

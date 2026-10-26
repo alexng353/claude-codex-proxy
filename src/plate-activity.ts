@@ -11,6 +11,7 @@ import {
 } from "./plate-activity.mjs";
 import { type GateEvent, gateEvents } from "./hygiene";
 import { loadState } from "./hygiene-gate";
+import { cachedRemoteState, remoteGate } from "./hygiene-remote";
 import { isCompactionRequest } from "./request";
 import { stateDir } from "./sessions";
 import type { ResponsesRequest } from "./types";
@@ -42,15 +43,24 @@ const FETCH_TIMEOUT_MS = 1500;
 const RETAIN_DAYS = 60;
 const HYGIENE_LAG_MS = 5 * 60_000;
 
-/** Gate outcomes in (since, until]. Injected by tests; never throws. */
-export type HygieneSource = (since: number, until: number) => GateEvent[];
+/**
+ * Gate outcomes in (since, until], or null when the gate's state isn't known
+ * (a follower that hasn't heard from the authority lately). Injected by
+ * tests; never throws.
+ */
+export type HygieneSource = (since: number, until: number) => GateEvent[] | null;
+
+/** A follower's copy older than this can't say nothing happened. */
+const REMOTE_STATE_MAX_AGE_MS = 90_000;
 
 const gateSource: HygieneSource = (since, until) => {
   try {
-    return gateEvents(loadState(), since, until);
+    const remote = remoteGate();
+    const state = remote ? cachedRemoteState(remote, Date.now(), REMOTE_STATE_MAX_AGE_MS) : loadState();
+    return state ? gateEvents(state, since, until) : null;
   } catch (error) {
     console.error("plate-activity: hygiene state unavailable:", (error as Error).name);
-    return [];
+    return null;
   }
 };
 
@@ -177,13 +187,14 @@ async function freshBlock(
   // A thread in scope before gate events existed starts its gate cursor now.
   const since = row.hygiene_at;
   const seen = since === null ? new Set<string>() : reportedKeys(threadId);
-  const gate =
-    since === null ? [] : hygiene(since - HYGIENE_LAG_MS, now).filter((e) => !seen.has(e.key));
+  const reported = since === null ? [] : hygiene(since - HYGIENE_LAG_MS, now);
+  // Unknown gate state: report no gate events and leave the gate cursor where it is.
+  const gate = (reported ?? []).filter((e) => !seen.has(e.key));
   const truncated = events.length >= PAGE && events[0].id > cursor + 1;
   return {
     block: renderBlock(events, { timeZone: config.timeZone, truncated, hygiene: gate }),
     through: events.at(-1)?.id ?? cursor,
-    hygieneThrough: now,
+    hygieneThrough: reported === null ? null : now,
     hygieneKeys: gate.map((e) => e.key),
   };
 }
