@@ -113,6 +113,8 @@ bun run limits --probe --record --quiet   # append a fresh sample per account to
 
 Limit readings otherwise arrive only while an account is serving turns, so idle accounts have gaps. `--record` appends one line per account to `$PROXY_STATE_DIR/limits-history.jsonl` with the sample time, source, reset times, and each window's percentage; `--quiet` suppresses the display. Running `bun run limits --probe --record --quiet` from a five-minute systemd user timer gives a continuous history of every account.
 
+`▶ ACTIVE` marks the account with the most recent activity observed by the running proxy, with that activity's age. Meter probes and cached readings do not move the marker. It is omitted when the proxy has no activity data or the most recently observed account is still limited. Chats can use different pinned accounts simultaneously; the marker identifies the latest observed activity, not a global account selection.
+
 Failures and account switches are appended to `$PROXY_STATE_DIR/failures.jsonl` (default `~/.local/state/claude-codex-proxy/failures.jsonl`, mode 0600). Entries include UTC time, request ID, account, worker/attempt where available, failure category, numeric API status where available, and the next account for failover. Raw CLI messages, credentials, and conversation text are omitted. Logging failures do not interrupt requests.
 
 Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory keeps its own `.credentials.json` and `.claude.json`; every other entry is a symlink to your main Claude config. Because `projects/` is shared, a conversation can resume its transcript on another account. A switch still misses the prompt cache once, since each account has its own cache.

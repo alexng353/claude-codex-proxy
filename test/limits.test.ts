@@ -77,6 +77,60 @@ test("reuses probe results and --probe refreshes them", async () => {
   } finally { f.server.stop(true); }
 });
 
+test("marks latest proxy activity even when probes and caches have newer meter readings", async () => {
+  const f = await fixture();
+  try {
+    await mkdir(join(f.dir, "state/accounts/work"), { recursive: true });
+    await writeFile(join(f.dir, "state/accounts/work/.credentials.json"), "{}");
+    f.setAccounts([
+      { name: "default", observedAt: new Date(Date.now() - 120_000).toISOString(), windows: { five_hour: { usedPercent: 30, resetsAt: null } } },
+      { name: "work", observedAt: new Date(Date.now() - 60_000).toISOString(), windows: { five_hour: { usedPercent: 10, resetsAt: null } } },
+    ]);
+    for (const args of [[], [], ["--probe"]]) {
+      const output = await f.run(...args);
+      const lines = output.split("\n").filter((line) => line.includes("▶ ACTIVE"));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toStartWith("work  ");
+      expect(lines[0]).toContain("last proxy activity 1m ago");
+    }
+  } finally { f.server.stop(true); }
+});
+
+test("does not guess an active account from local usage or a rejected latest account", async () => {
+  const f = await fixture();
+  try {
+    expect(await f.run()).not.toContain("▶ ACTIVE");
+    await mkdir(join(f.dir, "state/accounts/work"), { recursive: true });
+    await writeFile(join(f.dir, "state/accounts/work/.credentials.json"), "{}");
+    f.setAccounts([
+      { name: "default", observedAt: new Date(Date.now() - 120_000).toISOString(),
+        windows: { five_hour: { usedPercent: 20, resetsAt: null } } },
+      { name: "work", observedAt: new Date().toISOString(),
+      limitedUntil: new Date(Date.now() + 3600_000).toISOString(),
+      windows: { five_hour: { usedPercent: 100, resetsAt: null } } }]);
+    const output = await f.run();
+    expect(output).toContain("LIMITED until");
+    expect(output).not.toContain("▶ ACTIVE");
+  } finally { f.server.stop(true); }
+});
+
+test("latest activity without quota meters still moves the marker", async () => {
+  const f = await fixture();
+  try {
+    await mkdir(join(f.dir, "state/accounts/work"), { recursive: true });
+    await writeFile(join(f.dir, "state/accounts/work/.credentials.json"), "{}");
+    f.setAccounts([
+      { name: "default", observedAt: new Date(Date.now() - 120_000).toISOString(), windows: { five_hour: { usedPercent: 30, resetsAt: null } } },
+      { name: "work", observedAt: new Date(Date.now() - 60_000).toISOString(), windows: {} },
+    ]);
+    const output = await f.run();
+    const lines = output.split("\n").filter((line) => line.includes("▶ ACTIVE"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toStartWith("work  ");
+    expect(output).toContain("42%");
+  } finally { f.server.stop(true); }
+});
+
 test("--record appends every account's sample and --quiet hides the display", async () => {
   const f = await fixture();
   try {
