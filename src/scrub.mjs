@@ -8,23 +8,35 @@
  * Node model router can import it next to context.mjs.
  */
 import { spawnSync } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 const SPLIT = "\0__SCRUB_SPLIT__\0";
 const MIN_VALUE_LENGTH = 8;
 const SECRET_NAME =
-  /(TOKEN|SECRET|PASSW(OR)?D|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|_PAT$|AUTH|CREDENTIAL|CLIENT_ID|ENDPOINT|DSN)/i;
+  /(TOKEN|SECRET|PASSW(OR)?D|PASSPHRASE|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|SIGNING_?KEY|_PAT$|^PAT$|^KEY$|AUTH|CREDENTIAL|CLIENT_ID|ENDPOINT|DSN)/i;
+
+/**
+ * Keys in JSON/YAML/TOML credential files whose string values are secrets.
+ * Matched on the lowercased key with separators removed, anchored at the end
+ * so neighbours such as `tokenExpiresAt` or `token_type` stay out.
+ */
+const CREDENTIAL_KEY =
+  /(?:token|secret|password|passwd|passphrase|apikey|accesskey|secretkey|privatekey|authkey|signingkey|credential)$|^(?:key|pat)$/;
 
 /** Token shapes that are secrets wherever they appear. */
 const PATTERNS = [
   [
-    /-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY-----[\s\S]*?-----END \1PRIVATE KEY-----/g,
+    /-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY( BLOCK)?-----[\s\S]*?-----END \1PRIVATE KEY\2-----/g,
     "private-key",
   ],
-  // A truncated PEM block still leaks its body.
-  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:\s*[A-Za-z0-9+/=]{16,})+/g, "private-key"],
+  // A truncated PEM or PGP armor block still leaks its body. PGP armor may
+  // open with `Comment: ...` style header lines.
+  [
+    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:\s*[A-Za-z][A-Za-z-]*: [^\n]*)*(?:\s*[A-Za-z0-9+/=]{16,})+/g,
+    "private-key",
+  ],
   [/\b(?:gh[pousr]_[A-Za-z0-9]{36,251}|github_pat_[A-Za-z0-9_]{22,251})\b/g, "github-token"],
   [/\bnpm_[A-Za-z0-9]{36}\b/g, "npm-token"],
   [/\bhf_[A-Za-z0-9]{30,}\b/g, "huggingface-token"],
@@ -106,13 +118,148 @@ function loadDotenvFile(file) {
   return vars;
 }
 
+function unquote(value) {
+  if (/^"(?:[^"\\]|\\.)*"$/.test(value)) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value.slice(1, -1);
+    }
+  }
+  if (/^'.*'$/.test(value)) return value.slice(1, -1);
+  return value;
+}
+
+function isCredentialKey(key) {
+  return CREDENTIAL_KEY.test(String(key).toLowerCase().replace(/[^a-z0-9]/g, ""));
+}
+
+/** Credential leaves of a parsed JSON document, keyed by their leaf name. */
+export function credentialEntriesFromJson(text) {
+  let root;
+  try {
+    root = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const entries = [];
+  const walk = (value, key) => {
+    if (typeof value === "string") {
+      if (key != null && isCredentialKey(key)) entries.push([key, value]);
+    } else if (Array.isArray(value)) {
+      for (const item of value) walk(item, key);
+    } else if (value && typeof value === "object") {
+      for (const [name, child] of Object.entries(value)) walk(child, name);
+    }
+  };
+  walk(root, null);
+  return entries;
+}
+
+/**
+ * Credential `key: value` pairs from YAML such as gh's hosts.yml. This is a
+ * line scanner, not a YAML parser: it reads scalar values on the key's own
+ * line, which is how CLI tools write tokens.
+ */
+export function credentialEntriesFromYaml(text) {
+  const entries = [];
+  for (const line of text.split("\n")) {
+    const match = /^\s*(?:-\s+)?(["']?)([A-Za-z0-9_.-]+)\1\s*:\s+(.+?)\s*$/.exec(line);
+    if (!match || !isCredentialKey(match[2])) continue;
+    const quoted = /^("(?:[^"\\]|\\.)*"|'[^']*')/.exec(match[3]);
+    const value = quoted ? unquote(quoted[1]) : match[3].replace(/\s+#.*$/, "");
+    entries.push([match[2], value]);
+  }
+  return entries;
+}
+
+/** Credential `key = "value"` pairs from TOML such as wrangler's config. */
+export function credentialEntriesFromToml(text) {
+  const entries = [];
+  for (const line of text.split("\n")) {
+    const match = /^\s*(["']?)([A-Za-z0-9_.-]+)\1\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*')/.exec(line);
+    if (!match || !isCredentialKey(match[2])) continue;
+    entries.push([match[2], unquote(match[3])]);
+  }
+  return entries;
+}
+
+/**
+ * Armored private key files (envx keys, exported GPG subkeys). Each body line
+ * becomes a literal, so a fragment such as `head -5 private.key` is redacted
+ * even without the BEGIN line the token patterns key on. Public keys and
+ * anything else yield nothing.
+ */
+export function credentialEntriesFromKeyFile(text) {
+  if (!/-----BEGIN [A-Z0-9 ]*PRIVATE KEY/.test(text)) return [];
+  const entries = [];
+  for (const line of text.split("\n")) {
+    const body = line.trim();
+    if (body.length >= 40 && /^[A-Za-z0-9+/=]+$/.test(body)) entries.push(["PRIVATE_KEY", body]);
+  }
+  return entries;
+}
+
+/** All `[name, value]` pairs a credential file holds. Names may repeat. */
+export function loadSecretEntries(file) {
+  try {
+    if (!statSync(file).isFile()) return [];
+  } catch {
+    return [];
+  }
+  try {
+    if (/\.(zsh|sh|bash)$/.test(file)) return [...loadShellFile(file)];
+    if (/\.(json|toml|ya?ml|key|asc|pem)$/.test(file)) {
+      const text = readFileSync(file, "utf8");
+      if (file.endsWith(".json")) return credentialEntriesFromJson(text);
+      if (file.endsWith(".toml")) return credentialEntriesFromToml(text);
+      if (/\.ya?ml$/.test(file)) return credentialEntriesFromYaml(text);
+      return credentialEntriesFromKeyFile(text);
+    }
+    return [...loadDotenvFile(file)];
+  } catch {
+    return [];
+  }
+}
+
+/** Name -> value view of a credential file; the last value wins on repeats. */
 export function loadSecretFile(file) {
   try {
     statSync(file);
   } catch {
     return new Map();
   }
-  return /\.(zsh|sh|bash)$/.test(file) ? loadShellFile(file) : loadDotenvFile(file);
+  return new Map(loadSecretEntries(file));
+}
+
+/**
+ * Expand `*` path segments (`accounts/*\/.credentials.json`). Missing
+ * directories expand to nothing, so files that do not exist yet are harmless.
+ */
+export function expandSecretPaths(patterns) {
+  const out = [];
+  const expand = (base, segments) => {
+    if (segments.length === 0) return out.push(base);
+    const [segment, ...rest] = segments;
+    if (!segment.includes("*")) return expand(join(base, segment), rest);
+    const matcher = new RegExp(`^${segment.split("*").map(escapeRegExp).join(".*")}$`);
+    let names = [];
+    try {
+      names = readdirSync(base).sort();
+    } catch {
+      return;
+    }
+    for (const name of names) if (matcher.test(name)) expand(join(base, name), rest);
+  };
+  for (const pattern of patterns) {
+    if (!pattern.includes("*")) {
+      out.push(pattern);
+      continue;
+    }
+    const absolute = pattern.startsWith("/");
+    expand(absolute ? "/" : "", pattern.split("/").filter(Boolean));
+  }
+  return out;
 }
 
 /** Whether a configured value is worth redacting by its literal text. */
@@ -136,16 +283,25 @@ export function defaultSecretFiles(env = process.env) {
   return [
     join(home, ".config/zsh/secrets.zsh"),
     join(home, ".config/spotlike/env"),
+    join(home, ".config/gh/hosts.yml"),
+    join(home, ".railway/config.json"),
+    join(home, ".codex/auth.json"),
+    join(home, ".local/state/today/codex-home/auth.json"),
+    join(home, ".claude/.credentials.json"),
+    join(home, ".local/state/claude-codex-proxy/accounts/*/.credentials.json"),
+    join(home, ".config/.wrangler/config/default.toml"),
+    join(home, ".config/agent-gate/client.json"),
+    join(home, ".config/envx/keys/*/private.key"),
   ];
 }
 
 /**
- * @param {{ files?: string[], refreshMs?: number, load?: (file: string) => Map<string, string>, now?: () => number }} [options]
+ * @param {{ files?: string[], refreshMs?: number, load?: (file: string) => Iterable<[string, string]>, now?: () => number }} [options]
  */
 export function createScrubber(options = {}) {
   const files = options.files ?? defaultSecretFiles();
   const refreshMs = options.refreshMs ?? 5000;
-  const load = options.load ?? loadSecretFile;
+  const load = options.load ?? loadSecretEntries;
   const now = options.now ?? Date.now;
   // value -> names. Values are kept after rotation for the life of the
   // process, so a replayed transcript that still holds a retired token stays
@@ -170,7 +326,8 @@ export function createScrubber(options = {}) {
     if (at - checkedAt < refreshMs) return;
     checkedAt = at;
     let changed = false;
-    for (const file of files) {
+    // Globs are re-expanded each refresh so a new account dir or key is seen.
+    for (const file of expandSecretPaths(files)) {
       const current = stamp(file);
       if (stamps.get(file) === current) continue;
       stamps.set(file, current);

@@ -1,9 +1,19 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createScrubber, isSecretValue, loadSecretFile } from "../src/scrub.mjs";
+import {
+  createScrubber,
+  credentialEntriesFromJson,
+  credentialEntriesFromKeyFile,
+  credentialEntriesFromToml,
+  credentialEntriesFromYaml,
+  expandSecretPaths,
+  isSecretValue,
+  loadSecretEntries,
+  loadSecretFile,
+} from "../src/scrub.mjs";
 
 // Fakes are assembled at runtime so the source never holds a token-shaped
 // literal for push protection or scanners to flag.
@@ -71,6 +81,141 @@ describe("loading", () => {
     expect(isSecretValue("DATA_DIR", "/home/someone/.local/share/thing")).toBe(false);
     expect(isSecretValue("SHORT", "abc")).toBe(false);
     expect(isSecretValue("MG_API_KEY", FAKE_MG)).toBe(true);
+  });
+});
+
+describe("structured credential files", () => {
+  const ACCESS = "FAKE-access-" + repeat("a1B2", 40);
+  const REFRESH = "FAKE-refresh-" + repeat("c3D4", 40);
+  const OTHER_ACCESS = "FAKE-other-" + repeat("e5F6", 40);
+  const CLIENT_SECRET = "FAKE-client-" + repeat("g7H8", 32);
+
+  test("JSON keeps credential leaves only, including repeated names", () => {
+    const text = JSON.stringify({
+      user: { accessToken: ACCESS, refreshToken: REFRESH, id: "user-0000-1111-2222", tokenExpiresAt: 1 },
+      mcpOAuth: {
+        a: { serverUrl: "https://mcp.example.test/mcp", accessToken: OTHER_ACCESS, clientSecret: CLIENT_SECRET },
+        b: { accessToken: "", token_type: "Bearer-bearer-bearer" },
+      },
+      projects: [{ path: "/home/someone/code/thing" }],
+    });
+    expect(credentialEntriesFromJson(text)).toEqual([
+      ["accessToken", ACCESS],
+      ["refreshToken", REFRESH],
+      ["accessToken", OTHER_ACCESS],
+      ["clientSecret", CLIENT_SECRET],
+      ["accessToken", ""],
+    ]);
+    expect(credentialEntriesFromJson("{not json")).toEqual([]);
+  });
+
+  test("YAML reads gh-style nested tokens and ignores other keys", () => {
+    const text = [
+      "github.com:",
+      "    users:",
+      "        someone:",
+      `            oauth_token: ${ACCESS}`,
+      "    git_protocol: https",
+      `    oauth_token: "${REFRESH}" # quoted`,
+      `    password: '${CLIENT_SECRET}'`,
+      "    user: someone",
+    ].join("\n");
+    expect(credentialEntriesFromYaml(text)).toEqual([
+      ["oauth_token", ACCESS],
+      ["oauth_token", REFRESH],
+      ["password", CLIENT_SECRET],
+    ]);
+  });
+
+  test("TOML reads wrangler-style tokens and ignores tables and dates", () => {
+    const text = [
+      `oauth_token = "${ACCESS}"`,
+      'expiration_time = "2030-01-01T00:00:00.000Z"',
+      `refresh_token = '${REFRESH}'`,
+      'scopes = [ "account:read" ]',
+      "[env.prod]",
+      `api_key = "${CLIENT_SECRET}"`,
+    ].join("\n");
+    expect(credentialEntriesFromToml(text)).toEqual([
+      ["oauth_token", ACCESS],
+      ["refresh_token", REFRESH],
+      ["api_key", CLIENT_SECRET],
+    ]);
+  });
+
+  const armor = (kind: string) =>
+    [
+      `-----BEGIN PGP ${kind} KEY BLOCK-----`,
+      "Comment: FAKE test key, not a real key",
+      "",
+      repeat("FAKEkeyLINEone0", 64),
+      repeat("FAKEkeyLINEtwo1", 64),
+      "=AbCd",
+      `-----END PGP ${kind} KEY BLOCK-----`,
+    ].join("\n");
+
+  test("armored private keys yield body lines; public keys yield nothing", () => {
+    expect(credentialEntriesFromKeyFile(armor("PRIVATE")).map(([, value]) => value)).toEqual([
+      repeat("FAKEkeyLINEone0", 64),
+      repeat("FAKEkeyLINEtwo1", 64),
+    ]);
+    expect(credentialEntriesFromKeyFile(armor("PUBLIC"))).toEqual([]);
+  });
+
+  test("PGP private key blocks are redacted by shape, whole or truncated", () => {
+    const s = createScrubber({ files: [] });
+    const whole = s.scrub(`a\n${armor("PRIVATE")}\nb`);
+    expect(whole).toBe("a\n[REDACTED:private-key]\nb");
+    const truncated = armor("PRIVATE").split("\n").slice(0, 4).join("\n");
+    expect(s.scrub(truncated)).not.toContain("FAKEkeyLINEone0");
+  });
+
+  test("globs expand per refresh, and missing files and dirs are harmless", async () => {
+    const root = await mkdtemp(join(tmpdir(), "scrub-glob-"));
+    try {
+      const pattern = join(root, "accounts/*/.credentials.json");
+      const missing = join(root, "nope/config.toml");
+      expect(expandSecretPaths([pattern])).toEqual([]);
+      expect(loadSecretEntries(missing)).toEqual([]);
+      let clock = 0;
+      const s = createScrubber({ files: [pattern, missing], refreshMs: 1000, now: () => clock });
+      expect(s.scrub(`x ${ACCESS}`)).toBe(`x ${ACCESS}`);
+      mkdirSync(join(root, "accounts/one"), { recursive: true });
+      writeFileSync(
+        join(root, "accounts/one/.credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: ACCESS, refreshToken: REFRESH, scopes: ["user:inference"] } }),
+      );
+      clock = 2000;
+      expect(s.scrub(`x ${ACCESS} ${REFRESH} user:inference`)).toBe(
+        "x [REDACTED:accessToken] [REDACTED:refreshToken] user:inference",
+      );
+      // A rotated token is picked up and the retired one stays redacted.
+      writeFileSync(
+        join(root, "accounts/one/.credentials.json"),
+        JSON.stringify({ claudeAiOauth: { accessToken: OTHER_ACCESS, refreshToken: REFRESH, pad: 1 } }),
+      );
+      clock = 4000;
+      expect(s.scrub(`${ACCESS} ${OTHER_ACCESS}`)).toBe("[REDACTED:accessToken] [REDACTED:accessToken]");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("dispatches on extension through loadSecretEntries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "scrub-ext-"));
+    try {
+      writeFileSync(join(root, "hosts.yml"), `host:\n  oauth_token: ${ACCESS}\n`);
+      writeFileSync(join(root, "default.toml"), `oauth_token = "${REFRESH}"\n`);
+      writeFileSync(join(root, "client.json"), JSON.stringify({ url: "http://x", token: CLIENT_SECRET }));
+      writeFileSync(join(root, "private.key"), armor("PRIVATE"));
+      expect(loadSecretEntries(join(root, "hosts.yml"))).toEqual([["oauth_token", ACCESS]]);
+      expect(loadSecretEntries(join(root, "default.toml"))).toEqual([["oauth_token", REFRESH]]);
+      expect(loadSecretEntries(join(root, "client.json"))).toEqual([["token", CLIENT_SECRET]]);
+      expect(loadSecretEntries(join(root, "private.key"))).toHaveLength(2);
+      expect(loadSecretEntries(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
