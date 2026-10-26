@@ -434,7 +434,6 @@ export function gateEvents(state: GateState, since: number, until: number): Gate
 const EXEMPT_TRIGGERS = new Set([
   "exec",
   "app_tool_create_thread",
-  "app_tool_send_message",
   "code_review",
   "codex_replay",
   "resume_interrupted_task",
@@ -463,6 +462,14 @@ const EXEMPT_TRIGGERS = new Set([
 ]);
 /** Heartbeats (`automation_heartbeat_*`), cron and one-shot schedules (`automation_cron_*`). */
 const EXEMPT_TRIGGER_PREFIXES = ["automation_"];
+/**
+ * Turns another chat (`app_tool_send_message`), Today's daemon
+ * (`today_follow_up`) or a stop hook (`today_hook`) started. Their own
+ * prompts arrive wrapped (`<codex_delegation>`, `<hook_prompt`, `[agent]`), but
+ * Codex keeps the trigger for the whole turn, so a message Alex steers into
+ * one carries it too. In these turns a fully bare message is his.
+ */
+const AGENT_STARTED_TRIGGERS = new Set(["app_tool_send_message", "today_follow_up", "today_hook"]);
 /** Thread sources whose turns are always agent-driven. */
 const EXEMPT_THREAD_SOURCES = new Set(["subagent", "memory_consolidation"]);
 
@@ -485,6 +492,10 @@ const SYNTHETIC_PREFIXES = [
   "<codex_delegation>",
   "<skill>",
   "<hygiene-gate-note",
+  // Stop-hook prompts (Codex and Today's `today_hook` turns).
+  "<hook_prompt",
+  // Goal continuations: Codex re-prompts the thread on its own.
+  "<codex_internal_context",
 ];
 
 export type TurnMetadata = {
@@ -528,13 +539,47 @@ const isContextMessage = (item: ResponseInputItem) =>
 
 export function isSyntheticUserMessage(item: ResponseInputItem): boolean {
   const texts = partsOf(item).map((part) =>
-    typeof part.text === "string" ? part.text.trimStart() : null,
+    typeof part.text === "string" ? part.text.trimStart().replace(SENT_AT_STAMP, "") : null,
   );
   return (
     texts.length > 0 &&
-    texts.every((text) => text !== null && SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)))
+    texts.every(
+      (text) =>
+        text !== null && (SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)) || AGENT_TAG.test(text)),
+    )
   );
 }
+
+/**
+ * A message no part of which is marked as written by an agent or a relay: no
+ * synthetic wrapper, agent tag or dthread markup in any part. Stricter than
+ * `!isSyntheticUserMessage`, so an envelope with an extra part, or relay
+ * markup outside its envelope, never reads as Alex in an agent-started turn.
+ */
+export function isBareUserMessage(item: ResponseInputItem): boolean {
+  const parts = partsOf(item);
+  return (
+    parts.length > 0 &&
+    parts.every((part) => {
+      if (typeof part.text !== "string") return part.type === "input_image";
+      const text = part.text.trimStart().replace(SENT_AT_STAMP, "");
+      return (
+        !SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)) &&
+        !AGENT_TAG.test(text) &&
+        !text.includes("<dthread_message>") &&
+        !text.includes("<codex_delegation>")
+      );
+    })
+  );
+}
+
+/**
+ * Tags agents and scripts open their messages with when Today delivers them
+ * bare (no delegation envelope, no turn trigger): "[agent] Shipped...",
+ * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...". Alex asked
+ * (Oct 23) that chat-to-chat traffic never be gated, so overnight work goes on.
+ */
+const AGENT_TAG = /^\[(?:agent\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
 
 /**
  * Plate's relay chat. dthread (~/code/alexng353/dthread) sends Alex's
@@ -588,8 +633,12 @@ function typedText(part: string): string {
   if (/^<image\b[^>]*>$/s.test(text) || text === "</image>") return "";
   return text
     .replace(/<(in-app-browser-context|plate-activity|hygiene-gate-note)\b[\s\S]*?<\/\1>/g, "")
-    .trim();
+    .trim()
+    .replace(SENT_AT_STAMP, "");
 }
+
+/** Today stamps each message it sends, e.g. "[02:41 PDT Fri Oct 23] BYPASS". */
+const SENT_AT_STAMP = /^\[\d{1,2}:\d{2} [A-Z]{2,5} [A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}(?: · [\w.-]{1,32})?\]\s*/;
 
 /**
  * Decides whether this request starts a turn Alex typed.
@@ -631,16 +680,20 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
   }
 
   const trigger = meta.turnTrigger;
+  const gatedByCaller = !!trigger && extraGatedTriggers.includes(trigger);
+  const agentStarted = !!trigger && !gatedByCaller && AGENT_STARTED_TRIGGERS.has(trigger);
   const exemptTrigger =
     !!trigger &&
-    !extraGatedTriggers.includes(trigger) &&
+    !gatedByCaller &&
     (EXEMPT_TRIGGERS.has(trigger) || EXEMPT_TRIGGER_PREFIXES.some((p) => trigger.startsWith(p)));
-  const agentSent = exemptTrigger && trigger === "app_tool_send_message";
-  if (exemptTrigger && !(agentSent && dthread.size)) return { type: "exempt", reason: `trigger ${trigger}` };
+  if (exemptTrigger) return { type: "exempt", reason: `trigger ${trigger}` };
 
-  const human = agentSent
-    ? [...dthread.keys()]
-    : turnUsers.filter((index) => dthread.has(index) || !isSyntheticUserMessage(input[index]));
+  const human = !agentStarted
+    ? turnUsers.filter((index) => dthread.has(index) || !isSyntheticUserMessage(input[index]))
+    : dthread.size
+      ? [...dthread.keys()]
+      : turnUsers.filter((index) => isBareUserMessage(input[index]));
+  if (agentStarted && !human.length) return { type: "exempt", reason: `trigger ${trigger}` };
   if (!human.length)
     return turnUsers.length ? { type: "exempt", reason: "no human-written message" } : { type: "continuation" };
   const texts: string[] = [];

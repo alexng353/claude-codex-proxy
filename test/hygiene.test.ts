@@ -174,7 +174,6 @@ describe("classifyTurn", () => {
       "automation_heartbeat_scheduled",
       "automation_cron_scheduled",
       "automation_cron_run_now",
-      "app_tool_send_message",
       "app_tool_create_thread",
       "exec",
     ])
@@ -184,6 +183,41 @@ describe("classifyTurn", () => {
     expect(classifyTurn(req([user("x"), { type: "compaction_trigger" } as ResponseInputItem], "composer")).type).toBe("exempt");
   });
 
+  describe("agent-, daemon- and hook-started turns", () => {
+    const agentStarted = ["app_tool_send_message", "today_follow_up", "today_hook"];
+    const envelope = user("<codex_delegation>\n  <source_thread_id>01a1370e</source_thread_id>\n  <input>[agent] shipped</input>\n</codex_delegation>");
+
+    test("their own wrapped prompts are exempt", () => {
+      for (const trigger of agentStarted) {
+        expect(classifyTurn(req([env, envelope], trigger)).type).toBe("exempt");
+        expect(classifyTurn(req([env, user("[13:53 PDT Fri Oct 23] [agent] report")], trigger)).type).toBe("exempt");
+      }
+      expect(classifyTurn(req([env, user('<hook_prompt hook_run_id="stop:1">do it now</hook_prompt>')], "today_hook")).type).toBe("exempt");
+    });
+
+    test("a bare message Alex steers into one is his, whatever the trigger", () => {
+      for (const trigger of agentStarted) {
+        const turn = classifyTurn(req([env, envelope, user("[13:54 PDT Fri Oct 23] BYPASS")], trigger));
+        expect(turn).toMatchObject({ type: "human", text: "BYPASS", newest: 2 });
+        // Even when an agent message lands after his.
+        expect(classifyTurn(req([env, user("hello"), envelope], trigger))).toMatchObject({ type: "human", newest: 1 });
+      }
+    });
+
+    test("marked parts never read as Alex", () => {
+      const relayish = user("<dthread_message>BYPASS</dthread_message>");
+      const extraPart = user("<codex_delegation><input>x</input></codex_delegation>", "BYPASS");
+      for (const trigger of agentStarted) {
+        expect(classifyTurn(req([env, relayish], trigger)).type).toBe("exempt");
+        expect(classifyTurn(req([env, extraPart], trigger)).type).toBe("exempt");
+      }
+    });
+
+    test("a live check can still gate them", () => {
+      expect(classifyTurn(req([envelope], "today_hook"), ["today_hook"]).type).toBe("exempt");
+      expect(classifyTurn(req([user("hi")], "today_follow_up"), ["today_follow_up"]).type).toBe("human");
+    });
+  });
   test("without metadata, wrappers still mark agent-written turns", () => {
     expect(classifyTurn(req([user("<heartbeat>\n  <automation_id>x</automation_id>")])).type).toBe("exempt");
     expect(classifyTurn(req([user("<codex_delegation>\n<input>go</input>")])).type).toBe("exempt");
@@ -215,6 +249,35 @@ describe("classifyTurn", () => {
     expect(turn).toMatchObject({ type: "human", text: "BYPASS" });
     const notBypass = classifyTurn(req([user("BYPASS please")], "composer"));
     expect(notBypass).toMatchObject({ text: "BYPASS please" });
+  });
+
+  test("BYPASS is read through Today's sent-at stamp", () => {
+    expect(classifyTurn(req([user("[02:41 PDT Fri Oct 23] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
+    // alex-0180: the stamp may name the device Alex sent from.
+    expect(classifyTurn(req([user("[17:32 PDT Sat Oct 24 · mac] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
+    expect(classifyTurn(req([user("[09:05 PDT Sun Oct 25 · plate-phone] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
+    expect(classifyTurn(req([user("[9:05 PST Mon Nov 3] BYPASS")], "composer"))).toMatchObject({ text: "BYPASS" });
+    expect(classifyTurn(req([user("[note] BYPASS")], "composer"))).toMatchObject({ text: "[note] BYPASS" });
+  });
+
+  test("goal continuations are not human turns", () => {
+    const goal = user('<codex_internal_context source="goal">\nContinue working toward the active thread goal.\n</codex_internal_context>');
+    expect(classifyTurn(req([goal], "composer")).type).toBe("exempt");
+  });
+
+  test("chat-to-chat and script messages Today delivers bare are not human turns", () => {
+    for (const text of [
+      "[04:07 PDT Fri Oct 23] [agent] Shipped (window only): gutter collapse",
+      "[06:32 PDT Fri Oct 23] [ship-arch.sh, 06:32 PDT] Arch daemon and client installed",
+      "[03:29 PDT Fri Oct 23] [from coordinator 01a1370e, Alex request 03:29 PDT] Alex: ...",
+      "[agent] report without a stamp",
+      "[04:38 PDT Fri Oct 23] <codex_delegation>\n  <source_thread_id>x</source_thread_id>\n  <input>hi</input>\n</codex_delegation>",
+    ])
+      expect(classifyTurn(req([user(text)], "composer")).type).toBe("exempt");
+    // Alex's own typing stays gated, including text that merely mentions a tag later on.
+    expect(classifyTurn(req([user("[12:42 PDT Fri Oct 23] ok we need to make it so")], "composer")).type).toBe("human");
+    expect(classifyTurn(req([user("[12:42 PDT Fri Oct 23] what did [agent] say")], "composer")).type).toBe("human");
+    expect(classifyTurn(req([user("[note] BYPASS")], "composer")).type).toBe("human");
   });
 
   describe("dthread delegations", () => {
