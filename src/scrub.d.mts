@@ -6,10 +6,16 @@ export type Scrubber = {
 export function createScrubber(options?: {
   files?: string[];
   refreshMs?: number;
-  load?: (file: string) => Map<string, string>;
+  load?: (file: string) => Iterable<[string, string]>;
   now?: () => number;
 }): Scrubber;
 export function loadSecretFile(file: string): Map<string, string>;
+export function loadSecretEntries(file: string): Array<[string, string]>;
+export function credentialEntriesFromJson(text: string): Array<[string, string]>;
+export function credentialEntriesFromYaml(text: string): Array<[string, string]>;
+export function credentialEntriesFromToml(text: string): Array<[string, string]>;
+export function credentialEntriesFromKeyFile(text: string): Array<[string, string]>;
+export function expandSecretPaths(patterns: string[]): string[];
 export function isSecretValue(name: string, value: string): boolean;
 export function defaultSecretFiles(env?: Record<string, string | undefined>): string[];
 export function scrubRequest<T>(request: T): T;
