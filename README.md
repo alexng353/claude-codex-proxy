@@ -119,6 +119,12 @@ Failures and account switches are appended to `$PROXY_STATE_DIR/failures.jsonl` 
 
 Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory keeps its own `.credentials.json` and `.claude.json`; every other entry is a symlink to your main Claude config. Because `projects/` is shared, a conversation can resume its transcript on another account. A switch still misses the prompt cache once, since each account has its own cache.
 
+### Live usage dashboard
+
+Run `bun run dashboard`, then open [the local dashboard](http://127.0.0.1:3458). It shows the last 24 hours of overlapping quota lines, output tokens by model, and input/output/cache percentages. The page refreshes every 30 seconds while visible, or immediately with **Reload**. It reads `limits-history.jsonl` and `usage.sqlite` without changing them or making model requests. Keep the five-minute quota recorder running for fresh observations. The timestamp shows when data was loaded; quota observations can be older and gaps are left open. Failed refreshes preserve the last successful view and display an error.
+
+The dashboard always binds to `127.0.0.1`; `DASHBOARD_PORT` defaults to `3458`. It uses a separate process so it can be restarted without interrupting inference. To keep it available after login, install a systemd user service with `WorkingDirectory` set to this checkout and `ExecStart` set to the absolute Bun path followed by the absolute path to `scripts/dashboard.ts`, then enable it with `systemctl --user enable --now claude-usage-dashboard.service`. The chart library loads from jsDelivr when the page opens.
+
 ## Supported API
 
 - `GET /health`
