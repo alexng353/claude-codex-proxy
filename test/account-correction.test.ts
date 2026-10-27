@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { resetAccountState } from "../src/accounts";
 import { closeIdleWorkers, runClaude } from "../src/claude";
 
+for (const auth of [false, true]) {
 for (const compaction of [false, true]) {
-  test(`fails over when a ${compaction ? "compaction" : "tool-name"} correction hits quota`, async () => {
+  test(`fails over when a ${compaction ? "compaction" : "tool-name"} correction hits ${auth ? "authentication failure" : "quota"}`, async () => {
     const root = await mkdtemp(join(tmpdir(), "claude-correction-"));
     const saved = Object.fromEntries(["CLAUDE_BIN", "CLAUDE_CONFIG_DIR", "PROXY_STATE_DIR"]
       .map((key) => [key, process.env[key]]));
@@ -28,7 +29,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     ? { is_error: false, structured_output: { text: "spare success", tool_calls: [] } }
     : count === 1
       ? { is_error: false, structured_output: { text: "", tool_calls: [{ name: "missing", arguments: "{}" }] } }
-      : { is_error: true, api_error_status: 429, result: "rate limit" };
+      : ${JSON.stringify(auth ? { is_error: true, api_error_status: 401, result: "Unauthorized" } : { is_error: true, api_error_status: 429, result: "rate limit" })};
   console.log(JSON.stringify({ type: "result", subtype: "success", ...result }));
 }
 `);
@@ -44,6 +45,10 @@ for await (const line of createInterface({ input: process.stdin })) {
         : "hello" });
       expect(compaction ? output.compaction : output.text).toBe("spare success");
       expect(output.account).toBe("spare");
+      if (auth) {
+        const logs = (await readFile(join(state, "failures.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+        expect(logs.filter((row) => row.event === "failover").every((row) => row.category === "authentication")).toBe(true);
+      }
       expect(await readFile(join(root, "launches"), "utf8")).toBe("default\nspare\n");
     } finally {
       closeIdleWorkers();
@@ -55,4 +60,6 @@ for await (const line of createInterface({ input: process.stdin })) {
       await rm(root, { recursive: true, force: true });
     }
   });
+}
+
 }

@@ -38,7 +38,7 @@ while IFS= read -r input; do
     printf '%s\\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}'
     printf '%s\\n' '{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You have hit your limit"}'
   else
-    printf '%s\\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.42,"resetsAt":1790759400},"seven_day":{"utilization":0.08,"resetsAt":1791028800}}}}'
+    printf '%s\\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.42,"resetsAt":4102444800},"seven_day":{"utilization":0.08,"resetsAt":4103049600}}}}'
     printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"from-'"$(basename "$CLAUDE_CONFIG_DIR")"'","tool_calls":[]}}'
   fi
 done
@@ -103,7 +103,7 @@ test("reports the answering account's usage in Codex rate-limit headers", async 
   expect(response.headers.get("x-codex-limit-name")).toBe("Claude (spare)");
   expect(response.headers.get("x-codex-primary-used-percent")).toBe("42");
   expect(response.headers.get("x-codex-primary-window-minutes")).toBe("300");
-  expect(response.headers.get("x-codex-primary-reset-at")).toBe("1790759400");
+  expect(response.headers.get("x-codex-primary-reset-at")).toBe("4102444800");
   expect(response.headers.get("x-codex-secondary-used-percent")).toBe("8");
   expect(response.headers.get("x-codex-secondary-window-minutes")).toBe("10080");
 });

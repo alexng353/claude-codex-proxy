@@ -163,7 +163,7 @@ async function fromProxy(): Promise<Map<string, Row>> {
     if (!response.ok) return rows;
     const body = (await response.json()) as { accounts: Row[] };
     for (const row of body.accounts)
-      if (Object.keys(row.windows ?? {}).length > 0 || (row.limitedUntil && Date.parse(row.limitedUntil) > Date.now()))
+      if (Number.isFinite(Date.parse(row.observedAt ?? "")) || Object.keys(row.windows ?? {}).length > 0 || (row.limitedUntil && Date.parse(row.limitedUntil) > Date.now()))
         rows.set(row.name, { ...row, windows: row.windows ?? {}, source: "proxy" });
   } catch {}
   return rows;
@@ -248,6 +248,13 @@ async function email(account: Account): Promise<string> {
 
 const proxyRows = await fromProxy();
 const accounts = listAccounts();
+// Meter probes aren't inference activity, and chats may use different accounts.
+const latestActivity = accounts.map((account) => proxyRows.get(account.name))
+  .filter((row): row is Row => !!row && Number.isFinite(Date.parse(row.observedAt ?? "")))
+  .sort((a, b) => Date.parse(b.observedAt!) - Date.parse(a.observedAt!))[0];
+const activeAccount = latestActivity &&
+  !(latestActivity.limitedUntil && Date.parse(latestActivity.limitedUntil) > Date.now())
+  ? latestActivity : undefined;
 const emails = await Promise.all(accounts.map(email));
 const rows = await Promise.all(
   accounts.map(async (account, index) => {
@@ -286,11 +293,14 @@ if (record) {
 }
 
 if (!quiet) rows.forEach((row, index) => {
+  const active = row.name === activeAccount?.name
+    ? `  ▶ ACTIVE (last proxy activity ${Math.max(0, Math.round((Date.now() - Date.parse(activeAccount.observedAt!)) / 60_000))}m ago)`
+    : "";
   const limited = row.limitedUntil ? `  LIMITED until ${new Date(row.limitedUntil).toLocaleString()}` : "";
   const age = row.observedAt
     ? `, seen ${Math.round((Date.now() - Date.parse(row.observedAt)) / 60_000)}m ago`
     : "";
-  console.log(`${row.name}  ${emails[index]}  [${row.source}${age}]${limited}`);
+  console.log(`${row.name}  ${emails[index]}  [${row.source}${age}]${limited}${active}`);
   for (const [name, window] of Object.entries(row.windows)) {
     const label = (labels[name] ?? name).padEnd(7);
     const percent = `${window.usedPercent}%`.padStart(6);

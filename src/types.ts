@@ -57,6 +57,7 @@ export type ClaudeResult = {
   /** HTTP status of the API error behind an error result, e.g. 429. */
   api_error_status?: number | null;
   result?: string;
+  errors?: string[];
   structured_output?: {
     text: string;
     tool_calls: Array<{ name: string; arguments: string }>;

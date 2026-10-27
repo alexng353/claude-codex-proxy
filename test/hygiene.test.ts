@@ -253,6 +253,9 @@ describe("classifyTurn", () => {
 
   test("BYPASS is read through Today's sent-at stamp", () => {
     expect(classifyTurn(req([user("[02:41 PDT Fri Oct 23] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
+    // alex-0180: the stamp may name the device Alex sent from.
+    expect(classifyTurn(req([user("[17:32 PDT Sat Oct 24 · mac] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
+    expect(classifyTurn(req([user("[09:05 PDT Sun Oct 25 · plate-phone] BYPASS")], "composer"))).toMatchObject({ type: "human", text: "BYPASS" });
     expect(classifyTurn(req([user("[9:05 PST Mon Nov 3] BYPASS")], "composer"))).toMatchObject({ text: "BYPASS" });
     expect(classifyTurn(req([user("[note] BYPASS")], "composer"))).toMatchObject({ text: "[note] BYPASS" });
   });

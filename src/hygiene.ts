@@ -638,7 +638,7 @@ function typedText(part: string): string {
 }
 
 /** Today stamps each message it sends, e.g. "[02:41 PDT Fri Oct 23] BYPASS". */
-const SENT_AT_STAMP = /^\[\d{1,2}:\d{2} [A-Z]{2,5} [A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}\]\s*/;
+const SENT_AT_STAMP = /^\[\d{1,2}:\d{2} [A-Z]{2,5} [A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}(?: · [\w.-]{1,32})?\]\s*/;
 
 /**
  * Decides whether this request starts a turn Alex typed.

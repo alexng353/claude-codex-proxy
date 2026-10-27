@@ -12,7 +12,9 @@ import {
   accountEnv,
   listAccounts,
   isLimitError,
-  isLimited,
+  isUnavailable,
+  isAuthError,
+  markAuthFailed,
   markLimited,
   observeRateLimit,
   pickAccount,
@@ -20,7 +22,17 @@ import {
   type Account,
 } from "./accounts";
 import { recordUsage } from "./usage";
+import { failureCategory, recordFailure } from "./failures";
 import { normalizeVisualizeReferences } from "./visualize";
+import {
+  estimateRequestTokens,
+  estimateVisibleTokens,
+  fitReplay,
+  promptTooLong,
+  replayBudget,
+  replayTokens,
+  retryBudget,
+} from "./budget";
 import {
   findSessions,
   threadAccount,
@@ -33,15 +45,6 @@ import {
   stateDir,
   type SessionKey,
 } from "./sessions";
-import {
-  estimateRequestTokens,
-  estimateVisibleTokens,
-  fitReplay,
-  promptTooLong,
-  replayBudget,
-  replayTokens,
-  retryBudget,
-} from "./budget";
 import {
   conversationRequest,
   deltaRequest,
@@ -64,9 +67,6 @@ import type {
 } from "./types";
 
 const MODEL_ALIASES: Record<string, string> = {
-  opus: "opus",
-  sonnet: "sonnet",
-  haiku: "haiku",
   "claude-opus": "opus",
   "claude-sonnet": "sonnet",
   "claude-haiku": "haiku",
@@ -74,9 +74,13 @@ const MODEL_ALIASES: Record<string, string> = {
 
 const CODEX_TOOL_SYSTEM_PROMPT = `You are running inside a Codex agent loop. Tools described in <available_tools> are real, available Codex tools even though they are not present in Claude Code's native tool registry. Invoke them by returning their exact name and arguments in the required structured tool_calls output. Never claim that a listed Codex tool is unavailable merely because it is absent from the native registry. When a Codex browser, node_repl, cua_repl, or computer tool is listed, use it for browser requests instead of substituting WebFetch, web search, curl, or another native tool.`;
 
-const MAX_TOOL_NAME_RETRIES = 2;
+/** How many times one answer may be sent back to its worker for correction. */
+const MAX_CORRECTIONS = 2;
 
-const COMPACTION_CORRECTION = `<compaction_error>\nNo tools were executed. This turn must produce only the handoff summary: put all of it in text and leave tool_calls empty.\n</compaction_error>`;
+const COMPACTION_CORRECTION: Correction = {
+  message: `<compaction_error>\nNo tools were executed. This turn must produce only the handoff summary: put all of it in text and leave tool_calls empty.\n</compaction_error>`,
+  failure: "Claude CLI did not return a compaction summary",
+};
 
 export function resolveModel(model: string): string {
   const resolved = MODEL_ALIASES[model] ?? model;
@@ -132,16 +136,7 @@ export function buildClaudeArgs(
     ...(effort ? ["--effort", effort] : []),
     "-p",
     "--dangerously-skip-permissions",
-    ...(session
-      ? [
-          ...(session.resumeFrom
-            ? ["--resume", session.resumeFrom, "--fork-session"]
-            : []),
-          "--session-id",
-          session.id,
-          ...(session.resumeAt ? ["--resume-session-at", session.resumeAt] : []),
-        ]
-      : ["--no-session-persistence"]),
+    ...sessionArgs(session),
     "--input-format",
     "stream-json",
     "--output-format",
@@ -161,6 +156,18 @@ export function buildClaudeArgs(
     systemPromptFile(request),
     "--json-schema",
     JSON.stringify(outputSchema(request.tools ?? [])),
+  ];
+}
+
+function sessionArgs(session?: SessionLaunch): string[] {
+  if (!session) return ["--no-session-persistence"];
+  return [
+    ...(session.resumeFrom
+      ? ["--resume", session.resumeFrom, "--fork-session"]
+      : []),
+    "--session-id",
+    session.id,
+    ...(session.resumeAt ? ["--resume-session-at", session.resumeAt] : []),
   ];
 }
 
@@ -216,13 +223,6 @@ type PendingTurn = {
   resolve: (result: ClaudeResult) => void;
   reject: (error: Error) => void;
 };
-type ClaudeProcess = {
-  stdin: { write(data: string): unknown; flush(): unknown; end(): unknown };
-  stdout: ReadableStream<Uint8Array>;
-  stderr: ReadableStream<Uint8Array>;
-  exited: Promise<number>;
-  kill(): void;
-};
 /** What the worker answered last, so the next request can be checked against it. */
 type LastTurn = { text: string; callIds: Set<string> };
 
@@ -266,7 +266,7 @@ class ClaudeWorker {
   seenCount = 0;
   prefixHash = "";
   lastTurn: LastTurn = { text: "", callIds: new Set() };
-  private readonly subprocess: ClaudeProcess;
+  private readonly subprocess: Bun.Subprocess<"pipe", "pipe", "pipe">;
   private pending?: PendingTurn;
   private readonly workerId = crypto.randomUUID();
   private workerTurn = 0;
@@ -275,18 +275,16 @@ class ClaudeWorker {
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
-
-  /** Whether this process forked a stored session instead of starting fresh. */
-  private readonly resumed: boolean;
+  /** The stored session this process forked, if it did not start fresh. */
   private readonly resumedFrom?: string;
 
   constructor(
     request: ResponsesRequest,
+    account: Account,
     resumeFrom?: string,
-    account: Account = pickAccount() ?? soonestAccount(),
+    resumeAt?: string,
   ) {
     this.account = account;
-    this.resumed = resumeFrom !== undefined;
     this.resumedFrom = resumeFrom;
     this.model = request.model;
     this.effort = resolveEffort(request);
@@ -300,13 +298,18 @@ class ClaudeWorker {
       // The map only saves cache; a broken database must not block inference.
       console.error("Unable to register Claude session:", (error as Error).message);
     }
+    const {
+      CLAUDECODE: _nested,
+      CLAUDE_CODE_EFFORT_LEVEL: _effortLevel,
+      ...env
+    } = process.env;
     this.subprocess = Bun.spawn(
       [
         process.env.CLAUDE_BIN ?? "claude",
         ...buildClaudeArgs(request, {
           id: this.sessionId,
           resumeFrom,
-          resumeAt: resumeFrom ? resumeCheckpoint(resumeFrom) : undefined,
+          resumeAt: resumeFrom ? resumeAt : undefined,
         }),
       ],
       {
@@ -314,28 +317,21 @@ class ClaudeWorker {
         stdout: "pipe",
         stderr: "pipe",
         cwd: process.env.CLAUDE_CWD || process.cwd(),
-        env: {
-          ...(Object.fromEntries(
-            Object.entries(process.env).filter(
-              ([key]) =>
-                key !== "CLAUDECODE" && key !== "CLAUDE_CODE_EFFORT_LEVEL",
-            ),
-          ) as Record<string, string>),
-          ...accountEnv(account),
-        },
+        env: { ...env, ...accountEnv(account) },
       },
-    ) as unknown as ClaudeProcess;
+    );
     liveWorkers.add(this);
     void this.readStdout().catch((cause) => this.fail(cause));
-    void this.readStderr();
-    void this.subprocess.exited.then((exitCode) => {
+    const stderrRead = this.readStderr().catch(() => {});
+    void this.subprocess.exited.then(async (exitCode) => {
+      // Helpers may inherit the pipe; allow diagnostics to drain without hanging exit.
+      await Promise.race([stderrRead, Bun.sleep(1000)]);
       this.closed = true;
       idleWorkers.delete(this);
       liveWorkers.delete(this);
       if (this.pending) {
         const message =
           this.stderr.trim() || `Claude CLI exited with code ${exitCode}`;
-        if (isLimitError(undefined, this.stderr)) markLimited(this.account);
         this.pending.reject(new Error(message));
         this.pending = undefined;
       }
@@ -345,23 +341,23 @@ class ClaudeWorker {
   async run(
     content: ClaudeInputBlock[],
     turn: TurnContext,
-    attempt = 1,
+    attempt: number,
   ): Promise<ClaudeResult> {
-    this.turn = turn;
-    this.attempt = attempt;
-    this.workerTurn++;
     if (this.closed) throw new Error("Claude CLI worker is closed");
     if (this.pending)
       throw new Error("Claude CLI worker is already processing a turn");
+    this.turn = turn;
+    turn.account = this.account;
+    this.attempt = attempt;
+    this.workerTurn++;
     idleWorkers.delete(this);
-    if (this.idleTimer) clearTimeout(this.idleTimer);
+    clearTimeout(this.idleTimer);
     const timeoutMs = Number(process.env.CLAUDE_TIMEOUT_MS ?? 900_000);
     return await new Promise<ClaudeResult>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pending = undefined;
-        this.abort();
-        reject(new Error(`Claude CLI timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
+      const timeout = setTimeout(
+        () => this.fail(new Error(`Claude CLI timed out after ${timeoutMs}ms`)),
+        timeoutMs,
+      );
       this.pending = {
         resolve: (result) => {
           clearTimeout(timeout);
@@ -369,6 +365,7 @@ class ClaudeWorker {
         },
         reject: (error) => {
           clearTimeout(timeout);
+          this.noteFailure(undefined, error.message);
           reject(error);
         },
       };
@@ -434,14 +431,29 @@ class ClaudeWorker {
     pending?.reject(cause instanceof Error ? cause : new Error(String(cause)));
   }
 
+  /**
+   * Logs a failed turn and benches this account when the error shows it is out
+   * of quota or signed out, so the request can fail over to another account.
+   */
+  private noteFailure(status: unknown, message: string): void {
+    if (isLimitError(status, message)) markLimited(this.account);
+    if (isAuthError(status, message)) markAuthFailed(this.account);
+    recordFailure({
+      event: "failure",
+      requestId: this.turn.requestId,
+      account: this.account.name,
+      workerId: this.workerId,
+      attempt: this.attempt,
+      category: failureCategory(status, message),
+      status: typeof status === "number" ? status : undefined,
+    });
+  }
+
   private async readStdout(): Promise<void> {
-    const reader = this.subprocess.stdout.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+    for await (const chunk of this.subprocess.stdout) {
+      buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) this.acceptLine(line);
@@ -450,50 +462,47 @@ class ClaudeWorker {
   }
 
   private acceptLine(line: string): void {
+    let event:
+      | ClaudeResult
+      | { type: "rate_limit_event"; rate_limit_info?: Record<string, unknown> }
+      | undefined;
     try {
-      const value = JSON.parse(line) as
-        | ClaudeResult
-        | { type: "rate_limit_event"; rate_limit_info?: Record<string, unknown> };
-      if (value.type === "rate_limit_event") {
-        observeRateLimit(this.account, value.rate_limit_info ?? {});
-        return;
-      }
-      if (value.type !== "result" || !this.pending) return;
-      if (value.is_error && isLimitError(value.api_error_status, value.result))
-        markLimited(this.account);
-      this.turn.account = this.account;
-      recordUsage(value, {
-        requestId: this.turn.requestId,
-        workerId: this.workerId,
-        workerTurn: this.workerTurn,
-        model: this.model,
-        effort: this.effort,
-        attempt: this.attempt,
-        launchMode: "minimal",
-        resumed: this.resumed,
-        threadId: this.turn.threadId,
-        sessionId: this.sessionId,
-        resumedFrom: this.resumedFrom,
-        account: this.account.name,
-      });
-      const pending = this.pending;
-      this.pending = undefined;
-      pending.resolve(value);
+      event = JSON.parse(line);
     } catch {
-      // Ignore non-JSON diagnostics from the CLI.
+      return; // The CLI also prints non-JSON diagnostics.
     }
+    if (event?.type === "rate_limit_event") {
+      observeRateLimit(this.account, event.rate_limit_info ?? {});
+      return;
+    }
+    if (event?.type !== "result" || !this.pending) return;
+    if (event.is_error)
+      this.noteFailure(event.api_error_status, resultErrorText(event));
+    recordUsage(event, {
+      requestId: this.turn.requestId,
+      workerId: this.workerId,
+      workerTurn: this.workerTurn,
+      model: this.model,
+      effort: this.effort,
+      attempt: this.attempt,
+      launchMode: "minimal",
+      resumed: this.resumedFrom !== undefined,
+      threadId: this.turn.threadId,
+      sessionId: this.sessionId,
+      resumedFrom: this.resumedFrom,
+      account: this.account.name,
+    });
+    const pending = this.pending;
+    this.pending = undefined;
+    pending.resolve(event);
   }
 
   private async readStderr(): Promise<void> {
-    const reader = this.subprocess.stderr.getReader();
     const decoder = new TextDecoder();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    for await (const chunk of this.subprocess.stderr)
       this.stderr = (
-        this.stderr + decoder.decode(value, { stream: true })
+        this.stderr + decoder.decode(chunk, { stream: true })
       ).slice(-65_536);
-    }
   }
 }
 
@@ -576,7 +585,7 @@ function claimWorker(
   // Most recently parked first.
   for (const worker of [...idleWorkers].reverse()) {
     // A limited account cannot answer; the session resumes on another one.
-    if (isLimited(worker.account)) {
+    if (isUnavailable(worker.account)) {
       worker.close();
       continue;
     }
@@ -648,6 +657,55 @@ function findStoredSession(
   return undefined;
 }
 
+/** A live worker or a stored session that this request's history extends. */
+type Continuation = {
+  request: ResponsesRequest;
+  delta: ResponseInputItem[];
+  resumeFrom: string;
+  worker?: ClaudeWorker;
+};
+
+/** Tries each form of the request in order; live workers win over stored sessions. */
+function findContinuation(
+  requests: Iterable<ResponsesRequest>,
+  account?: Account,
+): Continuation | undefined {
+  for (const request of requests) {
+    const live = claimWorker(request, account);
+    if (live)
+      return { request, ...live, resumeFrom: live.worker.sessionId };
+    const stored = findStoredSession(request);
+    if (stored) return { request, ...stored };
+  }
+  return undefined;
+}
+
+/** The first account with quota left, or the one whose limit resets soonest. */
+const availableAccount = (): Account => pickAccount() ?? soonestAccount();
+
+/**
+ * The account to replay on when `account` can no longer serve requests, or
+ * undefined when the error should stand because none is left.
+ */
+function failoverAccount(
+  requestId: string,
+  account: Account | undefined,
+  category: string,
+): Account | undefined {
+  if (!account || !isUnavailable(account)) return undefined;
+  const next = pickAccount();
+  if (!next) return undefined;
+  recordFailure({
+    event: "failover",
+    requestId,
+    account: account.name,
+    nextAccount: next.name,
+    category,
+  });
+  console.error(`Switching Claude account ${account.name} -> ${next.name}`);
+  return next;
+}
+
 /** Close idle workers; their sessions stay resumable. Used on shutdown and in tests. */
 export function closeIdleWorkers(): void {
   for (const worker of [...idleWorkers]) worker.close();
@@ -666,92 +724,107 @@ export {
 
 type StructuredOutput = NonNullable<ClaudeResult["structured_output"]>;
 
-function structuredOutput(
-  worker: ClaudeWorker,
-  result: ClaudeResult,
-): StructuredOutput {
-  if (result.is_error) {
-    worker.close();
-    throw new Error(result.result || "Claude CLI returned an error");
+function resultErrorText(result: ClaudeResult): string {
+  return [result.result, ...(result.errors ?? [])].filter((text) => typeof text === "string").join("\n");
+}
+
+class ClaudeFailure extends Error {
+  constructor(result: ClaudeResult) {
+    super(resultErrorText(result) || "Claude CLI returned an error");
+    this.status = result.api_error_status;
   }
+  readonly status: number | null | undefined;
+}
+
+function errorCategory(error: unknown): string {
+  return failureCategory(error instanceof ClaudeFailure ? error.status : undefined, String(error));
+}
+
+function parseStructuredOutput(result: ClaudeResult): StructuredOutput {
+  if (result.is_error)
+    throw new ClaudeFailure(result);
   let structured: ClaudeResult["structured_output"];
   try {
     structured =
       result.structured_output ??
       (JSON.parse(result.result ?? "{}") as ClaudeResult["structured_output"]);
-  } catch {
-    worker.close();
-    throw new Error("Claude CLI returned invalid structured output");
-  }
+  } catch {}
   if (
     !structured ||
     typeof structured.text !== "string" ||
     !Array.isArray(structured.tool_calls)
-  ) {
-    worker.close();
+  )
     throw new Error("Claude CLI returned invalid structured output");
-  }
   return structured;
 }
 
 export async function runClaude(
   request: ResponsesRequest,
 ): Promise<ProxyOutput> {
-  let turn: TurnContext = {
-    requestId: crypto.randomUUID(),
-    threadId:
-      typeof request.prompt_cache_key === "string"
-        ? request.prompt_cache_key
-        : undefined,
-  };
-  let output: ProxyOutput;
+  const requestId = crypto.randomUUID();
+  const threadId =
+    typeof request.prompt_cache_key === "string"
+      ? request.prompt_cache_key
+      : undefined;
+  const checkpoints = new Map<string, string | undefined>();
   for (;;) {
-    turn = { requestId: turn.requestId, threadId: turn.threadId };
+    const turn: TurnContext = { requestId, threadId };
+    let output: ProxyOutput;
     try {
-      output = await runClaudeTurn(request, turn);
-      break;
+      output = await runClaudeTurn(request, turn, checkpoints);
     } catch (error) {
-      // Corrections can also hit quota; replay before any tool calls are returned.
-      if (!turn.account || !isLimited(turn.account) || !pickAccount()) throw error;
+      // Corrections can also fail authentication or hit quota; replay before any tool calls are returned.
+      if (failoverAccount(requestId, turn.account, errorCategory(error)))
+        continue;
+      recordFailure({ event: "request_failed", requestId, account: turn.account?.name,
+        category: errorCategory(error) });
+      throw error;
     }
-  }
-  if (turn.threadId && turn.account) {
-    try {
-      pinThreadAccount(turn.threadId, turn.account.name, turn.pinnedAccount);
-    } catch (error) {
-      // Persistence failure must not discard an already completed response.
-      console.error("Unable to save thread account:", (error as Error).message);
+    if (threadId && turn.account) {
+      try {
+        pinThreadAccount(threadId, turn.account.name, turn.pinnedAccount);
+      } catch (error) {
+        // Persistence failure must not discard an already completed response.
+        console.error("Unable to save thread account:", (error as Error).message);
+      }
     }
+    return { ...output, account: turn.account?.name };
   }
-  return { ...output, account: turn.account?.name };
 }
 
 async function runClaudeTurn(
-  request: ResponsesRequest,
+  original: ResponsesRequest,
   turn: TurnContext,
+  checkpoints: Map<string, string | undefined>,
 ): Promise<ProxyOutput> {
-  validateCompactionItems(request);
-  const original = request;
-  request = normalizeContext(request);
+  validateCompactionItems(original);
   const pinnedName = turn.threadId
-    ? threadAccount(turn.threadId) ?? claimThreadAccount(turn.threadId, (pickAccount() ?? soonestAccount()).name)
+    ? threadAccount(turn.threadId) ??
+      claimThreadAccount(turn.threadId, availableAccount().name)
     : undefined;
+  turn.pinnedAccount = pinnedName;
   const pinned = listAccounts().find((account) => account.name === pinnedName);
-  const account = pinned && !isLimited(pinned) ? pinned : pickAccount() ?? soonestAccount();
-  if (turn.threadId) {
-    turn.pinnedAccount = pinnedName ?? account.name;
-  }
-  let live = claimWorker(request, turn.threadId ? account : undefined);
-  let stored = live ? undefined : findStoredSession(request);
+  const account = pinned && !isUnavailable(pinned) ? pinned : availableAccount();
+
+  const normalized = normalizeContext(original);
   // Existing sessions must keep the exact prefix they were originally sent.
-  if (!live && !stored && request !== original) {
-    live = claimWorker(original, turn.threadId ? account : undefined);
-    stored = live ? undefined : findStoredSession(original);
-    if (live || stored) request = original;
+  const found = findContinuation(
+    new Set([normalized, original]),
+    turn.threadId ? account : undefined,
+  );
+  const request = found?.request ?? normalized;
+  let delta = found?.delta;
+  let resumeFrom = found?.resumeFrom;
+  const replaying = resumeFrom !== undefined && checkpoints.has(resumeFrom);
+  // Capture before this turn can append a rejected answer to the transcript.
+  if (resumeFrom && !checkpoints.has(resumeFrom))
+    checkpoints.set(resumeFrom, resumeCheckpoint(resumeFrom));
+  const resumeAt = resumeFrom ? checkpoints.get(resumeFrom) : undefined;
+  if (replaying && resumeFrom && !resumeAt && !found?.worker) {
+    delta = undefined;
+    resumeFrom = undefined;
   }
-  let delta = live?.delta ?? stored?.delta;
-  let resumeFrom = live?.worker.sessionId ?? stored?.resumeFrom;
-  let worker = live?.worker ?? new ClaudeWorker(request, resumeFrom, account);
+  let worker = found?.worker ?? new ClaudeWorker(request, account, resumeFrom, resumeAt);
   // Estimated tokens of the last full-history prompt, to rescale after a rejection.
   let replaySent = 0;
   /** The whole conversation for a fresh worker, shortened to fit Claude's window. */
@@ -772,30 +845,44 @@ async function runClaudeTurn(
     ? await prepareClaudePrompt(deltaRequest(request, delta))
     : await replayPrompt();
   let shrunk = false;
-  let result: ClaudeResult;
-  let attempt = 1;
+  const replayWorker = async (next: Account): Promise<ClaudeWorker> => {
+    // Without a checkpoint, resuming could include the rejected answer.
+    if (resumeFrom && !resumeAt) {
+      await prepared.cleanup();
+      prepared = await replayPrompt();
+      delta = undefined;
+      resumeFrom = undefined;
+    }
+    return new ClaudeWorker(request, next, resumeFrom, resumeAt);
+  };
+  let structured: StructuredOutput;
   try {
-    while (true) {
+    let result: ClaudeResult;
+    for (let attempt = 1; ; attempt++) {
       try {
-        result = await worker.run(prepared.content, turn, attempt++);
+        result = await worker.run(prepared.content, turn, attempt);
       } catch (error) {
         worker.close();
-        const next = isLimited(worker.account) ? pickAccount() : undefined;
+        const next = failoverAccount(
+          turn.requestId,
+          worker.account,
+          errorCategory(error),
+        );
         if (next) {
-          worker = new ClaudeWorker(request, resumeFrom, next);
+          worker = await replayWorker(next);
           continue;
         }
-        if (isLimited(worker.account) || !delta) throw error;
+        if (isUnavailable(worker.account) || !delta) throw error;
         // Missing or unusable transcripts get one full-history fallback.
         await prepared.cleanup();
         prepared = await replayPrompt();
         delta = undefined;
         resumeFrom = undefined;
-        worker = new ClaudeWorker(request, undefined, worker.account);
+        worker = new ClaudeWorker(request, worker.account);
         continue;
       }
-      const tooLong =
-        result.is_error && !shrunk ? promptTooLong(result.result ?? "") : undefined;
+      if (!result.is_error) break;
+      const tooLong = shrunk ? undefined : promptTooLong(resultErrorText(result));
       if (tooLong) {
         // The estimate was optimistic (or a resumed session outgrew Claude's
         // window): replay once more with the error's own sizes as the scale.
@@ -806,19 +893,20 @@ async function runClaudeTurn(
         prepared = await replayPrompt(retryBudget(sent, tooLong, request.model));
         delta = undefined;
         resumeFrom = undefined;
-        worker = new ClaudeWorker(request, undefined, worker.account);
+        worker = new ClaudeWorker(request, worker.account);
         continue;
       }
-      if (!result.is_error || !isLimited(worker.account)) break;
-      const next = pickAccount();
-      if (!next) break;
-      console.error(
-        `Switching Claude account ${worker.account.name} -> ${next.name}`,
+      const next = failoverAccount(
+        turn.requestId,
+        worker.account,
+        failureCategory(result.api_error_status, resultErrorText(result)),
       );
+      if (!next) break;
       worker.close();
       // Keep the original checkpoint and delta across every rejected account.
-      worker = new ClaudeWorker(request, resumeFrom, next);
+      worker = await replayWorker(next);
     }
+    structured = parseStructuredOutput(result);
   } catch (error) {
     worker.close();
     throw error;
@@ -826,37 +914,24 @@ async function runClaudeTurn(
     await prepared.cleanup();
   }
 
-  let structured = structuredOutput(worker, result);
   if (isCompactionRequest(request))
     return await compactionOutput(worker, request, turn, structured);
 
   // Tool names are validated here instead of by a schema enum (see
-  // outputSchema). Correct them in the same process to keep its cache.
+  // outputSchema).
   const allowedTools = new Set(
     toolDescriptors(requestTools(request)).map((tool) => tool.proxyName),
   );
-  for (let retry = 0; ; retry++) {
-    const unknown = structured.tool_calls
+  structured = await corrected(worker, turn, structured, (output) => {
+    const unknown = output.tool_calls
       .map((call) => call.name)
       .filter((name) => !allowedTools.has(name));
-    if (unknown.length === 0) break;
-    if (retry >= MAX_TOOL_NAME_RETRIES) {
-      worker.close();
-      throw new Error(`Claude CLI requested unavailable tool: ${unknown[0]}`);
-    }
-    const correction = `<tool_error>\nNo tool calls were executed. Unknown tool name(s): ${unknown.join(", ")}. Use only exact names from <available_tools> or tools loaded by tool search, formatted namespace.name for namespaced tools. Reply again with the corrected text and tool_calls.\n</tool_error>`;
-    try {
-      result = await worker.run(
-        [{ type: "text", text: correction }],
-        turn,
-        retry + 2,
-      );
-    } catch (error) {
-      worker.close();
-      throw error;
-    }
-    structured = structuredOutput(worker, result);
-  }
+    if (unknown.length === 0) return undefined;
+    return {
+      message: `<tool_error>\nNo tool calls were executed. Unknown tool name(s): ${unknown.join(", ")}. Use only exact names from <available_tools> or tools loaded by tool search, formatted namespace.name for namespaced tools. Reply again with the corrected text and tool_calls.\n</tool_error>`,
+      failure: `Claude CLI requested unavailable tool: ${unknown[0]}`,
+    };
+  });
 
   const toolCalls = structured.tool_calls.map((call) => ({
     ...call,
@@ -868,23 +943,57 @@ async function runClaudeTurn(
     text,
     callIds: new Set(toolCalls.map((call) => call.callId)),
   });
-  // Claude Code's usage includes its private system prompt, native tool schemas,
-  // plugins, MCP definitions, and cache activity. Reporting that hidden runtime
-  // overhead makes Codex believe its own conversation exceeds the context window.
-  // Only report the request/output content that Codex can retain or compact.
-  const inputTokens = estimateRequestTokens(request);
-  const outputTokens = estimateVisibleTokens(
-    text + JSON.stringify(toolCalls),
-  );
   return {
     text,
     toolCalls,
-    usage: {
-      inputTokens,
-      outputTokens,
-      totalTokens: inputTokens + outputTokens,
-    },
+    usage: visibleUsage(request, text + JSON.stringify(toolCalls)),
   };
+}
+
+/** A follow-up asking the worker to fix its answer, and the error if it never does. */
+type Correction = { message: string; failure: string };
+
+/**
+ * Sends corrections to the same worker, which keeps its prompt cache, until
+ * `check` accepts the answer. The worker is closed if it never does.
+ */
+async function corrected(
+  worker: ClaudeWorker,
+  turn: TurnContext,
+  structured: StructuredOutput,
+  check: (output: StructuredOutput) => Correction | undefined,
+): Promise<StructuredOutput> {
+  try {
+    for (let retry = 0; ; retry++) {
+      const correction = check(structured);
+      if (!correction) return structured;
+      if (retry >= MAX_CORRECTIONS) throw new Error(correction.failure);
+      const result = await worker.run(
+        [{ type: "text", text: correction.message }],
+        turn,
+        retry + 2,
+      );
+      structured = parseStructuredOutput(result);
+    }
+  } catch (error) {
+    worker.close();
+    throw error;
+  }
+}
+
+/**
+ * Claude Code's usage includes its private system prompt, native tool schemas,
+ * plugins, MCP definitions, and cache activity. Reporting that hidden runtime
+ * overhead makes Codex believe its own conversation exceeds the context window,
+ * so only the request and output content Codex can retain or compact counts.
+ */
+function visibleUsage(
+  request: ResponsesRequest,
+  output: string,
+): ProxyOutput["usage"] {
+  const inputTokens = estimateRequestTokens(request);
+  const outputTokens = estimateVisibleTokens(output);
+  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
 }
 
 /**
@@ -899,40 +1008,17 @@ async function compactionOutput(
   turn: TurnContext,
   structured: StructuredOutput,
 ): Promise<ProxyOutput> {
-  for (
-    let retry = 0;
-    structured.tool_calls.length > 0 || !structured.text.trim();
-    retry++
-  ) {
-    if (retry >= MAX_TOOL_NAME_RETRIES) {
-      worker.close();
-      throw new Error("Claude CLI did not return a compaction summary");
-    }
-    let result: ClaudeResult;
-    try {
-      result = await worker.run(
-        [{ type: "text", text: COMPACTION_CORRECTION }],
-        turn,
-        retry + 2,
-      );
-    } catch (error) {
-      worker.close();
-      throw error;
-    }
-    structured = structuredOutput(worker, result);
-  }
+  const { text } = await corrected(worker, turn, structured, (output) =>
+    output.tool_calls.length > 0 || !output.text.trim()
+      ? COMPACTION_CORRECTION
+      : undefined,
+  );
   // The summary replaces this history, so no later request can extend this worker.
   worker.close();
-  const inputTokens = estimateRequestTokens(request);
-  const outputTokens = estimateVisibleTokens(structured.text);
   return {
     text: "",
     toolCalls: [],
-    compaction: structured.text,
-    usage: {
-      inputTokens,
-      outputTokens,
-      totalTokens: inputTokens + outputTokens,
-    },
+    compaction: text,
+    usage: visibleUsage(request, text),
   };
 }
