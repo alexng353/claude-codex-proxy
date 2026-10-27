@@ -1,6 +1,7 @@
 // alex-0230: two copies of the proxy can run at once while one hands the port to
 // the other (reusePort). This is what /health says about this copy, so the handoff
 // can check the new one by its own port and confirm what it is running.
+import { readFileSync } from "node:fs";
 
 let draining = false;
 let commit: string | undefined;
@@ -37,11 +38,25 @@ export function isDraining(): boolean {
 export function legacyRunning(env: Record<string, string | undefined> = process.env): boolean {
   const pid = Number(env.LEGACY_PID);
   if (!(pid > 0)) return false;
+  // LEGACY_STARTTIME (field 22 of /proc/PID/stat) pins the process, so a pid reused
+  // after the old copy exits never keeps this one waiting.
+  if (env.LEGACY_STARTTIME) return processStartTime(pid) === env.LEGACY_STARTTIME;
   try {
     process.kill(pid, 0);
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** A process's start time in clock ticks since boot, or undefined if it is gone. */
+export function processStartTime(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The command name (field 2) may hold spaces; fields restart after its ")".
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
+  } catch {
+    return undefined;
   }
 }
 

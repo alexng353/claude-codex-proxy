@@ -2,6 +2,7 @@ import { afterAll, beforeEach, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { lockOwner } from "../src/filelock";
+import { legacyRunning, processStartTime } from "../src/handoff";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -135,4 +136,13 @@ test("while the old single copy drains (first move), a perpetual chat waits for 
   } finally {
     delete process.env.LEGACY_PID;
   }
+});
+
+test("the old copy is pinned by its start time, so a reused pid never blocks", () => {
+  const pid = String(process.pid);
+  const started = processStartTime(process.pid)!;
+  expect(started).toMatch(/^[0-9]+$/);
+  expect(legacyRunning({ LEGACY_PID: pid, LEGACY_STARTTIME: started })).toBe(true);
+  expect(legacyRunning({ LEGACY_PID: pid, LEGACY_STARTTIME: "1" })).toBe(false);
+  expect(legacyRunning({ LEGACY_PID: "999999999", LEGACY_STARTTIME: started })).toBe(false);
 });
