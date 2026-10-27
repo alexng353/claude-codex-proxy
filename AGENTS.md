@@ -63,6 +63,23 @@ curl -s http://127.0.0.1:3456/health   # {"status":"ok"}
 
 On macOS, use a launchd agent with the same command and environment.
 
+### Updating without cutting turns (optional)
+
+A copy stopped with SIGTERM drains: it stops accepting, lets every open
+request, memory summary and usage probe finish, then exits 0. It listens with
+`reusePort`, so a new copy can start beside it on the same port first. `/health`
+reports `commit`, `pid`, `slot` and `draining`; `HEALTH_PORT` serves one copy's
+own `/health`. Shared state (perpetual chats, account usage, the hygiene gate,
+the probe lease) is locked with `flock` across copies (`src/filelock.ts`).
+
+To update, run two template units (`claude-codex-proxy@a` / `@b`) that differ
+only in `HEALTH_PORT`: start the idle one on the new revision, check its own
+`/health` shows that commit with `draining: false`, then send SIGTERM to the
+old one's main process only (`systemctl --user kill --kill-whom=main
+--signal=SIGTERM`). Never `restart`: that cuts open turns. Run each slot from
+an immutable checkout of its commit, but keep `CLAUDE_CWD` the main checkout:
+Claude Code keys saved sessions by its working directory.
+
 ## 4. Configure Codex
 
 Back up `~/.codex/config.toml`, then add the provider block. Do not change the
