@@ -1,0 +1,59 @@
+import { afterEach, expect, test } from "bun:test";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { accountStatus, isUnavailable, listAccounts, observeRateLimit, resetAccountState } from "../src/accounts";
+
+const keys = ["CLAUDE_ACCOUNT_WEEKLY_CAP", "PROXY_STATE_DIR", "CLAUDE_CONFIG_DIR"];
+const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+afterEach(() => {
+  for (const key of keys) {
+    if (saved[key] === undefined) delete process.env[key];
+    else process.env[key] = saved[key];
+  }
+  resetAccountState();
+});
+
+async function setup() {
+  const directory = await mkdtemp(join(tmpdir(), "claude-codex-proxy-usage-"));
+  for (const name of ["hinson", "martin"]) {
+    const dir = join(directory, "state", "accounts", name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, ".credentials.json"), "{}");
+  }
+  process.env.PROXY_STATE_DIR = join(directory, "state");
+  process.env.CLAUDE_CONFIG_DIR = join(directory, "base");
+}
+
+const week = (utilization: number, resetsAt = Date.now() / 1000 + 86_400) => ({
+  status: "allowed",
+  unifiedWindows: { seven_day: { utilization, resetsAt } },
+});
+
+test("last-known usage survives a restart, marked stale, and still caps", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "hinson=90";
+  const hinson = listAccounts().find((a) => a.name === "hinson")!;
+  observeRateLimit(hinson, week(0.94));
+  const live = accountStatus().find((a) => a.name === "hinson")!;
+  expect(live.stale).toBe(false);
+  resetAccountState();
+  const restored = accountStatus().find((a) => a.name === "hinson")!;
+  expect(restored.stale).toBe(true);
+  expect(restored.observedAt).toBe(live.observedAt);
+  expect(restored.windows.seven_day?.usedPercent).toBe(94);
+  expect(isUnavailable(hinson)).toBe(true);
+  observeRateLimit(hinson, week(0.95));
+  expect(accountStatus().find((a) => a.name === "hinson")!.stale).toBe(false);
+});
+
+test("a restored window that has since reset is dropped", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=50";
+  const martin = listAccounts().find((a) => a.name === "martin")!;
+  observeRateLimit(martin, week(0.9, Date.now() / 1000 + 1));
+  resetAccountState();
+  await Bun.sleep(1_100);
+  expect(isUnavailable(martin)).toBe(false);
+  expect(accountStatus().find((a) => a.name === "martin")!.windows).toEqual({});
+});
