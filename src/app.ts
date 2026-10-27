@@ -3,7 +3,8 @@ import { runClaude } from "./claude";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
 import { GATE_ONLY_HEADER, HOP_HEADER, loopResponse, remoteGate } from "./hygiene-remote";
-import { perpetualStatus, preparePerpetual } from "./perpetual";
+import { PerpetualWaitAborted, perpetualStatus, preparePerpetualWaiting } from "./perpetual";
+import { healthInfo } from "./handoff";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
@@ -98,7 +99,7 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
 export async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/health" && request.method === "GET")
-    return json({ status: "ok" });
+    return json(healthInfo());
   // Tailscale Serve exposes this port for Cairn. Anything that came through a
   // proxy hop may reach only the separately authenticated hygiene API.
   const forwarded = request.headers.has("x-forwarded-for") || request.headers.has("tailscale-user-login");
@@ -146,7 +147,7 @@ export async function handleRequest(request: Request): Promise<Response> {
     // Perpetual chats (src/perpetual) replace history with a summary view;
     // every other request goes to Claude exactly as before.
     const prepared = preloadSkills(activity.request);
-    const perpetual = preparePerpetual(prepared);
+    const perpetual = await preparePerpetualWaiting(prepared, { signal: request.signal });
     const output = perpetual ? await perpetual.run(runClaude, request.signal) : await runClaude(prepared);
     activity.commit();
     const response = responseObject(body, output);
@@ -156,7 +157,12 @@ export async function handleRequest(request: Request): Promise<Response> {
     return reply;
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : String(cause);
-    const status = message.startsWith("Unsupported Claude") ? 400 : 502;
+    // A handoff (alex-0230): 503 so Codex retries, reaching the copy that has the chat.
+    const status = message.startsWith("Unsupported Claude")
+      ? 400
+      : cause instanceof PerpetualWaitAborted
+        ? 503
+        : 502;
     return error(message, status);
   }
 }

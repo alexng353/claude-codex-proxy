@@ -8,6 +8,8 @@
  * timer, and feeds the result through `observeRateLimit` like a turn's report.
  * The parsing matches `scripts/limits.ts --probe`.
  */
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import {
   accountEnv,
   accountStatus,
@@ -16,6 +18,8 @@ import {
   type Account,
   type RateLimitInfo,
 } from "./accounts";
+import { tryLock, unlock } from "./filelock";
+import { stateDir } from "./sessions";
 
 export type ProbeWindow = { usedPercent: number; resetsAt: string | null };
 
@@ -92,7 +96,7 @@ export function applyProbe(
   if (!info) return false;
   const seen = accountStatus().find((status) => status.name === account.name)?.observedAt;
   if (seen && Date.parse(seen) > startedAt) return false;
-  observeRateLimit(account, info);
+  observeRateLimit(account, info, startedAt);
   return true;
 }
 
@@ -160,13 +164,30 @@ export async function probeAccount(account: Account): Promise<ProbeOutcome> {
 }
 
 let running: Promise<ProbeOutcome[]> | undefined;
+/** Set once this copy drains: a running batch probes no further accounts. */
+let stopping = false;
 
-/** Probe every account, one at a time so CLI token refreshes never overlap. */
+/** Held while a batch runs, so two copies (during a handoff) never probe at once. */
+function leasePath(): string {
+  return join(stateDir(), "usage-probe.lock");
+}
+
+/**
+ * Probe every account, one at a time so CLI token refreshes never overlap, in this
+ * copy or another (alex-0230). Probes nothing while another copy's batch runs.
+ */
 export function probeAllAccounts(): Promise<ProbeOutcome[]> {
-  running ??= (async () => {
+  // The body starts on a later tick, so its cleanup (running = undefined) always
+  // runs after this assignment, even when it returns at once (alex-0230 N4).
+  running ??= Promise.resolve().then(async () => {
     const outcomes: ProbeOutcome[] = [];
+    let leased = false;
     try {
+      mkdirSync(stateDir(), { recursive: true });
+      leased = tryLock(leasePath()).held;
+      if (!leased) return outcomes;
       for (const account of listAccounts()) {
+        if (stopping) break;
         try {
           outcomes.push(await probeAccount(account));
         } catch {
@@ -174,10 +195,11 @@ export function probeAllAccounts(): Promise<ProbeOutcome[]> {
         }
       }
     } finally {
+      if (leased) unlock(leasePath());
       running = undefined;
     }
     return outcomes;
-  })();
+  });
   return running;
 }
 
@@ -185,8 +207,10 @@ export function probeAllAccounts(): Promise<ProbeOutcome[]> {
  * Probe shortly after start, then every `USAGE_PROBE_INTERVAL_MS` (default 12
  * minutes). `USAGE_PROBE_DISABLE=1` turns it off. Returns a stop function.
  */
-export function startUsageProbe(env: Record<string, string | undefined> = process.env): () => void {
-  if (env.USAGE_PROBE_DISABLE === "1") return () => {};
+export function startUsageProbe(
+  env: Record<string, string | undefined> = process.env,
+): () => Promise<unknown> {
+  if (env.USAGE_PROBE_DISABLE === "1") return async () => {};
   const number = (value: string | undefined, fallback: number) =>
     value && Number.isFinite(Number(value)) && Number(value) >= 0 ? Number(value) : fallback;
   const intervalMs = Math.max(60_000, number(env.USAGE_PROBE_INTERVAL_MS, DEFAULT_INTERVAL_MS));
@@ -204,9 +228,13 @@ export function startUsageProbe(env: Record<string, string | undefined> = proces
     (timer as { unref?: () => void }).unref?.();
   };
   schedule(initialDelayMs);
+  // Stops the timer and any batch after its current account; resolves once that
+  // account's probe (and its token refresh) has finished.
   return () => {
     stopped = true;
+    stopping = true;
     if (timer) clearTimeout(timer);
+    return running ?? Promise.resolve();
   };
 }
 
@@ -214,4 +242,5 @@ export function startUsageProbe(env: Record<string, string | undefined> = proces
 export function resetUsageProbe(): void {
   usageSupported = undefined;
   running = undefined;
+  stopping = false;
 }

@@ -174,3 +174,16 @@ test("the timer probes once at start and can be disabled", async () => {
   stop();
   expect(accountStatus()[0].windows.seven_day?.usedPercent).toBe(95);
 });
+
+// alex-0230: two proxy copies during a handoff share one probe lease.
+test("a batch skipped for another copy's lease does not stop later probes", async () => {
+  await fakeCli();
+  await mkdir(join(root, "state"), { recursive: true });
+  const lease = join(root, "state", "usage-probe.lock");
+  const other = Bun.spawn(["flock", "-o", lease, "sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] });
+  await Bun.sleep(150);
+  expect(await probeAllAccounts()).toEqual([]);
+  other.kill("SIGKILL");
+  await other.exited;
+  expect(await probeAllAccounts()).toEqual([{ account: "default", result: "applied" }]);
+});

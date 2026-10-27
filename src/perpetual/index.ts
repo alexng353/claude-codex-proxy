@@ -96,6 +96,11 @@ type Thread = {
   compactor: Compactor;
 };
 const threads = new Map<string, Thread>();
+/** Turns planned or running per chat (alex-0230: a draining copy keeps those chats). */
+const busy = new Map<string, number>();
+let draining = false;
+/** Chats closed whose summary has not finished and lock not gone yet, by chat. */
+const closing = new Map<string, Promise<void>>();
 
 export type PerpetualDeps = {
   config?: () => PerpetualConfig | undefined;
@@ -109,6 +114,109 @@ let deps: PerpetualDeps = {};
 export function setPerpetualDeps(next: PerpetualDeps): void {
   deps = next;
   threads.clear();
+  busy.clear();
+  closing.clear();
+  draining = false;
+}
+
+/**
+ * Close a chat this copy no longer serves: no new summary starts, the one running
+ * finishes, then its lock goes. The drain waits for that (alex-0230 F3).
+ */
+function closeThread(threadId: string): void {
+  const thread = threads.get(threadId);
+  if (!thread) return;
+  threads.delete(threadId);
+  thread.compactor.stop();
+  const done: Promise<void> = thread.compactor
+    .idle()
+    .catch(() => {})
+    .then(() => thread.store.release())
+    .finally(() => {
+      if (closing.get(threadId) === done) closing.delete(threadId);
+    });
+  closing.set(threadId, done);
+}
+
+/**
+ * This copy is handing over (alex-0230): no summary starts, and each chat's lock
+ * goes as soon as it has no turn and no summary call running, so the next copy can
+ * open it. Resolves when every chat is released, including chats opened by requests
+ * accepted before the drain began.
+ */
+export async function drainPerpetual(): Promise<void> {
+  draining = true;
+  for (const thread of threads.values()) thread.compactor.stop();
+  for (const threadId of [...threads.keys()]) if (!busy.get(threadId)) closeThread(threadId);
+  while (threads.size || closing.size || [...busy.values()].some((n) => n > 0)) await Bun.sleep(200);
+}
+
+/** Turns planned or running here, plus chats still closing, for the drain. */
+export function perpetualBusy(): number {
+  return [...busy.values()].reduce((a, b) => a + b, 0) + closing.size;
+}
+
+function track(threadId: string, plan: PerpetualPlan): PerpetualPlan {
+  busy.set(threadId, (busy.get(threadId) ?? 0) + 1);
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    const left = (busy.get(threadId) ?? 1) - 1;
+    if (left > 0) busy.set(threadId, left);
+    else {
+      busy.delete(threadId);
+      if (draining) closeThread(threadId);
+    }
+  };
+  return {
+    request: plan.request,
+    run: async (runClaude, signal) => {
+      try {
+        return await plan.run(runClaude, signal);
+      } finally {
+        finish();
+      }
+    },
+  };
+}
+
+/** The request ended (Codex went away) while its chat was held by another copy. */
+export class PerpetualWaitAborted extends Error {}
+
+/**
+ * preparePerpetual, but a chat another live copy still holds (a handoff in
+ * progress) is waited for instead of being passed through raw: passing a perpetual
+ * chat through sends its whole history without the memory view (alex-0230 F6).
+ * The old copy lets go once its turn and summary end; a dead owner's lock is taken
+ * over at once. The wait ends only with `signal` (or `waitMs`, for tests), and then
+ * throws rather than run the chat without its memory.
+ *
+ * A copy that is itself draining never waits: the holder is the new copy, which
+ * keeps the chat. It throws at once and the request fails with a retryable 503;
+ * Codex's retry reaches the new copy (this one no longer listens), which has the
+ * memory (alex-0230 N3).
+ */
+export async function preparePerpetualWaiting(
+  request: ResponsesRequest,
+  { waitMs = Infinity, pollMs = 250, signal }: { waitMs?: number; pollMs?: number; signal?: AbortSignal } = {},
+): Promise<PerpetualPlan | undefined> {
+  const until = Date.now() + waitMs;
+  let logged = false;
+  for (;;) {
+    try {
+      return prepare(request);
+    } catch (error) {
+      if (!(error instanceof LockedError)) return preparePerpetual(request);
+      if (draining)
+        throw new PerpetualWaitAborted(`this copy is handing over and ${error.message}; retry reaches the new copy`);
+      if (signal?.aborted || Date.now() >= until)
+        throw new PerpetualWaitAborted(`perpetual chat still held by another copy: ${error.message}`);
+      if (!logged) console.log(`perpetual: ${error.message}; waiting for it to let go`);
+      logged = true;
+      await Bun.sleep(pollMs);
+    }
+  }
 }
 
 const root = () => deps.root ?? join(stateDir(), "perpetual");
@@ -117,6 +225,8 @@ const safeName = (threadId: string) => threadId.replace(/[^A-Za-z0-9_-]/g, "_");
 function openThread(threadId: string, config: PerpetualConfig): Thread {
   const existing = threads.get(threadId);
   if (existing) return existing;
+  // Still closing here (its summary finishing): wait for it, never open a second store.
+  if (closing.has(threadId)) throw new LockedError("perpetual chat is still closing in this copy");
   const store = new ThreadStore(join(root(), safeName(threadId)));
   const compactor = new Compactor(store, {
     threadId,
@@ -183,7 +293,7 @@ function prepare(request: ResponsesRequest): PerpetualPlan | undefined {
       }),
     };
   const thread = openThread(threadId, config);
-  return new Turn(thread, request, config).plan();
+  return track(threadId, new Turn(thread, request, config).plan());
 }
 
 /** Where the current turn starts: after the last final answer, or an aborted turn. */

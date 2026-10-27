@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { withLock } from "./filelock";
 import { stateDir } from "./sessions";
 
 /**
@@ -38,43 +39,74 @@ const linkedAt = new Map<string, number>();
  * restored from disk after a restart and not reported again since.
  */
 const lastInfo = new Map<string, { info: RateLimitInfo; at: number; stale?: boolean }>();
-/** The usage file `lastInfo` was restored from, once it has been (alex-0217). */
+/** The usage file `lastInfo` last synced from, and that file's mtime then (alex-0217, 0230). */
 let restoredFrom: string | undefined;
+let restoredMtime = -1;
+/** Reports older than this copy are from before its start: shown as stale. */
+let startedAt = Date.now();
 
 function usageFile(): string {
   return join(stateDir(), "account-usage.json");
 }
 
+type SavedUsage = Record<string, { info?: RateLimitInfo; at?: number }>;
+
+/** Take every account report on disk that is newer than ours. */
+function adopt(saved: SavedUsage): void {
+  for (const [name, entry] of Object.entries(saved ?? {})) {
+    if (!entry?.info || typeof entry.at !== "number") continue;
+    const mine = lastInfo.get(name);
+    if (mine && mine.at >= entry.at) continue;
+    lastInfo.set(name, { info: entry.info, at: entry.at, stale: entry.at < startedAt });
+  }
+}
+
 /**
- * Restore the last-known usage once per state dir, so percentages and the weekly
- * cap survive a restart instead of reading as unknown until each account is used.
+ * Load the last-known usage, so percentages and the weekly cap survive a restart
+ * instead of reading as unknown until each account is used. Re-read whenever the
+ * file changes: during a handoff the other copy may have seen a newer report, and
+ * routing and caps must use it (alex-0230).
  */
 function restoreUsage(): void {
   const file = usageFile();
-  if (restoredFrom === file) return;
-  restoredFrom = file;
-  let saved: Record<string, { info?: RateLimitInfo; at?: number }>;
+  let mtime: number;
   try {
-    saved = JSON.parse(readFileSync(file, "utf8"));
+    mtime = statSync(file).mtimeMs;
   } catch {
+    restoredFrom = file;
     return;
   }
-  for (const [name, entry] of Object.entries(saved ?? {})) {
-    if (lastInfo.has(name) || !entry?.info || typeof entry.at !== "number") continue;
-    lastInfo.set(name, { info: entry.info, at: entry.at, stale: true });
+  if (restoredFrom === file && restoredMtime === mtime) return;
+  try {
+    adopt(JSON.parse(readFileSync(file, "utf8")));
+  } catch {
+    return; // mid-replace or damaged: try again next time
   }
+  restoredFrom = file;
+  restoredMtime = mtime;
 }
 
 function saveUsage(): void {
   const file = usageFile();
-  const next = `${file}.next`;
+  const next = `${file}.${process.pid}.next`;
   try {
     mkdirSync(stateDir(), { recursive: true });
-    const data = Object.fromEntries(
-      [...lastInfo].map(([name, { info, at }]) => [name, { info, at }]),
-    );
-    writeFileSync(next, JSON.stringify(data));
-    renameSync(next, file);
+    // Two copies run at once during a handoff (alex-0230). Read, merge and replace
+    // under one cross-process lock, newest report per account winning, so neither
+    // copy rolls the other's fresher numbers back.
+    withLock(`${file}.lock`, () => {
+      let onDisk: SavedUsage = {};
+      try {
+        onDisk = JSON.parse(readFileSync(file, "utf8"));
+      } catch {}
+      adopt(onDisk);
+      const data: Record<string, { info: RateLimitInfo; at: number }> = {};
+      for (const [name, { info, at }] of lastInfo) data[name] = { info, at };
+      writeFileSync(next, JSON.stringify(data));
+      renameSync(next, file);
+      restoredFrom = file;
+      restoredMtime = statSync(file).mtimeMs;
+    });
   } catch (error) {
     console.error("Unable to save Claude account usage:", (error as Error).message);
   }
@@ -266,10 +298,14 @@ export type RateLimitInfo = {
 };
 
 /** Apply a stream-json `rate_limit_event`; only "rejected" blocks the account. */
-export function observeRateLimit(account: Account, info: RateLimitInfo): void {
+export function observeRateLimit(account: Account, info: RateLimitInfo, at = Date.now()): void {
   restoreUsage();
-  lastInfo.set(account.name, { info, at: Date.now() });
-  saveUsage();
+  const mine = lastInfo.get(account.name);
+  // A probe passes the time it started: a turn that reported after that is newer.
+  if (!mine || mine.at <= at) {
+    lastInfo.set(account.name, { info, at });
+    saveUsage();
+  }
   if (info.status !== "rejected") return;
   markLimited(
     account,
@@ -354,4 +390,7 @@ export function resetAccountState(): void {
   linkedAt.clear();
   lastInfo.clear();
   restoredFrom = undefined;
+  restoredMtime = -1;
+  // A restart: every report already on disk is from before it.
+  startedAt = Date.now() + 1;
 }

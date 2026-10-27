@@ -136,9 +136,10 @@ test("omits repeated developer context on a live continuation", async () => {
 
 describe("HTTP app", () => {
   test("serves health and models", async () => {
-    expect(
-      await (await handleRequest(new Request("http://local/health"))).json(),
-    ).toEqual({ status: "ok" });
+    // alex-0230: health also says which commit this copy runs and whether it drains.
+    const health = await (await handleRequest(new Request("http://local/health"))).json();
+    expect(health).toMatchObject({ status: "ok", draining: false, pid: process.pid });
+    expect(typeof health.commit).toBe("string");
     const models = (await (
       await handleRequest(new Request("http://local/v1/models"))
     ).json()) as { data: unknown[]; models: Array<Record<string, unknown>> };

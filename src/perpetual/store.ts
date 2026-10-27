@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { emptyView, type ViewState } from "./view";
+import { tryLock, unlock } from "../filelock";
 
 /**
  * One perpetual chat on disk (gist section 1):
@@ -111,45 +112,17 @@ function readJson<T>(path: string, fallback: T): T {
   }
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-const heldLocks = new Set<string>();
-process.on("exit", () => {
-  for (const path of heldLocks)
-    try {
-      unlinkSync(path);
-    } catch {}
-});
-
-/** Takes the chat's lock for this process; a dead owner's lock is reclaimed. */
+/**
+ * Takes the chat's lock for this process (a kernel flock, see filelock). Holds are
+ * counted, so a store that closes can never drop the lock of another store of the
+ * same chat in this process (alex-0230 N2).
+ */
 function acquireLock(path: string): void {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(path, "wx", 0o600);
-      writeSync(fd, String(process.pid));
-      closeSync(fd);
-      heldLocks.add(path);
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-    const owner = Number(readFileSync(path, "utf8").trim());
-    if (owner === process.pid) {
-      heldLocks.add(path);
-      return;
-    }
-    if (owner > 0 && processAlive(owner))
-      throw new LockedError(`perpetual chat is owned by process ${owner}`);
-    unlinkSync(path);
-  }
-  throw new LockedError("perpetual chat lock is contended");
+  const taken = tryLock(path);
+  if (taken.held) return;
+  throw new LockedError(
+    taken.owner ? `perpetual chat is owned by process ${taken.owner}` : "perpetual chat lock is contended",
+  );
 }
 
 export class ThreadStore {
@@ -161,6 +134,15 @@ export class ThreadStore {
   view: ViewState;
   cview: ViewState;
   private state: ThreadState;
+
+  private locked = true;
+
+  /** Lets another process open this chat (its log is already on disk). Once. */
+  release(): void {
+    if (!this.locked) return;
+    this.locked = false;
+    unlock(join(this.dir, "lock"));
+  }
 
   constructor(readonly dir: string) {
     mkdirSync(join(dir, "images"), { recursive: true, mode: 0o700 });

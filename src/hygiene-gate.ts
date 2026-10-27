@@ -65,6 +65,7 @@ import {
   sha256,
   type Classifier,
 } from "./hygiene-proof";
+import { tryLock, unlock } from "./filelock";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -158,8 +159,27 @@ export function resetGateCache(): void {
 }
 
 let queue: Promise<unknown> = Promise.resolve();
+
+/**
+ * Hold the gate's cross-process lock for a whole decision (alex-0230 F7): during a
+ * handoff two copies run, and each reads the state, awaits a photo check, then
+ * writes. Without this, the slower one would write its stale copy over the other's
+ * proofs and rulings. A dead holder's lock is taken over (filelock).
+ */
+async function withStateLock<T>(work: () => Promise<T>): Promise<T> {
+  const path = `${statePath()}.lock`;
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  while (!tryLock(path).held) await Bun.sleep(25);
+  try {
+    return await work();
+  } finally {
+    unlock(path);
+  }
+}
+
 function serialized<T>(work: () => Promise<T>): Promise<T> {
-  const run = queue.then(work, work);
+  const locked = () => withStateLock(work);
+  const run = queue.then(locked, locked);
   queue = run.catch(() => {});
   return run;
 }

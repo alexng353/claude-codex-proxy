@@ -525,8 +525,14 @@ test("the log is append-only and owned by one process", async () => {
   store.append([{ kind: "user", text: "two", key: "k2" }]);
   expect(readFileSync(file, "utf8").startsWith(first)).toBe(true);
   // Another live process holds the lock: opening fails.
-  await writeFile(join(dir, "lock"), String(process.ppid));
-  expect(() => new ThreadStore(dir)).toThrow(/owned by process/);
+  store.release();
+  const other = Bun.spawn(["flock", "-o", join(dir, "lock"), "sleep", "30"], {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  await Bun.sleep(150);
+  expect(() => new ThreadStore(dir)).toThrow(/owned by process|contended/);
+  other.kill("SIGKILL");
+  await other.exited;
   // A dead owner's lock is reclaimed.
   await writeFile(join(dir, "lock"), "999999999");
   expect(new ThreadStore(dir).length).toBe(2);

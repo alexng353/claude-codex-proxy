@@ -91,3 +91,35 @@ test("a restored window that has since reset is dropped", async () => {
   expect(isUnavailable(martin)).toBe(false);
   expect(accountStatus().find((a) => a.name === "martin")!.windows).toEqual({});
 });
+
+// alex-0230: during a handoff another proxy copy writes the same usage file.
+test("another copy's newer report is used for caps and never rolled back", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=50";
+  const [hinson, martin] = ["hinson", "martin"].map((n) => listAccounts().find((a) => a.name === n)!);
+  observeRateLimit(martin, week(0.3));
+  expect(isUnavailable(martin)).toBe(false);
+  // The other copy saw martin cross its cap a moment later and saved it.
+  const file = join(process.env.PROXY_STATE_DIR!, "account-usage.json");
+  const onDisk = JSON.parse(await Bun.file(file).text());
+  onDisk.martin = { info: week(0.6), at: Date.now() + 5 };
+  await Bun.sleep(10);
+  await writeFile(file, JSON.stringify(onDisk));
+  expect(isUnavailable(martin)).toBe(true);
+  // Our next save (another account) keeps it.
+  observeRateLimit(hinson, week(0.1));
+  const saved = JSON.parse(await Bun.file(file).text());
+  expect(saved.martin.info.unifiedWindows.seven_day.utilization).toBe(0.6);
+  expect(saved.hinson.info.unifiedWindows.seven_day.utilization).toBe(0.1);
+  expect(accountStatus().find((a) => a.name === "martin")!.stale).toBe(false);
+});
+
+test("a probe that started before a turn's report does not replace it", async () => {
+  await setup();
+  const martin = listAccounts().find((a) => a.name === "martin")!;
+  const probeStarted = Date.now();
+  await Bun.sleep(5);
+  observeRateLimit(martin, week(0.4)); // a real turn, during the probe
+  observeRateLimit(martin, week(0.2), probeStarted); // the probe lands late
+  expect(accountStatus().find((a) => a.name === "martin")!.windows.seven_day?.usedPercent).toBe(40);
+});

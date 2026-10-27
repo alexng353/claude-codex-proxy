@@ -65,6 +65,8 @@ export class Compactor {
   private readonly queued = new Set<string>();
   private leafCursor = 0;
   private readonly waiters: Array<() => void> = [];
+  /** Set while this copy drains (alex-0230): calls running finish, none start. */
+  private stopped = false;
   private readonly concurrency: number;
   private readonly now: () => number;
 
@@ -80,11 +82,17 @@ export class Compactor {
 
   /** Starts whatever work is ready. Called after every logged message. */
   kick(): void {
-    for (;;) {
+    for (; !this.stopped; ) {
       const next = this.nextTask();
       if (!next) break;
       this.start(next);
     }
+    if (this.inflight.size === 0) for (const resolve of this.waiters.splice(0)) resolve();
+  }
+
+  /** Starts no more calls; the next copy picks the work up from disk. */
+  stop(): void {
+    this.stopped = true;
     if (this.inflight.size === 0) for (const resolve of this.waiters.splice(0)) resolve();
   }
 
