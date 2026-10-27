@@ -185,6 +185,13 @@ describe("structured credential files", () => {
     expect(credentialEntriesFromKeyFile(armor("PUBLIC"))).toEqual([]);
   });
 
+  test("a bare one-line API key file is its secret (alex-0229)", () => {
+    const key = "ak" + "_" + repeat("FAKEapiKEY9", 40);
+    expect(credentialEntriesFromKeyFile(`${key}\n`)).toEqual([["API_KEY", key]]);
+    expect(credentialEntriesFromKeyFile("short\n")).toEqual([]);
+    expect(credentialEntriesFromKeyFile("two words here and more\n")).toEqual([]);
+  });
+
   test("PGP private key blocks are redacted by shape, whole or truncated", () => {
     const s = createScrubber({ files: [] });
     const whole = s.scrub(`a\n${armor("PRIVATE")}\nb`);

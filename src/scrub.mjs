@@ -205,7 +205,12 @@ export function credentialEntriesFromToml(text) {
  * anything else yield nothing.
  */
 export function credentialEntriesFromKeyFile(text) {
-  if (!/-----BEGIN [A-Z0-9 ]*PRIVATE KEY/.test(text)) return [];
+  if (!/-----BEGIN [A-Z0-9 ]*PRIVATE KEY/.test(text)) {
+    // A bare API key file (`~/.config/today/abliteration.key`, alex-0229): one
+    // token on one line is that secret.
+    const value = text.trim();
+    return value.length >= 16 && /^[\x21-\x7e]+$/.test(value) ? [["API_KEY", value]] : [];
+  }
   const entries = [];
   for (const line of text.split("\n")) {
     const body = line.trim();
@@ -306,6 +311,8 @@ export function defaultSecretFiles(env = process.env) {
     join(home, ".config/.wrangler/config/default.toml"),
     join(home, ".config/agent-gate/client.json"),
     join(home, ".config/envx/keys/*/private.key"),
+    // alex-0229: Today's abliteration.ai key (codex-model-router reads it).
+    join(home, ".config/today/abliteration.key"),
   ];
 }
 
