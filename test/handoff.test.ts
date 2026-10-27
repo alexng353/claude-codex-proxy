@@ -121,3 +121,18 @@ test("a draining copy neither reopens a closing chat nor waits on the new copy",
   await drain;
   expect(lockOwner(join(root, "t6", "lock"))).toBeUndefined();
 });
+
+test("while the old single copy drains (first move), a perpetual chat waits for it to exit", async () => {
+  const legacy = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] });
+  process.env.LEGACY_PID = String(legacy.pid);
+  try {
+    setTimeout(() => legacy.kill("SIGKILL"), 300);
+    const started = Date.now();
+    const plan = await preparePerpetualWaiting(request("t7"), { waitMs: 5_000, pollMs: 50 });
+    expect(plan).toBeDefined();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(250);
+    expect(lockOwner(join(root, "t7", "lock"))).toBe(process.pid);
+  } finally {
+    delete process.env.LEGACY_PID;
+  }
+});

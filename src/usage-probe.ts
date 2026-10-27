@@ -19,6 +19,7 @@ import {
   type RateLimitInfo,
 } from "./accounts";
 import { tryLock, unlock } from "./filelock";
+import { legacyRunning } from "./handoff";
 import { stateDir } from "./sessions";
 
 export type ProbeWindow = { usedPercent: number; resetsAt: string | null };
@@ -218,6 +219,11 @@ export function startUsageProbe(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stopped = false;
   const tick = async () => {
+    // The old copy (first move) probes without the lease: wait until it is gone.
+    if (legacyRunning(env)) {
+      if (!stopped) schedule(30_000);
+      return;
+    }
     const outcomes = await probeAllAccounts().catch(() => []);
     if (outcomes.length)
       console.log(`Usage probe: ${outcomes.map((o) => `${o.account} ${o.result}`).join(", ")}`);

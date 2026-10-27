@@ -8,6 +8,7 @@ import {
   leadingContextCount,
   textFromContent,
 } from "../request";
+import { legacyRunning } from "../handoff";
 import { stateDir } from "../sessions";
 import type {
   ProxyOutput,
@@ -227,6 +228,8 @@ function openThread(threadId: string, config: PerpetualConfig): Thread {
   if (existing) return existing;
   // Still closing here (its summary finishing): wait for it, never open a second store.
   if (closing.has(threadId)) throw new LockedError("perpetual chat is still closing in this copy");
+  // The old copy's pid locks don't mix with flock: no chat lock until it is gone.
+  if (legacyRunning()) throw new LockedError("the old proxy copy is still draining");
   const store = new ThreadStore(join(root(), safeName(threadId)));
   const compactor = new Compactor(store, {
     threadId,

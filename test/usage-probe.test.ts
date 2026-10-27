@@ -187,3 +187,14 @@ test("a batch skipped for another copy's lease does not stop later probes", asyn
   await other.exited;
   expect(await probeAllAccounts()).toEqual([{ account: "default", result: "applied" }]);
 });
+
+test("no probe runs while the old single copy (first move) is still draining", async () => {
+  await fakeCli();
+  const legacy = Bun.spawn(["sleep", "30"], { stdio: ["ignore", "ignore", "ignore"] });
+  const stop = startUsageProbe({ USAGE_PROBE_INITIAL_DELAY_MS: "0", LEGACY_PID: String(legacy.pid) });
+  await Bun.sleep(400);
+  stop();
+  legacy.kill("SIGKILL");
+  expect(accountStatus()[0].observedAt).toBeNull();
+  expect(existsSync(join(root, "calls"))).toBe(false);
+});

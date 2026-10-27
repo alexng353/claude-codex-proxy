@@ -28,6 +28,23 @@ export function isDraining(): boolean {
   return draining;
 }
 
+/**
+ * The first move off the old single-copy units (alex-0230): `LEGACY_PID` names the
+ * old copy, which locks perpetual chats by pid alone and probes without the shared
+ * lease. While it runs, this copy takes no chat lock and runs no probe, so the two
+ * protocols never share a lock or an account directory.
+ */
+export function legacyRunning(env: Record<string, string | undefined> = process.env): boolean {
+  const pid = Number(env.LEGACY_PID);
+  if (!(pid > 0)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 export function healthInfo(pending?: number) {
   return {
     status: "ok",
