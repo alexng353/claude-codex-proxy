@@ -46,6 +46,9 @@ test("another process's lock holds until that process dies", async () => {
 test("a pre-flock copy's pid lock is honoured while it runs", async () => {
   const path = join(await dir(), "lock");
   const legacy = Bun.spawn([process.execPath, "-e", "await Bun.sleep(30000)"]);
+  // Until it has exec'd, its cmdline is empty (a real old copy has run for hours).
+  for (let i = 0; i < 100 && !(await Bun.file(`/proc/${legacy.pid}/cmdline`).text()).includes("bun"); i++)
+    await Bun.sleep(10);
   writeFileSync(path, String(legacy.pid));
   expect(tryLock(path)).toEqual({ held: false, owner: legacy.pid });
   legacy.kill();
