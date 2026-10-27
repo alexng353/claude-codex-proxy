@@ -16,6 +16,7 @@ import {
   isAuthError,
   markAuthFailed,
   markLimited,
+  markTurn,
   observeRateLimit,
   pickAccount,
   soonestAccount,
@@ -350,6 +351,8 @@ class ClaudeWorker {
       throw new Error("Claude CLI worker is already processing a turn");
     this.turn = turn;
     turn.account = this.account;
+    // The account actually serving this attempt (a reused worker, a failover).
+    markTurn(this.account);
     this.attempt = attempt;
     this.workerTurn++;
     idleWorkers.delete(this);

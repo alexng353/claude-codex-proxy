@@ -6,6 +6,7 @@ import {
   accountStatus,
   isUnavailable,
   listAccounts,
+  markTurn,
   observeRateLimit,
   pickAccount,
   resetAccountState,
@@ -60,6 +61,21 @@ test("weekly cap benches an account at its threshold", async () => {
   // A reading whose window already reset no longer counts.
   observeRateLimit(martin, week(0.9, Date.now() / 1000 - 1));
   expect(pickAccount()?.name).toBe("martin");
+});
+
+// alex-0234: the window's green dot is the account a new unpinned turn takes now.
+test("exactly one account is active: the one a turn would pick, past the caps", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_ORDER = "martin,default";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=50";
+  const active = () => accountStatus().filter((a) => a.active).map((a) => a.name);
+  expect(active()).toEqual(["martin"]);
+  const martin = listAccounts()[0];
+  observeRateLimit(martin, week(0.6));
+  expect(active()).toEqual(["default"]);
+  expect(accountStatus().every((a) => a.lastTurnAt === null)).toBe(true);
+  markTurn(martin);
+  expect(accountStatus().find((a) => a.name === "martin")!.lastTurnAt).not.toBeNull();
 });
 
 test("last-known usage survives a restart, marked stale, and still caps", async () => {

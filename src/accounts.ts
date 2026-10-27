@@ -32,6 +32,12 @@ const FALLBACK_LIMIT_MS = 15 * 60_000;
 
 const limitedUntil = new Map<string, number>();
 const authFailedUntil = new Map<string, number>();
+/** When each account last started a turn in this process (`/accounts` lastTurnAt). */
+const lastTurn = new Map<string, number>();
+
+export function markTurn(account: Account): void {
+  lastTurn.set(account.name, Date.now());
+}
 const failedCredentials = new Map<string, string>();
 const linkedAt = new Map<string, number>();
 /**
@@ -322,15 +328,26 @@ export function isLimitError(status: unknown, text: string | undefined): boolean
 
 export function accountStatus() {
   const now = Date.now();
+  // The account a new unpinned turn takes now (the window's green dot, alex-0234):
+  // the same choice the turn makes, not the configured order.
+  let active: string | undefined;
+  try {
+    active = (pickAccount() ?? soonestAccount()).name;
+  } catch {
+    active = undefined;
+  }
   return listAccounts().map((account) => {
     isAuthBlocked(account, now);
     const until = limitedUntil.get(account.name) ?? 0;
     const seen = seenInfo(account.name, now);
     const authUntil = authFailedUntil.get(account.name) ?? 0;
     const windows = seen?.info.unifiedWindows ?? {};
+    const served = lastTurn.get(account.name);
     return {
       name: account.name,
       dir: account.dir,
+      active: account.name === active,
+      lastTurnAt: served ? new Date(served).toISOString() : null,
       limitedUntil: until > now ? new Date(until).toISOString() : null,
       authFailedUntil: authUntil > now ? new Date(authUntil).toISOString() : null,
       observedAt: seen ? new Date(seen.at).toISOString() : null,
@@ -389,6 +406,7 @@ export function resetAccountState(): void {
   failedCredentials.clear();
   linkedAt.clear();
   lastInfo.clear();
+  lastTurn.clear();
   restoredFrom = undefined;
   restoredMtime = -1;
   // A restart: every report already on disk is from before it.
