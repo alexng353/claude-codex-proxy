@@ -76,6 +76,29 @@ describe("loading", () => {
     expect(loadSecretFile(join(directory, "absent.zsh")).size).toBe(0);
   });
 
+  test("commented-out exports in shell files stay redacted", () => {
+    const retired = "FAKE-retired-" + repeat("r3T1", 20);
+    const file = join(directory, "retired.zsh");
+    writeFileSync(
+      file,
+      [
+        "# 2026-10-26: disabled, shadows another login",
+        `# export RETIRED_API_TOKEN=${retired}`,
+        `#export QUOTED_SECRET="${retired}-q"`,
+        "# export DERIVED_TOKEN=$OTHER_TOKEN",
+        "# just a comment about export FOO=bar baz",
+      ].join("\n"),
+    );
+    // The shell loader also reports SHLVL; isSecretValue drops it later.
+    expect(loadSecretEntries(file).filter(([name]) => name !== "SHLVL")).toEqual([
+      ["RETIRED_API_TOKEN", retired],
+      ["QUOTED_SECRET", `${retired}-q`],
+    ]);
+    expect(createScrubber({ files: [file] }).scrub(`saw ${retired} once`)).toBe(
+      "saw [REDACTED:RETIRED_API_TOKEN] once",
+    );
+  });
+
   test("keeps ordinary config readable", () => {
     expect(isSecretValue("PORT", "8080")).toBe(false);
     expect(isSecretValue("DATA_DIR", "/home/someone/.local/share/thing")).toBe(false);

@@ -118,6 +118,20 @@ function loadDotenvFile(file) {
   return vars;
 }
 
+/**
+ * `# export NAME=value` lines in a shell file. A credential that was disabled
+ * by commenting it out is still a credential until it is revoked, and copies
+ * of it may sit in old transcripts or shell snapshots. Literal values only.
+ */
+function commentedExports(file) {
+  const entries = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    const match = /^\s*#+\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=("[^"$`\\]*"|'[^']*'|[^\s"'$`\\]+)\s*$/.exec(line);
+    if (match) entries.push([match[1], unquote(match[2])]);
+  }
+  return entries;
+}
+
 function unquote(value) {
   if (/^"(?:[^"\\]|\\.)*"$/.test(value)) {
     try {
@@ -208,7 +222,7 @@ export function loadSecretEntries(file) {
     return [];
   }
   try {
-    if (/\.(zsh|sh|bash)$/.test(file)) return [...loadShellFile(file)];
+    if (/\.(zsh|sh|bash)$/.test(file)) return [...loadShellFile(file), ...commentedExports(file)];
     if (/\.(json|toml|ya?ml|key|asc|pem)$/.test(file)) {
       const text = readFileSync(file, "utf8");
       if (file.endsWith(".json")) return credentialEntriesFromJson(text);
