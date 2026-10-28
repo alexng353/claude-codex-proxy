@@ -8,6 +8,7 @@ import {
   applyProbe,
   parseUsageReport,
   probeAllAccounts,
+  probeAccount,
   resetUsageProbe,
   startUsageProbe,
   toRateLimitInfo,
@@ -197,4 +198,64 @@ test("no probe runs while the old single copy (first move) is still draining", a
   legacy.kill("SIGKILL");
   expect(accountStatus()[0].observedAt).toBeNull();
   expect(existsSync(join(root, "calls"))).toBe(false);
+});
+
+for (const failure of ['stderr', 'result', 'status', 'network'] as const) {
+  test(`probe distinguishes ${failure} failures and recovers auth state`, async () => {
+    await fakeCli();
+    const cli = join(root, 'claude');
+    const body = await readFile(cli, 'utf8');
+    const error = failure === 'network' ? 'Connection timed out' : 'Not logged in';
+    const emit = failure === 'stderr' || failure === 'network'
+      ? `console.error(${JSON.stringify(error)}); process.exit(1);`
+      : `console.log(JSON.stringify({type:'result', is_error:true, ${failure === 'status' ? 'api_error_status:401' : 'errors:["OAuth token refresh failed: invalid_grant"]'}})); process.exit(0);`;
+    await writeFile(cli, body.replace('const weekly =', `${emit}\nconst weekly =`));
+    const [outcome] = await probeAllAccounts();
+    if (failure === 'network') {
+      expect(outcome.result).toBe('unavailable');
+      expect((accountStatus()[0] as any).authFailedSince).toBeNull();
+    } else {
+      expect(outcome.result).toStartWith('auth failed since ');
+      expect((accountStatus()[0] as any).authFailedSince).toBeString();
+      await fakeCli();
+      expect((await probeAccount(listAccounts()[0], async () => 'healthy')).result).toBe('applied');
+      expect((accountStatus()[0] as any).authFailedSince).toBeNull();
+      expect(accountStatus()[0].authFailedUntil).toBeNull();
+    }
+  });
+}
+
+test('keepalive visits capped and exhausted accounts without a model turn and uses a stub warning sender', async () => {
+  const { loginKeepalive } = await import('../scripts/login-keepalive');
+  await fakeCli();
+  const second = join(root, 'state/accounts/second');
+  await mkdir(second, { recursive: true });
+  await writeFile(join(second, '.credentials.json'), JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: Date.now() + HOUR } }));
+  const oldCaps = process.env.CLAUDE_ACCOUNT_WEEKLY_CAP;
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = 'second=50';
+  process.env.CLAUDE_ACCOUNT_ORDER = 'default';
+  observeRateLimit(listAccounts()[1], { status: 'rejected', resetsAt: Math.floor((Date.now() + HOUR) / 1000), unifiedWindows: { seven_day: { utilization: 1 } } });
+  const warnings: string[] = [];
+  try {
+    const result = await loginKeepalive(async (message) => { warnings.push(message); return true; });
+    expect(result.map((r) => r.account)).toEqual(['default', 'second']);
+    expect(warnings).toHaveLength(1);
+    const calls = (await readFile(join(root, 'calls'), 'utf8')).trim().split('\n').map((s) => JSON.parse(s));
+    expect(calls.every((c) => c.args.includes('/usage') && !c.args.includes('--model'))).toBe(true);
+  } finally {
+    if (oldCaps === undefined) delete process.env.CLAUDE_ACCOUNT_WEEKLY_CAP;
+    else process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = oldCaps;
+  }
+});
+
+
+test('a cached usage report cannot end an authentication incident without validation', async () => {
+  const { markAuthFailed } = await import('../src/accounts');
+  await fakeCli();
+  const account = listAccounts()[0];
+  markAuthFailed(account);
+  const since = accountStatus()[0].authFailedSince;
+  expect((await probeAccount(account, async () => 'unknown')).result).toBe(`auth failed since ${since}`);
+  expect(accountStatus()[0].authFailedSince).toBe(since);
+  expect((await probeAccount(account, async () => 'failed')).result).toBe(`auth failed since ${since}`);
 });

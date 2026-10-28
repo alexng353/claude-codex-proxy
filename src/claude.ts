@@ -1,3 +1,4 @@
+import { markAuthHealthy } from "./auth-health";
 import { normalizeContext } from "./context.mjs";
 import {
   mkdirSync,
@@ -15,6 +16,7 @@ import {
   isUnavailable,
   isAuthError,
   markAuthFailed,
+  clearAuthFailure,
   markLimited,
   markTurn,
   observeRateLimit,
@@ -488,6 +490,7 @@ class ClaudeWorker {
       return;
     }
     if (event?.type !== "result" || !this.pending) return;
+    if (!event.is_error) { markAuthHealthy(this.account); clearAuthFailure(this.account); }
     // The model sometimes answers in plain text and then submits StructuredOutput
     // with empty text; keep the answer instead of returning nothing to Codex.
     const output = event.structured_output;

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
 import { closeIdleWorkers } from "./claude";
 import { healthInfo, isDraining, runningCommit, setDraining } from "./handoff";
@@ -29,6 +30,7 @@ const own = healthPort
   : undefined;
 // Idle accounts have no turn headers; /usage fills their meters for routing and caps.
 const stopProbe = startUsageProbe();
+const stopWarnings = startAuthWarnings();
 
 /**
  * Hand over (alex-0230): stop accepting, start no new work (the usage probe, idle
@@ -42,6 +44,7 @@ async function drain(signal: string): Promise<void> {
   console.log(`Draining on ${signal}: ${server.pendingRequests} open requests`);
   let probeDone = false;
   void stopProbe().finally(() => (probeDone = true));
+  const warningsDone = stopWarnings();
   closeIdleWorkers();
   let memoryDone = false;
   void drainPerpetual().finally(() => (memoryDone = true));
@@ -58,6 +61,7 @@ async function drain(signal: string): Promise<void> {
     }
   }
   closeIdleWorkers();
+  await warningsDone;
   console.log("Drained: every request finished");
   own?.stop(true);
   process.exit(0);

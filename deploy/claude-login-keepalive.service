@@ -1,0 +1,13 @@
+[Unit]
+Description=Refresh Claude subscription logins and warn about sign-in failures
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@CHECKOUT@
+ExecStart=@BUN@ @CHECKOUT@/scripts/login-keepalive.ts
+Environment=CLAUDE_BIN=@CLAUDE@
+EnvironmentFile=-%h/.config/claude-codex-proxy/keepalive.env
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDECODE CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
+UMask=0077
+TimeoutStartSec=10min

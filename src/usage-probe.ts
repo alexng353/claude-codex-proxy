@@ -8,10 +8,14 @@
  * timer, and feeds the result through `observeRateLimit` like a turn's report.
  * The parsing matches `scripts/limits.ts --probe`.
  */
+import { authHealth, checkAuthExpiry, markAuthHealthy, validateSubscriptionAuth } from "./auth-health";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   accountEnv,
+  isAuthError,
+  markAuthFailed,
+  clearAuthFailure,
   accountStatus,
   listAccounts,
   observeRateLimit,
@@ -27,7 +31,7 @@ export type ProbeWindow = { usedPercent: number; resetsAt: string | null };
 const DEFAULT_INTERVAL_MS = 12 * 60_000;
 const DEFAULT_INITIAL_DELAY_MS = 15_000;
 const PROBE_TIMEOUT_MS = 15_000;
-const STRIPPED_ENV = ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
+const STRIPPED_ENV = ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"];
 
 /** Windows from `claude -p /usage --output-format stream-json`, keyed like `rate_limit_event`. */
 export function parseUsageReport(text: string): Record<string, ProbeWindow> | undefined {
@@ -101,17 +105,17 @@ export function applyProbe(
   return true;
 }
 
-type RunResult = { text: string; code: number | null; timedOut: boolean };
+type RunResult = { text: string; stderr: string; code: number | null; timedOut: boolean };
 
 async function runClaude(account: Account, args: string[], timeoutMs: number): Promise<RunResult> {
   const env = { ...process.env, ...accountEnv(account) } as Record<string, string>;
   for (const key of STRIPPED_ENV) delete env[key];
   const child = Bun.spawn([process.env.CLAUDE_BIN ?? "claude", ...args], {
     env,
-    cwd: "/tmp",
+    cwd: stateDir(),
     stdin: "ignore",
     stdout: "pipe",
-    stderr: "ignore",
+    stderr: "pipe",
     detached: process.platform !== "win32",
   });
   let timedOut = false;
@@ -125,10 +129,10 @@ async function runClaude(account: Account, args: string[], timeoutMs: number): P
     }
   }, timeoutMs);
   try {
-    const [text, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-    return { text, code, timedOut };
+    const [text, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { text, stderr, code, timedOut };
   } catch {
-    return { text: "", code: null, timedOut };
+    return { text: "", stderr: "", code: null, timedOut };
   } finally {
     clearTimeout(timer);
   }
@@ -147,10 +151,14 @@ async function supportsUsage(account: Account): Promise<boolean> {
   return usageSupported;
 }
 
-export type ProbeOutcome = { account: string; result: "applied" | "newer data" | "unavailable" };
+export type ProbeOutcome = { account: string; result: "applied" | "newer data" | "unavailable" | `auth failed since ${string}` };
 
 /** Probe one account and record what it reports. */
-export async function probeAccount(account: Account): Promise<ProbeOutcome> {
+export async function probeAccount(
+  account: Account,
+  validate: typeof validateSubscriptionAuth = validateSubscriptionAuth,
+): Promise<ProbeOutcome> {
+  checkAuthExpiry(account);
   if (!(await supportsUsage(account))) return { account: account.name, result: "unavailable" };
   const startedAt = Date.now();
   const result = await runClaude(
@@ -159,8 +167,33 @@ export async function probeAccount(account: Account): Promise<ProbeOutcome> {
       "--safe-mode", "--tools", "", "--strict-mcp-config"],
     PROBE_TIMEOUT_MS,
   );
+  let authError = isAuthError(undefined, result.stderr);
+  for (const line of result.text.split("\n")) {
+    try {
+      const event = JSON.parse(line);
+      if (event?.type === "result" && event.is_error) {
+        const message = [event.result, ...(Array.isArray(event.errors) ? event.errors : [])]
+          .filter((value) => typeof value === "string").join("\n");
+        authError ||= isAuthError(event.api_error_status, message);
+      }
+    } catch {}
+  }
+  checkAuthExpiry(account);
+  if (authError) {
+    markAuthFailed(account);
+    return { account: account.name, result: `auth failed since ${authHealth(account).authFailedSince ?? new Date().toISOString()}` };
+  }
   const windows = !result.timedOut && result.code === 0 ? parseUsageReport(result.text) : undefined;
-  if (!windows) return { account: account.name, result: "unavailable" };
+  if (!windows || authHealth(account).authFailedSince) {
+    const validation = await validate(account);
+    if (validation === "failed") markAuthFailed(account);
+    if (validation === "healthy") { markAuthHealthy(account); clearAuthFailure(account); }
+    const since = authHealth(account).authFailedSince;
+    if (since || !windows)
+      return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable" };
+  }
+  markAuthHealthy(account);
+  clearAuthFailure(account);
   return { account: account.name, result: applyProbe(account, windows, startedAt) ? "applied" : "newer data" };
 }
 

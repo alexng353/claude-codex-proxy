@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { authHealth, recordAuthFailure } from "./auth-health";
 import { withLock } from "./filelock";
 import { stateDir } from "./sessions";
 
@@ -253,15 +254,22 @@ export function isUnavailable(account: Account, now = Date.now()): boolean {
   return isAuthBlocked(account, now) || isLimited(account, now) || isOverWeeklyCap(account, now);
 }
 
+/** Successful requests clear the cooldown immediately, including within one process. */
+export function clearAuthFailure(account: Account): void {
+  authFailedUntil.delete(account.name);
+  failedCredentials.delete(account.name);
+}
+
 /** Authentication can recover after a CLI refresh or a new login. */
 export function markAuthFailed(account: Account): void {
+  recordAuthFailure(account);
   authFailedUntil.set(account.name, Date.now() + FALLBACK_LIMIT_MS);
   failedCredentials.set(account.name, credentialVersion(account));
   console.error(`Claude account ${account.name} authentication failed; skipping for 15 minutes`);
 }
 
 export function isAuthError(status: unknown, text: string | undefined): boolean {
-  return status === 401 || /(?:API Error:\s*401\b|failed to authenticate|authentication failed on every account|OAuth (?:access )?token (?:has expired|is invalid)|invalid authentication credentials|not logged in[.\s].*login)/i.test(text ?? "");
+  return status === 401 || /(?:API Error:\s*401\b|failed to authenticate|authentication failed on every account|OAuth (?:access )?token (?:has expired|is invalid)|invalid authentication credentials|invalid_grant|refresh token (?:has expired|is invalid|expired|revoked)|not logged in\b)/i.test(text ?? "");
 }
 
 /** First account in order that can serve a request, or undefined if none. */
@@ -349,6 +357,7 @@ export function accountStatus() {
       active: account.name === active,
       lastTurnAt: served ? new Date(served).toISOString() : null,
       limitedUntil: until > now ? new Date(until).toISOString() : null,
+      ...authHealth(account),
       authFailedUntil: authUntil > now ? new Date(authUntil).toISOString() : null,
       observedAt: seen ? new Date(seen.at).toISOString() : null,
       // Restored from before a restart, not reported again since (alex-0217).

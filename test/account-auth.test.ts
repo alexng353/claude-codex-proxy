@@ -82,14 +82,22 @@ for await (const line of createInterface({ input: process.stdin })) {
   });
 }
 
-test("authentication cooldown expires independently from quota", () => {
-  resetAccountState();
-  const account = { name: "expired-auth", dir: "/unused", isDefault: false };
-  const before = Date.now();
-  markAuthFailed(account);
-  expect(isUnavailable(account, before + 60_000)).toBe(true);
-  expect(isUnavailable(account, Date.now() + 15 * 60_000)).toBe(false);
-  resetAccountState();
+test("authentication cooldown expires independently from quota", async () => {
+  const previous = process.env.PROXY_STATE_DIR;
+  const directory = await mkdtemp(join(tmpdir(), "auth-cooldown-"));
+  process.env.PROXY_STATE_DIR = directory;
+  try {
+    resetAccountState();
+    const account = { name: "expired-auth", dir: "/unused", isDefault: false };
+    const before = Date.now();
+    markAuthFailed(account);
+    expect(isUnavailable(account, before + 60_000)).toBe(true);
+    expect(isUnavailable(account, Date.now() + 15 * 60_000)).toBe(false);
+  } finally {
+    resetAccountState();
+    if (previous === undefined) delete process.env.PROXY_STATE_DIR; else process.env.PROXY_STATE_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("authentication classification accepts numeric status and explicit CLI errors", () => {
