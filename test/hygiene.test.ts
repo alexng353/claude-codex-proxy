@@ -305,6 +305,10 @@ describe("classifyTurn", () => {
       expect(classifyTurn({ ...req([user("BYPASS")], "composer"), instructions: `${MARK}\n${seed}` }).type).toBe("exempt");
     });
 
+    test("/btw, which Today leaves unmarked because it has tools, is Alex's turn", () => {
+      expect(classifyTurn(req([dev(`base\n\n${seed}`), env, user("what is the builder doing?")], "composer")).type).toBe("human");
+    });
+
     test("quoted history, seed text, a late marker or Alex's own text never exempt a turn", () => {
       for (const quoted of [MARK, seed])
         expect(

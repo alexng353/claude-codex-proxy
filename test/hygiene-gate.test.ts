@@ -563,8 +563,12 @@ describe("locked responses through the proxy", () => {
       await ran(side(`${MARK}\nYou produce a concise catch-up since Alex's last message.`, "Produce the catch-up summary from the supplied snapshot. Answer only; use no tools.")),
     ).toBe("model-ran");
     expect(
-      await ran(side(`${MARK}\nBase instructions.\n\nYou are a side prompt of Alex's thread \"Today\".`, "what is the builder doing?")),
+      await ran(side(`${MARK}\nBase instructions.\n\nYou produce a concise catch-up since 2h ago.`, "Produce the catch-up summary.")),
     ).toBe("model-ran");
+    // /btw has tools, so Today leaves it unmarked and the gate answers it.
+    expect(
+      await ran(side("You are a side prompt of Alex's thread \"Today\": a short side conversation.", "what is the builder doing?")),
+    ).toContain("🪥 gate armed");
     // Alex's own turn in the same chat is still answered by the gate, and so is a
     // timer tag he types, and a chat whose restored history quotes the marker.
     expect(await ran(request([env, timer, assistant("ok"), user("[08:05 PDT Thu Oct 29] hi")]))).toContain("🪥 gate armed");

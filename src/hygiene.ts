@@ -584,10 +584,11 @@ export function isBareUserMessage(item: ResponseInputItem): boolean {
 const AGENT_TAG = /^\[(?:agent\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
 
 /**
- * Today side prompts (/btw, /summary and automatic summaries) are short-lived,
- * read-only threads the client makes, so their first message comes from Alex's
- * client like his own typing. Today's daemon opens their developer instructions
- * with this marker (today-proto `SIDE_CALL_MARKER`), as the whole first line.
+ * Today summaries (/summary and automatic ones) are short-lived no-tools side
+ * threads the client makes, so their first message comes from Alex's client like
+ * his own typing. Today's daemon opens their developer instructions with this
+ * marker (today-proto `SIDE_CALL_MARKER`), as the whole first line. Not /btw: it
+ * has tools, so it stays gated. Today never forks a side prompt.
  * Only that position counts: Today also copies earlier conversation into
  * developer instructions (restored-conversation, earlier_conversation,
  * thread_memory, perpetual_memory), always after the start and with `<` escaped,
