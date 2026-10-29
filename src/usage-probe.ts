@@ -26,13 +26,13 @@ import {
 import { tryLock, unlock } from "./filelock";
 import { legacyRunning } from "./handoff";
 import { stateDir } from "./sessions";
+import { STRIPPED_ENV } from "./claude-env";
 
 export type ProbeWindow = { usedPercent: number; resetsAt: string | null };
 
 const DEFAULT_INTERVAL_MS = 12 * 60_000;
 const DEFAULT_INITIAL_DELAY_MS = 15_000;
 const PROBE_TIMEOUT_MS = 15_000;
-const STRIPPED_ENV = ["CLAUDECODE", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"];
 
 /** Windows from `claude -p /usage --output-format stream-json`, keyed like `rate_limit_event`. */
 export function parseUsageReport(text: string): Record<string, ProbeWindow> | undefined {
@@ -167,6 +167,10 @@ export async function probeAccount(
     const since = authHealth(account).authFailedSince;
     return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable" };
   };
+  if (!account.isDefault && credentialStatus(account).version === "missing") {
+    markAuthFailed(account);
+    return unavailable();
+  }
   if (!(await supportsUsage(account))) {
     if (credentialStatus(account).state === "failed") markAuthFailed(account);
     return unavailable();

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { listAccounts, type Account } from "./accounts";
 import { tryLock, unlock, withLock } from "./filelock";
 import { stateDir } from "./sessions";
+import { STRIPPED_ENV } from "./claude-env";
 
 type FailureIncident = { id: string; since: string; delivered?: boolean };
 type ExpiryIncident = FailureIncident & { expiresAt: number };
@@ -33,7 +34,7 @@ function read(): State {
       const health = value as Health;
       const name = health.name ?? oldKey;
       const legacy = health.lastSent as Delivery | undefined;
-      if (legacy && "at" in legacy) health.lastSent = { failure: legacy, expiry: legacy };
+      if (legacy && "at" in legacy) health.lastSent = health.expiry?.delivered ? { expiry: legacy } : { failure: legacy };
       return [key({ name, dir: health.dir }), { ...health, name }];
     }));
   } catch (error) {
@@ -65,11 +66,27 @@ function entry(state: State, account: Account): Health {
 function get(account: Account): Health | undefined {
   try { return read()[key(account)]; } catch { return undefined; }
 }
+function noteCredentials(health: Health, version: string | undefined): void {
+  if (!version || version === "missing") return;
+  health.seenCredentials = true;
+  delete health.missingSince;
+}
+/** Turns can observe a login before the first probe. Persist that fact only once. */
+export function recordCredentialObservation(account: Account, version: string | undefined): void {
+  if (!version || version === "missing") return;
+  const known = get(account);
+  if (known?.seenCredentials && known.missingSince === undefined) return;
+  safely(() => update(state => noteCredentials(entry(state, account), version)));
+}
+/** Called by account remove; discarded identities must not affect a later re-add. */
+export function forgetAccountAuth(account: Account): void {
+  update(state => { delete state[key(account)]; });
+}
 export function recordAuthFailure(account: Account): void {
   safely(() => update((state) => {
     const health = entry(state, account);
     const credentials = credentialStatus(account);
-    if (credentials.version && credentials.version !== "missing") health.seenCredentials = true;
+    noteCredentials(health, credentials.version);
     if (!account.isDefault && credentials.version === "missing" && !health.seenCredentials) {
       // account add creates the directory before interactive login has finished.
       health.missingSince ??= Date.now();
@@ -120,7 +137,7 @@ export function checkAuthExpiry(account: Account, now = Date.now()): void {
   const { version, expiresAt, refreshTokenExpiresAt: expiry } = credentialStatus(account);
   safely(() => update((state) => {
     const health = entry(state, account);
-    if (version && version !== "missing") health.seenCredentials = true;
+    noteCredentials(health, version);
     if (expiry === null) return; // Unknown does not rearm an existing warning.
     // Match the CLI's stale metadata guard. An already-past deadline is silent.
     if (expiry <= now || expiry > now + THREE_DAYS || (expiresAt !== null && expiresAt > expiry + THREE_DAYS)) {
@@ -159,7 +176,10 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         if (!candidate) continue;
         // A send can await for seconds. Re-read each incident and account after the preceding send.
         const account = listAccounts().find((a) => key(a) === accountKey);
-        if (!account) continue;
+        if (!account) {
+          forgetAccountAuth({ name: snapshot.name, dir: snapshot.dir, isDefault: false });
+          continue;
+        }
         if (kind === "expiry") checkAuthExpiry(account);
         const health = read()[accountKey];
         const incident = health?.[kind];
@@ -187,6 +207,7 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
 }
 async function sendTodayWarning(message: string, _incidentId: string): Promise<boolean> {
   const { CODEX_THREAD_ID: _thread, ...env } = process.env;
+  for (const key of STRIPPED_ENV) delete env[key];
   const child = Bun.spawn([process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
     `/run/user/${process.getuid!()}/today/daemon.sock`, "--client", "claude-codex-proxy", "today", "-"], {
     env, stdin: new TextEncoder().encode(message), stdout: "ignore", stderr: "ignore",

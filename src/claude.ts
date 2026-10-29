@@ -1,4 +1,4 @@
-import { authIncidentId, credentialStatus } from "./auth-health";
+import { authIncidentId, credentialStatus, recordCredentialObservation } from "./auth-health";
 import { normalizeContext } from "./context.mjs";
 import {
   mkdirSync,
@@ -361,6 +361,7 @@ class ClaudeWorker {
     this.attempt = attempt;
     this.observedAuthIncident = authIncidentId(this.account);
     this.observedCredentials = credentialStatus(this.account).version;
+    recordCredentialObservation(this.account, this.observedCredentials);
     this.workerTurn++;
     idleWorkers.delete(this);
     clearTimeout(this.idleTimer);
@@ -453,9 +454,10 @@ class ClaudeWorker {
     if (isAuthError(status, message)) {
       const credentials = credentialStatus(this.account);
       // An expired bearer can fail after a transient refresh outage. Retain routing
-      // backoff, but only demand login for a dead marker or this turn's fresh bearer.
+      // backoff, but only demand login for a dead marker or a structured 401
+      // rejecting this turn's fresh bearer. Helper stderr is not auth evidence.
       const failed = credentials.state === "failed" ||
-        (credentials.version === this.observedCredentials && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000);
+        (status === 401 && credentials.version === this.observedCredentials && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000);
       markAuthFailed(this.account, failed);
     }
     recordFailure({

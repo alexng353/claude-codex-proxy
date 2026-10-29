@@ -1,5 +1,5 @@
 import { afterEach, expect, test, spyOn } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { listAccounts, accountStatus, markAuthFailed, resetAccountState, isAuthError, isUnavailable, soonestAccount, markLimited } from "../src/accounts";
@@ -127,11 +127,25 @@ test('timeout signals TERM before KILL and never validates the endpoint', async 
   const account = setup();
   const cli = join(root, 'slow-cli');
   const term = join(root, 'term');
-  writeFileSync(cli, `#!${process.execPath}\nimport {writeFileSync} from 'node:fs';\nif (process.argv.includes('--version')) { console.log('2.1.302 (Claude Code)'); process.exit(0); }\nprocess.on('SIGTERM', () => { writeFileSync(${JSON.stringify(term)}, 'term'); });\nsetInterval(() => {}, 10);`);
+  const ready = join(root, 'ready');
+  writeFileSync(cli, `#!${process.execPath}\nimport {writeFileSync} from 'node:fs';\nif (process.argv.includes('--version')) { console.log('2.1.302 (Claude Code)'); process.exit(0); }\nprocess.on('SIGTERM', () => { writeFileSync(${JSON.stringify(term)}, 'term'); });\nwriteFileSync(${JSON.stringify(ready)}, 'ready');\nsetInterval(() => {}, 10);`);
   chmodSync(cli, 0o755); process.env.CLAUDE_BIN = cli;
   let calls = 0;
   const start = Date.now();
-  await probeAccount(account, async () => { calls++; return 'failed'; }, 150);
+  const spawn = Bun.spawn;
+  // Hold spawn's return until the real child installs its handler, so runClaude's
+  // timeout starts after readiness. The version subprocess needs no handshake.
+  (Bun as any).spawn = (args: string[], options: any) => {
+    const child = spawn(args, options);
+    if (args.includes('/usage')) {
+      const deadline = Date.now() + 5000;
+      while (!existsSync(ready) && Date.now() < deadline) Bun.sleepSync(5);
+    }
+    return child;
+  };
+  try { await probeAccount(account, async () => { calls++; return 'failed'; }, 150); }
+  finally { Bun.spawn = spawn; }
+  expect(existsSync(ready)).toBe(true);
   expect(readFileSync(term, 'utf8')).toBe('term');
   expect(Date.now() - start).toBeGreaterThanOrEqual(1100);
   expect(calls).toBe(0);
@@ -274,4 +288,81 @@ test('missing credentials on a previously observed account bypass login grace', 
   rmSync(join(dir,'.credentials.json'));
   replay('m-empty');
   expect((await probeAccount(account)).result).toStartWith('auth failed since ');
+});
+
+test('first successful turn records credentials before any probe and later loss fails immediately', async () => {
+  const {runClaude,closeIdleWorkers} = await import('../src/claude');
+  setup();
+  const dir = join(process.env.PROXY_STATE_DIR!,'accounts','new');
+  mkdirSync(dir,{recursive:true});
+  writeFileSync(join(dir,'.credentials.json'),JSON.stringify({claudeAiOauth:{accessToken:'FAKE',refreshToken:'R'}}));
+  process.env.CLAUDE_ACCOUNT_ORDER='new,default';
+  const account = listAccounts().find(a => a.name==='new')!;
+  const cli = join(root,'success-cli');
+  writeFileSync(cli,`#!${process.execPath}
+import {createInterface} from 'node:readline';
+for await (const line of createInterface({input:process.stdin}))
+ console.log(JSON.stringify({type:'result',is_error:false,structured_output:{text:'ok',tool_calls:[]}}));`);
+  chmodSync(cli,0o755); process.env.CLAUDE_BIN=cli; closeIdleWorkers();
+  try {
+    expect((await runClaude({model:'sonnet',input:'hello'})).account).toBe('new');
+    rmSync(join(dir,'.credentials.json'));
+    markAuthFailed(account);
+    expect(health.authIncidentId(account)).toBeString();
+  } finally {closeIdleWorkers();}
+});
+
+for (const dead of [false,true]) test(`worker stderr auth prose only persists when credentials are dead: ${dead}`, async () => {
+  const {runClaude,closeIdleWorkers} = await import('../src/claude');
+  const account = setup(dead ? {accessToken:'',refreshToken:'',expiresAt:0} : undefined);
+  const cli=join(root,'helper-stderr');
+  writeFileSync(cli,`#!${process.execPath}
+import {createInterface} from 'node:readline';
+for await (const line of createInterface({input:process.stdin})) {
+ console.error('Helper failed to authenticate: invalid_grant'); process.exit(1);
+}`);
+  chmodSync(cli,0o755);process.env.CLAUDE_BIN=cli;closeIdleWorkers();
+  try {
+    await expect(runClaude({model:'sonnet',input:'hello'})).rejects.toThrow();
+    expect(accountStatus()[0].authFailedUntil).toBeString();
+    if(dead) expect(health.authIncidentId(account)).toBeString();
+    else expect(health.authIncidentId(account)).toBeUndefined();
+  } finally {closeIdleWorkers();}
+});
+
+test('credential-less named account never spawns a probe CLI', async () => {
+  setup(); const dir=join(process.env.PROXY_STATE_DIR!,'accounts','waiting');
+  mkdirSync(dir,{recursive:true}); replay('m-empty');
+  const account={name:'waiting',dir,isDefault:false};
+  const spawn=spyOn(Bun,'spawn');
+  try {
+    expect((await probeAccount(account)).result).toBe('unavailable');
+    expect(spawn).not.toHaveBeenCalled();
+  } finally {spawn.mockRestore();}
+});
+
+for (const observation of ['probe','failure'] as const) test(`credential observation clears missingSince: ${observation}`, () => {
+  setup(); const dir=join(process.env.PROXY_STATE_DIR!,'accounts','waiting');
+  mkdirSync(dir,{recursive:true});
+  const account={name:'waiting',dir,isDefault:false};
+  markAuthFailed(account);
+  const file=join(process.env.PROXY_STATE_DIR!,'account-auth.json');
+  expect(JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,dir])].missingSince).toBeNumber();
+  writeFileSync(join(dir,'.credentials.json'),'{}');
+  if(observation==='probe') health.checkAuthExpiry(account); else markAuthFailed(account);
+  expect(JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,dir])].missingSince).toBeUndefined();
+});
+
+test('account remove clears auth health so re-add gets login grace', async () => {
+  setup(); const dir=join(process.env.PROXY_STATE_DIR!,'accounts','again');
+  mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,'.credentials.json'),'{}');
+  const account={name:'again',dir,isDefault:false};
+  markAuthFailed(account); expect(health.authIncidentId(account)).toBeString();
+  const child=Bun.spawn([process.execPath,join(import.meta.dir,'../scripts/account.ts'),'remove','again'],{env:process.env,stdout:'pipe',stderr:'pipe'});
+  expect(await child.exited).toBe(0);
+  const file=join(process.env.PROXY_STATE_DIR!,'account-auth.json');
+  expect(JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,dir])]).toBeUndefined();
+  mkdirSync(dir,{recursive:true});
+  markAuthFailed(account);
+  expect(health.authIncidentId(account)).toBeUndefined();
 });

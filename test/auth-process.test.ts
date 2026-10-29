@@ -84,6 +84,8 @@ test('repeated observations do not rewrite state; same name in different dirs st
 test('real sender adapter sets client identity and removes thread identity', async () => {
   const account = setup(); markAuthFailed(account);
   process.env.CODEX_THREAD_ID = 'must-not-leak';
+  const stripped = ['CLAUDECODE','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_BASE_URL','CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'];
+  for (const key of stripped) process.env[key] = 'test-only-inherited';
   const spawn = Bun.spawn;
   let called = 0;
   let captured: {args: string[], env: any} | undefined;
@@ -95,7 +97,8 @@ test('real sender adapter sets client identity and removes thread identity', asy
   try { const stop = startAuthWarnings(); await stop(); expect(called).toBe(1);
     expect(captured!.args.slice(-4)).toEqual(['--client', 'claude-codex-proxy', 'today', '-']);
     expect(captured!.args[0]).toBe(process.env.TODAY_DAEMON_BIN!);
-    expect(captured!.env.CODEX_THREAD_ID).toBeUndefined(); }
+    expect(captured!.env.CODEX_THREAD_ID).toBeUndefined();
+    for (const key of stripped) expect(captured!.env[key]).toBeUndefined(); }
   finally { Bun.spawn = spawn; }
 });
 
@@ -174,5 +177,22 @@ test('legacy name-keyed incidents and delivery history migrate without losing de
   const state = JSON.parse(readFileSync(file,'utf8'));
   expect(state[JSON.stringify(['default',account.dir])].failure.id).toBe('old-id');
   expect(state[JSON.stringify(['default',account.dir])].lastSent.failure.credentials).toBe('legacy');
-  expect(state[JSON.stringify(['default',account.dir])].lastSent.expiry.credentials).toBe('legacy');
+  expect(state[JSON.stringify(['default',account.dir])].lastSent.expiry).toBeUndefined();
+});
+
+test('legacy expiry delivery does not suppress a pending failure with matching credentials', async () => {
+  const {credentialStatus} = await import('../src/auth-health');
+  const account = setup();
+  const expiry = Date.now()+86400000;
+  writeFileSync(join(account.dir,'.credentials.json'),JSON.stringify({claudeAiOauth:{refreshTokenExpiresAt:expiry}}));
+  const file = join(process.env.PROXY_STATE_DIR!,'account-auth.json');
+  mkdirSync(process.env.PROXY_STATE_DIR!,{recursive:true});
+  writeFileSync(file,JSON.stringify({default:{dir:account.dir,
+    expiry:{id:'delivered-expiry',since:new Date().toISOString(),expiresAt:expiry,delivered:true},
+    failure:{id:'pending-failure',since:new Date().toISOString()},
+    lastSent:{at:Date.now(),credentials:credentialStatus(account).version}}}));
+  const messages: string[] = [];
+  await flushAuthWarnings(async text => {messages.push(text);return true;});
+  expect(messages).toHaveLength(1);
+  expect(messages[0]).toContain('authentication failed');
 });

@@ -6,6 +6,7 @@
  *   bun run account list         show each account's login
  *   bun run account remove <name>
  */
+import { forgetAccountAuth } from "../src/auth-health";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { accountsDir, linkSharedEntries, listAccounts } from "../src/accounts";
@@ -52,7 +53,9 @@ if (command === "add") {
 } else if (command === "remove") {
   // Only the account directory: its entries are symlinks, so rm does not
   // follow them into the shared config.
-  rmSync(join(accountsDir(), checkName(name)), { recursive: true, force: true });
+  const account = { name: checkName(name), dir: join(accountsDir(), checkName(name)), isDefault: false };
+  rmSync(account.dir, { recursive: true, force: true });
+  forgetAccountAuth(account);
 } else {
   console.error("Usage: bun run account add|list|remove <name>");
   process.exit(2);
