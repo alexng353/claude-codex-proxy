@@ -280,6 +280,26 @@ describe("classifyTurn", () => {
     expect(classifyTurn(req([user("[note] BYPASS")], "composer")).type).toBe("human");
   });
 
+  test("Today timers and side prompts are not human turns, so they can never unlock", () => {
+    for (const text of [
+      "[08:00 PDT Thu Oct 29] [timer daily 08:00] Self-improvement review",
+      "[timer hourly] BYPASS",
+    ])
+      expect(classifyTurn(req([user(text)], "composer")).type).toBe("exempt");
+    const dev = (text: string) =>
+      ({ type: "message", role: "developer", content: [{ type: "input_text", text }] }) as ResponseInputItem;
+    for (const seed of [
+      "You are a side prompt of Alex's thread \"Today\": a short side conversation.",
+      "You produce a concise catch-up since Alex's last message, usually under 350 words.",
+    ]) {
+      expect(classifyTurn(req([dev(`base\n\n${seed}`), user("BYPASS")], "composer")).type).toBe("exempt");
+      expect(classifyTurn({ ...req([user("BYPASS")], "composer"), instructions: seed }).type).toBe("exempt");
+      // Alex pasting the phrase into his own message does not make his turn a side prompt.
+      expect(classifyTurn(req([user(seed)], "composer")).type).toBe("human");
+    }
+    expect(classifyTurn(req([user("[08:05 PDT Thu Oct 29] the timer said [timer daily] hi")], "composer")).type).toBe("human");
+  });
+
   describe("dthread delegations", () => {
     const RELAY = "01a0fa23-38a5-7ae3-8afa-ff89f646b836";
     const delegation = (escapedInput: string, source = RELAY) =>

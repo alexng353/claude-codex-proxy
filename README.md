@@ -268,7 +268,8 @@ Alex asked for this: agents refuse to work until he sends a photo proving he bru
 Only turns Alex types. Codex puts `x-codex-turn-metadata` in the body's `client_metadata`, which the router forwards unchanged.
 
 - **Exempt by trigger.** Turns whose `turn_trigger` starts with `automation_` (heartbeats, cron, and scheduled one-shot tasks), `app_tool_send_message` and `app_tool_create_thread` (agent-to-agent prompts), `exec`, `code_review`, resume and onboarding triggers, and the other app-initiated triggers listed in `src/hygiene.ts`.
-- **Exempt by thread, request kind or content.** Turns in a `subagent` thread, any `request_kind` other than `turn`, compaction requests, and turns whose new user messages are all Codex wrappers (`<heartbeat>`, `<codex_delegation>`, `<subagent_notification>`, environment context and similar).
+- **Exempt by thread, request kind or content.** Turns in a `subagent` thread, any `request_kind` other than `turn`, compaction requests, and turns whose new user messages are all Codex wrappers (`<heartbeat>`, `<codex_delegation>`, `<subagent_notification>`, environment context and similar) or agent and timer tags (`[agent]`, `[timer daily 08:00]`, `[ship-arch.sh, ...]`).
+- **Today side prompts.** `/btw`, `/summary` and automatic summaries run in side threads whose developer instructions carry Today's side seed. They run while the gate is armed. They are read-only and never count as Alex's turn, so they cannot unlock it.
 - **Gated.** Every other trigger is treated as possibly human, including `composer`, queued messages, edits, and triggers the gate has never seen, such as a future mobile client.
 - **Continuations.** A request whose input ends in model output or tool results is a continuation of a turn that was already let through, so a long turn started before 05:00 keeps running.
 

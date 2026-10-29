@@ -115,6 +115,8 @@ const user = (...content: Array<string | { photo: string }>): ResponseInputItem 
   }) as ResponseInputItem;
 const assistant = (text: string): ResponseInputItem =>
   ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] }) as ResponseInputItem;
+const developer = (text: string): ResponseInputItem =>
+  ({ type: "message", role: "developer", content: [{ type: "input_text", text }] }) as ResponseInputItem;
 const env = user("<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>");
 const request = (input: ResponseInputItem[], trigger = "composer", extra: Partial<ResponsesRequest> = {}): ResponsesRequest =>
   ({ model: "opus", prompt_cache_key: THREAD, client_metadata: meta(trigger), input, ...extra }) as ResponsesRequest;
@@ -539,6 +541,29 @@ describe("kill switch", () => {
 describe("locked responses through the proxy", () => {
   const post = (body: unknown) =>
     handleRequest(new Request("http://localhost/v1/responses", { method: "POST", body: JSON.stringify(body) }));
+
+  // 2026-10-29: Today's 08:00 timer and a /summary side prompt got the gate text
+  // instead of running, and nothing ran them later.
+  test("Claude path: a timer and Today side prompts run while the gate is armed", async () => {
+    const ran = async (body: ResponsesRequest) => {
+      const json = await (await post(body)).json();
+      return json.output[0].content[0].text as string;
+    };
+    const timer = user("[08:00 PDT Thu Oct 29] [timer daily 08:00] Self-improvement review: dispatch ONE Forge chat");
+    expect(await ran(request([env, timer]))).toBe("model-ran");
+    const { client_metadata: _, ...bare } = request([env, timer]) as ResponsesRequest & { client_metadata?: unknown };
+    expect(await ran(bare)).toBe("model-ran");
+    const side = (seed: string, question: string) =>
+      request([developer(`Base instructions.\n\n${seed}`), env, user(`[06:54 PDT Thu Oct 29] ${question}`)]);
+    expect(
+      await ran(side("You produce a concise catch-up since Alex's last message, usually under 350 words.", "Produce the catch-up summary from the supplied snapshot. Answer only; use no tools.")),
+    ).toBe("model-ran");
+    expect(
+      await ran(side("You are a side prompt of Alex's thread \"Today\": a short side conversation while the main thread keeps working.", "what is the builder doing?")),
+    ).toBe("model-ran");
+    // Alex's own turn in the same chat is still answered by the gate.
+    expect(await ran(request([env, timer, assistant("ok"), user("[08:05 PDT Thu Oct 29] hi")]))).toContain("🪥 gate armed");
+  });
 
   test("Claude path: locked turn streams a final answer and Claude never starts", async () => {
     const before = existsSync(join(directory, "inputs")) ? (await readFile(join(directory, "inputs"), "utf8")).length : 0;

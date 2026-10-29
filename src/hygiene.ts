@@ -576,10 +576,29 @@ export function isBareUserMessage(item: ResponseInputItem): boolean {
 /**
  * Tags agents and scripts open their messages with when Today delivers them
  * bare (no delegation envelope, no turn trigger): "[agent] Shipped...",
- * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...". Alex asked
- * (Oct 23) that chat-to-chat traffic never be gated, so overnight work goes on.
+ * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...", and
+ * systemd timers ("[timer daily 08:00] ...", sent with `today-daemon send`, which
+ * delivers like Alex's typing). Alex asked (Oct 23) that chat-to-chat traffic
+ * never be gated, so overnight work goes on.
  */
-const AGENT_TAG = /^\[(?:agent\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
+const AGENT_TAG = /^\[(?:agent\]|timer\b[^\]\n]*\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
+
+/**
+ * Today side prompts (/btw, /summary and automatic summaries) are short-lived,
+ * read-only threads the client makes, so their first message comes from Alex's
+ * client like his own typing. Their developer instructions carry Today's side
+ * seed (today-proto `seed_reason` for a Side origin; today-client
+ * `summary::prepare`). Only instructions count: Alex can't type there.
+ * Without this, a /summary on 2026-10-29 got the gate text instead of running.
+ */
+const SIDE_PROMPT_SEEDS = ["You are a side prompt of Alex's thread ", "You produce a concise catch-up "];
+
+export function isSidePrompt(request: ResponsesRequest): boolean {
+  const seeded = (text: unknown) => typeof text === "string" && SIDE_PROMPT_SEEDS.some((seed) => text.includes(seed));
+  if (seeded(request.instructions)) return true;
+  if (!Array.isArray(request.input)) return false;
+  return request.input.some((item) => isContextMessage(item) && partsOf(item).some((part) => seeded(part.text)));
+}
 
 /**
  * Plate's relay chat. dthread (~/code/alexng353/dthread) sends Alex's
@@ -663,6 +682,7 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
     return { type: "exempt", reason: `request kind ${meta.requestKind}` };
   if (meta.threadSource && EXEMPT_THREAD_SOURCES.has(meta.threadSource))
     return { type: "exempt", reason: `thread source ${meta.threadSource}` };
+  if (isSidePrompt(request)) return { type: "exempt", reason: "Today side prompt" };
 
   // The turn's own input: user and context messages after the last thing the
   // model produced.
