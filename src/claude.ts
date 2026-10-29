@@ -280,7 +280,7 @@ class ClaudeWorker {
   private attempt = 1;
   private observedCredentials: string | undefined;
   readonly spawnCredentials: string | undefined;
-  private readonly spawnAuthMode: "token" | "login";
+  readonly spawnAuthMode: "token" | "login";
   private observedAuthIncident: string | undefined;
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
@@ -622,8 +622,11 @@ function claimWorker(
   const signature = toolSignature(request);
   // Most recently parked first.
   for (const worker of [...idleWorkers].reverse()) {
-    // A limited account cannot answer; the session resumes on another one.
-    if (worker.spawnCredentials !== credentialStatus(worker.account).version || isUnavailable(worker.account)) {
+    const credentials = credentialStatus(worker.account);
+    // Login workers refresh their own credentials; only installed tokens are fixed at spawn.
+    const changedAuth = worker.spawnAuthMode !== credentials.authMode ||
+      (worker.spawnAuthMode === "token" && worker.spawnCredentials !== credentials.version);
+    if (changedAuth || isUnavailable(worker.account)) {
       worker.close();
       continue;
     }

@@ -225,3 +225,16 @@ test('token-to-login mode switch drops pending token expiry', async () => {
   const messages: string[] = []; await flushAuthWarnings(async s => { messages.push(s); return true; });
   expect(messages).toHaveLength(0); expect(credentialStatus(a).authMode).toBe('login');
 });
+test('legacy token cleanup preserves deliberate login and config symlinks', () => {
+  const base = setup(); const dir = join(root, 'state/accounts/linked'); mkdirSync(dir, { recursive: true });
+  rmSync(join(base.dir, '.credentials.json'), { recursive: true });
+  const names = ['.credentials.json', '.credentials.json.backup', '.claude.json', '.claude.json.backup'];
+  for (const name of names) {
+    writeFileSync(join(base.dir, name), '{}');
+    symlinkSync(join(base.dir, name), join(dir, name));
+  }
+  symlinkSync(join(base.dir, 'oauth-token'), join(dir, 'oauth-token'));
+  linkSharedEntries(dir);
+  for (const name of names) expect(fs.readlinkSync(join(dir, name))).toBe(join(base.dir, name));
+  expect(() => lstatSync(join(dir, 'oauth-token'))).toThrow();
+});

@@ -209,8 +209,10 @@ export function linkSharedEntries(dir: string): void {
   for (const entry of readdirSync(base)) {
     const link = join(dir, entry);
     if (isPrivate(entry)) {
-      // Undo only the exact symlinks made by older shared-entry linkers.
-      try { if (readlinkSync(link) === join(base, entry)) unlinkSync(link); } catch {}
+      // Older linkers shared token files, but never login/config files.
+      if (entry === "oauth-token" || entry.startsWith("oauth-token.")) {
+        try { if (readlinkSync(link) === join(base, entry)) unlinkSync(link); } catch {}
+      }
       continue;
     }
     try {

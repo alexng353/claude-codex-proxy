@@ -55,3 +55,23 @@ test('401 from an active worker using a rotated token cannot block the replaceme
   expect(accountStatus()[0].authFailedSince).toBeNull();
   expect(isUnavailable(listAccounts()[0])).toBe(false);
 });
+test('parked login worker is reused after CLI credential refresh', async () => {
+  const token = setup(false); rmSync(token);
+  const credentials = join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json');
+  const login = (accessToken: string) => JSON.stringify({ claudeAiOauth: { accessToken, refreshToken: 'fake-refresh' } });
+  writeFileSync(credentials, login('fake-before-refresh'));
+  expect((await runClaude(first)).text).toBe('ok');
+  writeFileSync(credentials, login('fake-after-refresh'));
+  expect((await runClaude(second)).text).toBe('ok');
+  expect(readFileSync(join(root, 'launches'), 'utf8')).toBe('launch\n');
+});
+for (const toToken of [false, true]) test(`parked worker is replaced on auth mode change to ${toToken ? 'token' : 'login'}`, async () => {
+  const token = setup(false);
+  writeFileSync(join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'fake-login', refreshToken: 'fake-refresh' } }));
+  if (toToken) rmSync(token);
+  expect((await runClaude(first)).text).toBe('ok');
+  if (toToken) writeFileSync(token, 'new-fake-token-for-tests', { mode: 0o600 });
+  else rmSync(token);
+  expect((await runClaude(second)).text).toBe('ok');
+  expect(readFileSync(join(root, 'launches'), 'utf8')).toBe('launch\nlaunch\n');
+});
