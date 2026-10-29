@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, spyOn } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -195,4 +195,113 @@ test('legacy expiry delivery does not suppress a pending failure with matching c
   await flushAuthWarnings(async text => {messages.push(text);return true;});
   expect(messages).toHaveLength(1);
   expect(messages[0]).toContain('authentication failed');
+});
+
+test('every Claude launcher strips every inherited credential variable', async () => {
+  setup();
+  const keys = ['CLAUDECODE','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_BASE_URL','CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR','CLAUDE_CODE_EFFORT_LEVEL'];
+  for(const key of keys) process.env[key]='test-only-inherited';
+  const {claudeClassifier}=await import('../src/hygiene-proof');
+  const {claudeRunner}=await import('../src/perpetual/summarizer');
+  const {runClaude,closeIdleWorkers}=await import('../src/claude');
+  const {probeAccount,resetUsageProbe}=await import('../src/usage-probe');
+  closeIdleWorkers(); resetUsageProbe();
+  const spawn=Bun.spawn; const seen: any[]=[];
+  (Bun as any).spawn=(_args:any,options:any)=>{seen.push(options.env);throw new Error('boundary stopped');};
+  try {
+    await expect(runClaude({model:'sonnet',input:'hello'})).rejects.toThrow('boundary stopped');
+    await expect(claudeClassifier({} as any,{kinds:[]})).rejects.toThrow('boundary stopped');
+    expect(()=>claudeRunner('haiku')('test-thread')).toThrow('boundary stopped');
+    await expect(probeAccount(listAccounts()[0])).rejects.toThrow('boundary stopped');
+    expect(seen).toHaveLength(4);
+    for(const child of seen) for(const key of keys.slice(0,6)) expect(child[key]).toBeUndefined();
+    for(const child of seen.slice(0,3)) expect(child.CLAUDE_CODE_EFFORT_LEVEL).toBeUndefined();
+  } finally {Bun.spawn=spawn;closeIdleWorkers();resetUsageProbe();}
+});
+
+test('removal in another process resets in-memory delivery hysteresis', async () => {
+  const {forgetAccountAuth}=await import('../src/auth-health');
+  setup(); const dir=join(process.env.PROXY_STATE_DIR!,'accounts','reborn');
+  mkdirSync(dir,{recursive:true});
+  const account={name:'reborn',dir,isDefault:false};
+  let sent=0; const send=async()=>{sent++;return true;};
+  const originalNow=Date.now; let now=originalNow();
+  Date.now=()=>now;
+  try {
+    markAuthFailed(account); now+=16*60000; markAuthFailed(account); await flushAuthWarnings(send);
+    expect(sent).toBe(1);
+    const child=run(`import {forgetAccountAuth} from ${JSON.stringify(modulePath)};forgetAccountAuth(${JSON.stringify(account)});`,'forget');
+    expect(await child.exited).toBe(0);
+    markAuthFailed(account); now+=16*60000; markAuthFailed(account); await flushAuthWarnings(send);
+    expect(sent).toBe(2);
+    forgetAccountAuth(account);
+    markAuthFailed(account); now+=16*60000; markAuthFailed(account); await flushAuthWarnings(send);
+    expect(sent).toBe(3);
+  } finally {Date.now=originalNow;}
+});
+
+test('late probe observations never recreate removed account state', async () => {
+  const {forgetAccountAuth}=await import('../src/auth-health');
+  const {probeAccount}=await import('../src/usage-probe');
+  setup(); const account={name:'gone',dir:join(root,'gone'),isDefault:false};
+  mkdirSync(account.dir);writeFileSync(join(account.dir,'.credentials.json'),'{}');
+  markAuthFailed(account);forgetAccountAuth(account);rmSync(account.dir,{recursive:true});
+  checkAuthExpiry(account);markAuthFailed(account);await probeAccount(account);
+  const state=JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!,'account-auth.json'),'utf8'));
+  expect(state[JSON.stringify([account.name,account.dir])]).toBeUndefined();
+});
+
+for(const incident of [false,true]) test(`flush removes gone account health even without an incident: ${incident}`,async()=>{
+  setup();const dir=join(process.env.PROXY_STATE_DIR!,'accounts','gone');mkdirSync(dir,{recursive:true});
+  const account={name:'gone',dir,isDefault:false};
+  if(incident) {writeFileSync(join(dir,'.credentials.json'),'{}');markAuthFailed(account);} else checkAuthExpiry(account);
+  rmSync(dir,{recursive:true});
+  await flushAuthWarnings(async()=>true);
+  expect(JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!,'account-auth.json'),'utf8'))[JSON.stringify([account.name,dir])]).toBeUndefined();
+});
+
+test('failed removed-account cleanup does not abort warning flush',async()=>{
+  setup();const dir=join(process.env.PROXY_STATE_DIR!,'accounts','gone');mkdirSync(dir,{recursive:true});
+  const account={name:'gone',dir,isDefault:false};
+  writeFileSync(join(dir,'.credentials.json'),'{}');markAuthFailed(account);rmSync(dir,{recursive:true});
+  markAuthFailed(listAccounts()[0]);
+  const next=join(process.env.PROXY_STATE_DIR!,`account-auth.json.${process.pid}.next`);mkdirSync(next);
+  let sent=0;
+  await expect(flushAuthWarnings(async()=>{sent++;return true;})).resolves.toBeUndefined();
+  expect(sent).toBe(1);
+});
+
+test('account remove reports corrupt auth state without a stack trace',async()=>{
+  setup();const dir=join(process.env.PROXY_STATE_DIR!,'accounts','bad');mkdirSync(dir,{recursive:true});
+  writeFileSync(join(process.env.PROXY_STATE_DIR!,'account-auth.json'),'{broken');
+  const child=Bun.spawn([process.execPath,join(import.meta.dir,'../scripts/account.ts'),'remove','bad'],{env:process.env,stdout:'pipe',stderr:'pipe'});
+  const error=await new Response(child.stderr).text();
+  expect(await child.exited).toBe(1);
+  expect(error).toContain('Unable to remove authentication state for account bad');
+  expect(error).not.toContain('at ');
+});
+
+test('unreadable auth state skips repeated turn observations without logging',async()=>{
+  const {recordCredentialObservation}=await import('../src/auth-health');
+  const account=setup();mkdirSync(process.env.PROXY_STATE_DIR!,{recursive:true});
+  writeFileSync(join(process.env.PROXY_STATE_DIR!,'account-auth.json'),'{broken');
+  const log=spyOn(console,'error');
+  try {
+    recordCredentialObservation(account,'fake-version');
+    recordCredentialObservation(account,'fake-version');
+    expect(log).not.toHaveBeenCalled();
+  } finally {log.mockRestore();}
+});
+
+for(const kind of ['both','neither'] as const) test(`legacy delivery migration handles ${kind} incidents`,async()=>{
+  const account=setup();mkdirSync(process.env.PROXY_STATE_DIR!,{recursive:true});
+  const file=join(process.env.PROXY_STATE_DIR!,'account-auth.json');
+  const incidents=kind==='both'? {failure:{id:'f',since:'now',delivered:true},expiry:{id:'e',since:'now',delivered:true,expiresAt:Date.now()+86400000}}:{};
+  writeFileSync(file,JSON.stringify({default:{dir:account.dir,...incidents,lastSent:{at:Date.now(),credentials:'old'}}}));
+  checkAuthExpiry(account);
+  const health=JSON.parse(readFileSync(file,'utf8'))[JSON.stringify(['default',account.dir])];
+  if(kind==='both') {
+    expect(health.lastSent.failure.credentials).toBe('old');
+    expect(health.lastSent.expiry.credentials).toBe('old');
+  } else expect(health.lastSent).toBeUndefined();
 });

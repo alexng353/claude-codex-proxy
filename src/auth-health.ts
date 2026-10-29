@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { hostname, homedir } from "node:os";
 import { join } from "node:path";
 import { listAccounts, type Account } from "./accounts";
@@ -11,6 +11,7 @@ type FailureIncident = { id: string; since: string; delivered?: boolean };
 type ExpiryIncident = FailureIncident & { expiresAt: number };
 type Delivery = { at: number; credentials: string | undefined };
 type Health = {
+  generation: string;
   name: string;
   dir: string;
   failure?: FailureIncident;
@@ -34,7 +35,14 @@ function read(): State {
       const health = value as Health;
       const name = health.name ?? oldKey;
       const legacy = health.lastSent as Delivery | undefined;
-      if (legacy && "at" in legacy) health.lastSent = health.expiry?.delivered ? { expiry: legacy } : { failure: legacy };
+      if (legacy && "at" in legacy) {
+        const history: Health["lastSent"] = {};
+        if (health.expiry?.delivered) history.expiry = legacy;
+        if (health.failure?.delivered || (!health.expiry?.delivered && health.failure)) history.failure = legacy;
+        health.lastSent = Object.keys(history).length ? history : undefined;
+      }
+      // Stable for old records until the next write; new entries always use UUIDs.
+      health.generation ??= `legacy:${key({ name, dir: health.dir })}`;
       return [key({ name, dir: health.dir }), { ...health, name }];
     }));
   } catch (error) {
@@ -61,10 +69,10 @@ function safely(fn: () => void): void {
   try { fn(); } catch { console.error("Unable to update account authentication state"); }
 }
 function entry(state: State, account: Account): Health {
-  return state[key(account)] ??= { name: account.name, dir: account.dir };
+  return state[key(account)] ??= { generation: crypto.randomUUID(), name: account.name, dir: account.dir };
 }
-function get(account: Account): Health | undefined {
-  try { return read()[key(account)]; } catch { return undefined; }
+function get(account: Account): Health | undefined | null {
+  try { return read()[key(account)]; } catch { return null; }
 }
 function noteCredentials(health: Health, version: string | undefined): void {
   if (!version || version === "missing") return;
@@ -73,16 +81,20 @@ function noteCredentials(health: Health, version: string | undefined): void {
 }
 /** Turns can observe a login before the first probe. Persist that fact only once. */
 export function recordCredentialObservation(account: Account, version: string | undefined): void {
+  if (!account.isDefault && !existsSync(account.dir)) return;
   if (!version || version === "missing") return;
   const known = get(account);
+  if (known === null) return;
   if (known?.seenCredentials && known.missingSince === undefined) return;
   safely(() => update(state => noteCredentials(entry(state, account), version)));
 }
 /** Called by account remove; discarded identities must not affect a later re-add. */
 export function forgetAccountAuth(account: Account): void {
+  for (const kind of ["failure", "expiry"]) lastSent.delete(`${path()}:${key(account)}:${kind}`);
   update(state => { delete state[key(account)]; });
 }
 export function recordAuthFailure(account: Account): void {
+  if (!account.isDefault && !existsSync(account.dir)) return;
   safely(() => update((state) => {
     const health = entry(state, account);
     const credentials = credentialStatus(account);
@@ -134,6 +146,7 @@ export function credentialStatus(account: Account) {
   return { version, state, expiresAt: timestamp(oauth?.expiresAt), refreshTokenExpiresAt: timestamp(oauth?.refreshTokenExpiresAt) };
 }
 export function checkAuthExpiry(account: Account, now = Date.now()): void {
+  if (!account.isDefault && !existsSync(account.dir)) return;
   const { version, expiresAt, refreshTokenExpiresAt: expiry } = credentialStatus(account);
   safely(() => update((state) => {
     const health = entry(state, account);
@@ -162,7 +175,7 @@ function warningText(machine: string, account: Account, incident: FailureInciden
 }
 const sending = new Set<string>();
 const delivered = new Set<string>();
-const lastSent = new Map<string, Delivery>();
+const lastSent = new Map<string, Delivery & { generation: string }>();
 /** Sender accepts the incident ID so a future idempotent Today CLI can use it directly. */
 export async function flushAuthWarnings(send: WarningSender, machine = hostname()): Promise<void> {
   mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
@@ -172,21 +185,21 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
   try {
     for (const [accountKey, snapshot] of Object.entries(read())) {
       for (const kind of ["failure", "expiry"] as const) {
-        const candidate = snapshot[kind];
-        if (!candidate) continue;
         // A send can await for seconds. Re-read each incident and account after the preceding send.
         const account = listAccounts().find((a) => key(a) === accountKey);
         if (!account) {
-          forgetAccountAuth({ name: snapshot.name, dir: snapshot.dir, isDefault: false });
-          continue;
+          safely(() => forgetAccountAuth({ name: snapshot.name, dir: snapshot.dir, isDefault: false }));
+          break;
         }
+        const candidate = snapshot[kind];
+        if (!candidate) continue;
         if (kind === "expiry") checkAuthExpiry(account);
         const health = read()[accountKey];
         const incident = health?.[kind];
         if (!incident || incident.id !== candidate.id || incident.delivered || delivered.has(incident.id)) continue;
         const version = credentialStatus(account).version;
         const remembered = lastSent.get(`${path()}:${accountKey}:${kind}`);
-        const previous = remembered && remembered.at > (health.lastSent?.[kind]?.at ?? 0) ? remembered : health.lastSent?.[kind];
+        const previous = remembered && remembered.generation === health.generation && remembered.at > (health.lastSent?.[kind]?.at ?? 0) ? remembered : health.lastSent?.[kind];
         if (previous && previous.credentials === version && Date.now() - previous.at < SIX_HOURS) continue;
         let sent = false;
         try { sent = await send(warningText(machine, account, incident), incident.id); } catch {}
@@ -194,10 +207,10 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         // Even if the durable write fails, this process must not resend on every tick.
         delivered.add(incident.id);
         const delivery = { at: Date.now(), credentials: version };
-        lastSent.set(`${path()}:${accountKey}:${kind}`, delivery);
+        lastSent.set(`${path()}:${accountKey}:${kind}`, { ...delivery, generation: health.generation });
         safely(() => update((state) => {
           const current = state[accountKey];
-          if (!current) return;
+          if (!current || current.generation !== health.generation) return;
           (current.lastSent ??= {})[kind] = delivery;
           if (current[kind]?.id === incident.id) current[kind]!.delivered = true;
         }));

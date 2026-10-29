@@ -131,7 +131,7 @@ test('timeout signals TERM before KILL and never validates the endpoint', async 
   writeFileSync(cli, `#!${process.execPath}\nimport {writeFileSync} from 'node:fs';\nif (process.argv.includes('--version')) { console.log('2.1.302 (Claude Code)'); process.exit(0); }\nprocess.on('SIGTERM', () => { writeFileSync(${JSON.stringify(term)}, 'term'); });\nwriteFileSync(${JSON.stringify(ready)}, 'ready');\nsetInterval(() => {}, 10);`);
   chmodSync(cli, 0o755); process.env.CLAUDE_BIN = cli;
   let calls = 0;
-  const start = Date.now();
+  let readyAt = 0;
   const spawn = Bun.spawn;
   // Hold spawn's return until the real child installs its handler, so runClaude's
   // timeout starts after readiness. The version subprocess needs no handshake.
@@ -140,6 +140,7 @@ test('timeout signals TERM before KILL and never validates the endpoint', async 
     if (args.includes('/usage')) {
       const deadline = Date.now() + 5000;
       while (!existsSync(ready) && Date.now() < deadline) Bun.sleepSync(5);
+      readyAt = Date.now();
     }
     return child;
   };
@@ -147,7 +148,8 @@ test('timeout signals TERM before KILL and never validates the endpoint', async 
   finally { Bun.spawn = spawn; }
   expect(existsSync(ready)).toBe(true);
   expect(readFileSync(term, 'utf8')).toBe('term');
-  expect(Date.now() - start).toBeGreaterThanOrEqual(1100);
+  expect(readyAt).toBeGreaterThan(0);
+  expect(Date.now() - readyAt).toBeGreaterThanOrEqual(1100);
   expect(calls).toBe(0);
   expect(accountStatus()[0].authFailedSince).toBeNull();
 });

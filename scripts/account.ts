@@ -55,7 +55,11 @@ if (command === "add") {
   // follow them into the shared config.
   const account = { name: checkName(name), dir: join(accountsDir(), checkName(name)), isDefault: false };
   rmSync(account.dir, { recursive: true, force: true });
-  forgetAccountAuth(account);
+  try { forgetAccountAuth(account); }
+  catch {
+    console.error(`Unable to remove authentication state for account ${account.name}; the account directory was removed. Check account-auth.json before re-adding it.`);
+    process.exit(1);
+  }
 } else {
   console.error("Usage: bun run account add|list|remove <name>");
   process.exit(2);

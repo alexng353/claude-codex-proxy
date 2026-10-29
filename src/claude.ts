@@ -1,3 +1,4 @@
+import { STRIPPED_ENV } from "./claude-env";
 import { authIncidentId, credentialStatus, recordCredentialObservation } from "./auth-health";
 import { normalizeContext } from "./context.mjs";
 import {
@@ -305,12 +306,8 @@ class ClaudeWorker {
       // The map only saves cache; a broken database must not block inference.
       console.error("Unable to register Claude session:", (error as Error).message);
     }
-    const {
-      CLAUDECODE: _nested,
-      CLAUDE_CODE_OAUTH_TOKEN: _inheritedToken,
-      CLAUDE_CODE_EFFORT_LEVEL: _effortLevel,
-      ...env
-    } = process.env;
+    const { CLAUDE_CODE_EFFORT_LEVEL: _effortLevel, ...env } = process.env;
+    for (const key of STRIPPED_ENV) delete env[key];
     this.subprocess = Bun.spawn(
       [
         process.env.CLAUDE_BIN ?? "claude",
