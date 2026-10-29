@@ -5,6 +5,8 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  readlinkSync,
+  unlinkSync,
   symlinkSync,
   statSync,
   writeFileSync,
@@ -205,8 +207,12 @@ export function linkSharedEntries(dir: string): void {
   mkdirSync(dir, { recursive: true });
   mkdirSync(join(base, "projects"), { recursive: true });
   for (const entry of readdirSync(base)) {
-    if (isPrivate(entry)) continue;
     const link = join(dir, entry);
+    if (isPrivate(entry)) {
+      // Undo only the exact symlinks made by older shared-entry linkers.
+      try { if (readlinkSync(link) === join(base, entry)) unlinkSync(link); } catch {}
+      continue;
+    }
     try {
       lstatSync(link);
       continue;

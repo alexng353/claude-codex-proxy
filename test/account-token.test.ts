@@ -1,9 +1,12 @@
-import { afterEach, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { afterEach, expect, test, spyOn } from 'bun:test';
+import { chmodSync, existsSync, linkSync, lstatSync, readFileSync, statSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { accountEnv, accountStatus, isUnavailable, linkSharedEntries, listAccounts, markAuthFailed, resetAccountState } from '../src/accounts';
 import { checkAuthExpiry, credentialStatus, flushAuthWarnings, validateSubscriptionAuth } from '../src/auth-health';
+import { accountToken } from '../src/account-token';
 import { createScrubber } from '../src/scrub.mjs';
 import { probeAccount, resetUsageProbe } from '../src/usage-probe';
 const saved = { ...process.env };
@@ -45,7 +48,9 @@ test('token symlinks are refused and default token files are never shared', () =
   linkSharedEntries(extra);
   expect(() => accountEnv({ name: 'extra', dir: extra, isDefault: false })).not.toThrow();
   expect(accountEnv({ name: 'extra', dir: extra, isDefault: false }).CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
-  rmSync(join(a.dir, 'oauth-token')); symlinkSync(join(a.dir, 'oauth-token.expires-at'), join(a.dir, 'oauth-token'));
+  expect(existsSync(join(extra, 'oauth-token.expires-at'))).toBe(false);
+  const valid = join(root, 'valid-token'); writeFileSync(valid, fake, { mode: 0o600 });
+  rmSync(join(a.dir, 'oauth-token')); symlinkSync(valid, join(a.dir, 'oauth-token'));
   expect(() => accountEnv(a)).toThrow('oauth-token');
 });
 test('token expiry warns at 14 days, dedupes, and ignores login refresh expiry', async () => {
@@ -74,20 +79,45 @@ test('scrub token assignments and structured child env even with opaque values',
   expect(scrubber.scrub(`CLAUDE_CODE_OAUTH_TOKEN=${fake} claude`)).not.toContain(fake);
   expect(JSON.stringify(scrubber.scrubRequest({ env: { CLAUDE_CODE_OAUTH_TOKEN: fake } }))).not.toContain(fake);
 });
-test('all four launchers inject only the account token after ambient stripping', async () => {
-  const a = setup(); process.env.CLAUDE_CODE_OAUTH_TOKEN = 'ambient-fake';
+test('all launchers isolate token/config pairs and strip ambient tokens for login accounts', async () => {
+  setup();
+  for (const [name, token] of [['extra', 'distinct-named-fake-token'], ['login', null]] as const) {
+    const dir = join(root, 'state/accounts', name); mkdirSync(dir, { recursive: true });
+    if (token) writeFileSync(join(dir, 'oauth-token'), token, { mode: 0o600 });
+    else writeFileSync(join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'fake', refreshToken: 'fake' } }));
+  }
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = 'ambient-fake-token-must-not-leak';
   const { claudeClassifier } = await import('../src/hygiene-proof');
   const { claudeRunner } = await import('../src/perpetual/summarizer');
   const { runClaude, closeIdleWorkers } = await import('../src/claude');
-  closeIdleWorkers(); const spawn = Bun.spawn; const seen: any[] = [];
-  (Bun as any).spawn = (_args: any, options: any) => { seen.push(options.env); throw new Error('boundary stopped'); };
+  const spawn = Bun.spawn; const seen: { args: string[]; env: any }[] = [];
+  (Bun as any).spawn = (args: string[], options: any) => {
+    seen.push({ args, env: options.env });
+    if (args.includes('--version') || args.includes('/usage')) {
+      const report = args.includes('--version') ? '2.1.302 (Claude Code)' : JSON.stringify({
+        type: 'assistant', local_command_run: { command: 'usage' },
+        usage_report: { rate_limits: { limits: [{ kind: 'session', percent: 1 }] } },
+      });
+      return spawn([process.execPath, '-e', `console.log(${JSON.stringify(report)})`], options);
+    }
+    throw new Error('boundary stopped');
+  };
   try {
-    await expect(runClaude({ model: 'sonnet', input: 'hello' })).rejects.toThrow('boundary stopped');
-    await expect(claudeClassifier({} as any, { kinds: [] })).rejects.toThrow('boundary stopped');
-    expect(() => claudeRunner('haiku')('test-thread')).toThrow('boundary stopped');
-    await expect(probeAccount(a)).rejects.toThrow('boundary stopped');
-    expect(seen).toHaveLength(4);
-    for (const env of seen) expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(fake);
+    for (const [name, token] of [['default', fake], ['extra', 'distinct-named-fake-token'], ['login', undefined]] as const) {
+      closeIdleWorkers(); resetUsageProbe(); resetAccountState(); seen.length = 0;
+      process.env.CLAUDE_ACCOUNT_ORDER = name;
+      const account = listAccounts().find(a => a.name === name)!;
+      await expect(runClaude({ model: 'sonnet', input: 'hello' })).rejects.toThrow('boundary stopped');
+      await expect(claudeClassifier({} as any, { kinds: [] })).rejects.toThrow('boundary stopped');
+      expect(() => claudeRunner('haiku')(`test-thread-${name}`)).toThrow('boundary stopped');
+      expect((await probeAccount(account)).result).toBe('applied');
+      expect(seen).toHaveLength(5);
+      expect(seen[3].args).toContain('--version'); expect(seen[4].args).toContain('/usage');
+      for (const { env } of seen) {
+        expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe(token);
+        expect(env.CLAUDE_CONFIG_DIR).toBe(account.dir);
+      }
+    }
   } finally { Bun.spawn = spawn; closeIdleWorkers(); }
 });
 test('switching to token mode cancels an undelivered login refresh warning', async () => {
@@ -122,8 +152,76 @@ test('token probe scope refusal remains unknown and does not disable routing', a
   const a = setup(); const cli = join(root, 'fake-claude');
   writeFileSync(cli, `#!${process.execPath}\nif (process.argv.includes('--version')) console.log('2.1.302 (Claude Code)');\n`, { mode: 0o700 });
   process.env.CLAUDE_BIN = cli;
-  const outcome = await probeAccount(a, account => validateSubscriptionAuth(account, async () => new Response('', { status: 403 })));
+  let validations = 0;
+  const outcome = await probeAccount(a, account => {
+    expect(account).toEqual(a);
+    return validateSubscriptionAuth(account, async () => { validations++; const response = new Response('', { status: 403 }); expect(response.status).toBe(403); return response; });
+  });
+  expect(validations).toBe(1);
   expect(outcome.result).toBe('unavailable');
   expect(isUnavailable(a)).toBe(false);
   expect(accountStatus()[0].authFailedSince).toBeNull();
+});
+
+test('legacy shared token symlinks do not disable named login accounts', () => {
+  const base = setup(); const dir = join(root, 'state/accounts/legacy'); mkdirSync(dir, { recursive: true });
+  writeFileSync(join(base.dir, 'oauth-token.expires-at'), '2030-01-01T00:00:00Z');
+  for (const name of ['oauth-token', 'oauth-token.expires-at']) symlinkSync(join(base.dir, name), join(dir, name));
+  writeFileSync(join(dir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'login-fake', refreshToken: 'refresh-fake' } }));
+  const named = listAccounts().find(a => a.name === 'legacy')!;
+  expect(isUnavailable(named)).toBe(false);
+  expect(accountEnv(named).CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  linkSharedEntries(dir);
+  for (const name of ['oauth-token', 'oauth-token.expires-at']) expect(() => lstatSync(join(dir, name))).toThrow();
+});
+test('token reader does not open login credentials', () => {
+  const a = setup(); const reader = spyOn(fs, 'readFileSync'); const opener = spyOn(fs, 'openSync');
+  try {
+    credentialStatus(a); accountEnv(a); isUnavailable(a);
+    for (const call of [...reader.mock.calls, ...opener.mock.calls]) expect(String(call[0])).not.toContain('.credentials.json');
+  } finally { reader.mockRestore(); opener.mockRestore(); }
+});
+test('token version is filesystem metadata, never a token digest', () => {
+  const a = setup(); const stat = statSync(join(a.dir, 'oauth-token'));
+  const version = credentialStatus(a).version!;
+  expect(version).toBe(`token:${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`);
+  expect(version).not.toContain(createHash('sha256').update(fake).digest('hex'));
+});
+test('hardlinked or foreign-owned token files are refused', () => {
+  const a = setup(); const path = join(a.dir, 'oauth-token'); linkSync(path, join(root, 'hardlink'));
+  expect(accountToken(a)?.state).toBe('failed');
+  rmSync(join(root, 'hardlink'));
+  const original = fs.fstatSync; const stub = spyOn(fs, 'fstatSync').mockImplementation(((...args: any[]) => {
+    const stat = (original as any)(...args); stat.uid = process.getuid!() + 1; return stat;
+  }) as any);
+  try { expect(accountToken(a)?.state).toBe('failed'); } finally { stub.mockRestore(); }
+});
+for (const kind of ['symlink', 'large', 'directory', 'fifo'] as const) test(`expiry reader refuses ${kind}`, () => {
+  const a = setup(); const file = join(a.dir, 'oauth-token.expires-at');
+  if (kind === 'symlink') { writeFileSync(join(root, 'expiry'), '2030-01-01T00:00:00Z'); symlinkSync(join(root, 'expiry'), file); }
+  if (kind === 'large') writeFileSync(file, ' '.repeat(65) + '2030-01-01T00:00:00Z');
+  if (kind === 'directory') mkdirSync(file);
+  if (kind === 'fifo') expect(Bun.spawnSync(['mkfifo', file]).exitCode).toBe(0);
+  expect(credentialStatus(a).expiresAt).toBeNull();
+});
+test('expiry-only edits replace the pending incident date at the exact 14-day boundary', async () => {
+  const a = setup(); const now = Date.parse('2026-10-29T00:00:00.000Z');
+  const clock = spyOn(Date, 'now').mockReturnValue(now); const file = join(a.dir, 'oauth-token.expires-at');
+  const messages: string[] = []; const send = async (s: string) => { messages.push(s); return true; };
+  try {
+    writeFileSync(file, new Date(now + 14 * 86400000 + 1).toISOString());
+    checkAuthExpiry(a); await flushAuthWarnings(send); expect(messages).toHaveLength(0);
+    writeFileSync(file, new Date(now + 14 * 86400000).toISOString()); checkAuthExpiry(a);
+    await flushAuthWarnings(send); expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain(new Date(now + 14 * 86400000).toISOString());
+    const changed = new Date(now + 13 * 86400000).toISOString();
+    writeFileSync(file, changed); checkAuthExpiry(a); await flushAuthWarnings(send);
+    expect(messages).toHaveLength(2); expect(messages[1]).toContain(changed);
+  } finally { clock.mockRestore(); }
+});
+test('token-to-login mode switch drops pending token expiry', async () => {
+  const a = setup(); writeFileSync(join(a.dir, 'oauth-token.expires-at'), new Date(Date.now() + 10 * 86400000).toISOString());
+  checkAuthExpiry(a); rmSync(join(a.dir, 'oauth-token'));
+  const messages: string[] = []; await flushAuthWarnings(async s => { messages.push(s); return true; });
+  expect(messages).toHaveLength(0); expect(credentialStatus(a).authMode).toBe('login');
 });

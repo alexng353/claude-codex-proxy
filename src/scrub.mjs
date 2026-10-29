@@ -57,6 +57,68 @@ const PATTERNS = [
 const ASSIGNMENT =
   /\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|_PAT|AUTH_KEY)[A-Za-z0-9_]*)(["']?\s*[=:]\s*["']?)([^\s"'`$\\,;)}\]]{12,})/gi;
 
+// OAuth assignments occur in shell traces, JSON and JSON serialized inside JSON.
+// Parse the value as one word so redaction cannot consume code or leave a tail.
+const OAUTH_NAME = "CLAUDE_CODE_OAUTH_TOKEN";
+const OAUTH_MARKER = `[REDACTED:${OAUTH_NAME}]`;
+function isOAuthToken(value) {
+  return value.length >= 16 && /^[A-Za-z0-9_+/=-]+$/.test(value)
+    && !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value);
+}
+function oauthWord(text, start) {
+  if (text.startsWith('\\"', start)) {
+    const end = text.indexOf('\\"', start + 2);
+    if (end < 0 || /[\r\n]/.test(text.slice(start, end))) return null;
+    try {
+      const value = JSON.parse(JSON.parse(`"${text.slice(start, end + 2)}"`));
+      return { value, end: end + 2, quote: '\\"' };
+    } catch { return null; }
+  }
+  let at = start, value = "", quote = "";
+  while (at < text.length && !/[\s,;)}\]]/.test(text[at])) {
+    const c = text[at];
+    if (c === '"' || c === "'") {
+      if (at === start) quote = c;
+      const begin = at++;
+      let part = "";
+      while (at < text.length && text[at] !== c) {
+        if (/[\r\n]/.test(text[at])) return null;
+        if (c === '"' && text[at] === "\\") {
+          if (at + 1 >= text.length || /[\r\n]/.test(text[at + 1])) return null;
+          part += text.slice(at, at + 2); at += 2;
+        } else part += text[at++];
+      }
+      if (text[at] !== c) return null;
+      at++;
+      if (c === '"') {
+        try { part = JSON.parse(text.slice(begin, at)); } catch { return null; }
+      }
+      value += part;
+    } else {
+      // Expressions and property access are deliberately not token literals.
+      if (c === '$' || c === '`' || c === '(') return null;
+      if (c === "\\") {
+        if (at + 1 >= text.length || /[\r\n]/.test(text[at + 1])) return null;
+        value += text[at + 1]; at += 2;
+      } else value += text[at++];
+    }
+  }
+  return { value, end: at, quote };
+}
+function scrubOAuthAssignments(text) {
+  const assignment = /\bCLAUDE_CODE_OAUTH_TOKEN(?:\\?["'])?[ \t]*[=:][ \t]*/g;
+  let out = "", copied = 0;
+  for (let match; (match = assignment.exec(text));) {
+    const start = assignment.lastIndex;
+    const word = oauthWord(text, start);
+    if (!word || !isOAuthToken(word.value)) continue;
+    out += text.slice(copied, start) + word.quote + OAUTH_MARKER + word.quote;
+    copied = word.end;
+    assignment.lastIndex = word.end;
+  }
+  return out + text.slice(copied);
+}
+
 function looksLikeToken(value) {
   return /[0-9]/.test(value) && /[A-Za-z]/.test(value) && !value.startsWith("[REDACTED");
 }
@@ -227,6 +289,10 @@ export function loadSecretEntries(file) {
     return [];
   }
   try {
+    if (file.endsWith("/oauth-token")) {
+      const value = readFileSync(file, "utf8").trim();
+      return value ? [[OAUTH_NAME, value]] : [];
+    }
     if (/\.(zsh|sh|bash)$/.test(file)) return [...loadShellFile(file), ...commentedExports(file)];
     if (/\.(json|toml|ya?ml|key|asc|pem)$/.test(file)) {
       const text = readFileSync(file, "utf8");
@@ -299,7 +365,11 @@ export function defaultSecretFiles(env = process.env) {
   if (env.SECRET_SCRUB_FILES != null)
     return env.SECRET_SCRUB_FILES.split(":").filter(Boolean);
   const home = homedir();
+  const base = env.CLAUDE_CONFIG_DIR ?? join(home, ".claude");
+  const state = env.PROXY_STATE_DIR ?? join(env.XDG_STATE_HOME ?? join(home, ".local/state"), "claude-codex-proxy");
   return [
+    join(base, "oauth-token"),
+    join(state, "accounts/*/oauth-token"),
     join(home, ".config/zsh/secrets.zsh"),
     join(home, ".config/spotlike/env"),
     join(home, ".config/gh/hosts.yml"),
@@ -372,13 +442,12 @@ export function createScrubber(options = {}) {
   function scrub(text) {
     if (typeof text !== "string" || text.length < MIN_VALUE_LENGTH) return text;
     refresh();
-    let out = text.replace(/\b(CLAUDE_CODE_OAUTH_TOKEN)(["']?\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;}\]]+)/g,
-      (_whole, name, separator) => `${name}${separator}[REDACTED:${name}]`);
+    let out = scrubOAuthAssignments(text);
     if (literal) out = out.replace(literal, (value) => `[REDACTED:${labels.get(value)}]`);
     for (const [pattern, label] of PATTERNS)
       out = out.replace(pattern, `[REDACTED:${label}]`);
     out = out.replace(ASSIGNMENT, (whole, name, separator, value) =>
-      looksLikeToken(value) ? `${name}${separator}[REDACTED:${name}]` : whole,
+      name !== OAUTH_NAME && looksLikeToken(value) ? `${name}${separator}[REDACTED:${name}]` : whole,
     );
     return out;
   }
@@ -386,7 +455,7 @@ export function createScrubber(options = {}) {
   /** Copy-on-write walk: returns the same object when nothing changed. */
   function scrubValue(value, key) {
     if (typeof value === "string") {
-      if (key === "CLAUDE_CODE_OAUTH_TOKEN") return "[REDACTED:CLAUDE_CODE_OAUTH_TOKEN]";
+      if (key === OAUTH_NAME && isOAuthToken(value)) return OAUTH_MARKER;
       if (key === "encrypted_content" || value.startsWith("data:")) return value;
       return scrub(value);
     }

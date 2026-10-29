@@ -301,7 +301,7 @@ The proxy reads `oauth-token` from that account's config directory:
 | `default` | `~/.claude/oauth-token` (or `$CLAUDE_CONFIG_DIR/oauth-token` if the proxy sets that variable) |
 | Named account | `~/.local/state/claude-codex-proxy/accounts/<name>/oauth-token` (under `$PROXY_STATE_DIR/accounts` when overridden) |
 
-The file must be a regular file with **exactly mode 600**. Symlinks, empty files,
+The file must be a regular file owned by the proxy user, with one hard link and **exactly mode 600**. Symlinks, empty files,
 and unreadable or incorrectly permissioned files are refused; they do not fall
 back to login. Token files and their metadata are private to each account and
 are never linked into another account. Remove the token file to return to the
@@ -351,20 +351,21 @@ the browser sign-in. Do not send tokens through chat, shell history, or logs.
 
    ```bash
    python3 - "$account_dir" <<'PY'
-   import datetime, getpass, os, pathlib, sys, tempfile
+   import datetime, getpass, os, pathlib, re, sys, tempfile
    directory = pathlib.Path(sys.argv[1])
    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
    token = getpass.getpass('Paste setup token (hidden): ').strip()
    if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
        raise SystemExit('Expected one nonempty token without whitespace')
-   with open('/dev/tty', 'r+') as terminal:
-       terminal.write('Known expiry in UTC (ISO timestamp, or blank): ')
-       terminal.flush()
-       expiry = terminal.readline().strip()
+   with open('/dev/tty', 'r') as terminal_in, open('/dev/tty', 'w') as terminal_out:
+       terminal_out.write('Known expiry in UTC (ISO timestamp, or blank): ')
+       terminal_out.flush()
+       expiry = terminal_in.readline().strip()
    if expiry:
-       if not expiry.endswith('Z'):
-           raise SystemExit('Expiry must end in Z (UTC)')
-       datetime.datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+       if not re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z', expiry):
+           raise SystemExit('Use YYYY-MM-DDTHH:MM:SS[.sss]Z (UTC)')
+       if datetime.datetime.fromisoformat(expiry.replace('Z', '+00:00')).timestamp() <= 0:
+           raise SystemExit('Expiry must be after the Unix epoch')
    fd, staging = tempfile.mkstemp(prefix='.oauth-install-', dir=directory)
    try:
        with os.fdopen(fd, 'w') as output:
@@ -381,7 +382,7 @@ the browser sign-in. Do not send tokens through chat, shell history, or logs.
    ```
 
 4. Check `/accounts` for `authMode: "token"`. New subprocesses read the file;
-   workers already running keep their current authentication until they exit.
+   active turns keep their current authentication; idle workers are replaced before their next turn if the credential file changes.
    Do not restart the proxy during active turns. Confirm a normal request when
    convenient; an unavailable `/usage` result alone does not mean the token is bad.
 

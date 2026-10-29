@@ -279,6 +279,8 @@ class ClaudeWorker {
   private turn: TurnContext = { requestId: "" };
   private attempt = 1;
   private observedCredentials: string | undefined;
+  readonly spawnCredentials: string | undefined;
+  private readonly spawnAuthMode: "token" | "login";
   private observedAuthIncident: string | undefined;
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
@@ -293,6 +295,9 @@ class ClaudeWorker {
     resumeAt?: string,
   ) {
     this.account = account;
+    const credentials = credentialStatus(account);
+    this.spawnCredentials = credentials.version;
+    this.spawnAuthMode = credentials.authMode;
     this.resumedFrom = resumeFrom;
     this.model = request.model;
     this.effort = resolveEffort(request);
@@ -453,9 +458,11 @@ class ClaudeWorker {
       // An expired bearer can fail after a transient refresh outage. Retain routing
       // backoff, but only demand login for a dead marker or a structured 401
       // rejecting this turn's fresh bearer. Helper stderr is not auth evidence.
+      const current = this.spawnAuthMode === "token" ? this.spawnCredentials : this.observedCredentials;
       const failed = credentials.state === "failed" ||
-        (status === 401 && credentials.version === this.observedCredentials && (credentials.authMode === "token" || (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000));
-      markAuthFailed(this.account, failed);
+        (status === 401 && credentials.version === current && (credentials.authMode === "token" || (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000));
+      // A retired worker says nothing about the replacement token, including cooldown.
+      if (this.spawnAuthMode !== "token" || credentials.version === this.spawnCredentials) markAuthFailed(this.account, failed);
     }
     recordFailure({
       event: "failure",
@@ -616,7 +623,7 @@ function claimWorker(
   // Most recently parked first.
   for (const worker of [...idleWorkers].reverse()) {
     // A limited account cannot answer; the session resumes on another one.
-    if (isUnavailable(worker.account)) {
+    if (worker.spawnCredentials !== credentialStatus(worker.account).version || isUnavailable(worker.account)) {
       worker.close();
       continue;
     }

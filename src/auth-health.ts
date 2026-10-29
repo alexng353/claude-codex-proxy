@@ -10,7 +10,7 @@ import { STRIPPED_ENV } from "./claude-env";
 
 type FailureIncident = { id: string; since: string; delivered?: boolean };
 type ExpiryIncident = FailureIncident & { expiresAt: number; authMode?: "token" | "login"; version?: string };
-type Delivery = { at: number; credentials: string | undefined };
+type Delivery = { at: number; credentials: string | undefined; expiresAt?: number };
 type Health = {
   generation: string;
   name: string;
@@ -168,7 +168,7 @@ export function checkAuthExpiry(account: Account, now = Date.now()): void {
     const health = entry(state, account);
     noteCredentials(health, version);
     if (health.expiry && (health.expiry.authMode ?? "login") !== authMode) delete health.expiry;
-    if (authMode === "token" && health.expiry?.version !== version) delete health.expiry;
+    if (authMode === "token" && health.expiry && (health.expiry.version !== version || (expiry !== null && health.expiry.expiresAt !== expiry))) delete health.expiry;
     if (expiry === null) return; // Unknown does not rearm an existing warning.
     // Match the CLI's stale metadata guard. An already-past deadline is silent.
     if (expiry <= now || expiry > now + window || (authMode === "login" && expiresAt !== null && expiresAt > expiry + THREE_DAYS)) {
@@ -222,13 +222,14 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         const version = credentialStatus(account).version;
         const remembered = lastSent.get(`${path()}:${accountKey}:${kind}`);
         const previous = remembered && remembered.generation === health.generation && remembered.at > (health.lastSent?.[kind]?.at ?? 0) ? remembered : health.lastSent?.[kind];
-        if (previous && previous.credentials === version && Date.now() - previous.at < SIX_HOURS) continue;
+        const expiry = "expiresAt" in incident ? incident.expiresAt : undefined;
+        if (previous && previous.credentials === version && (previous.expiresAt === undefined || previous.expiresAt === expiry) && Date.now() - previous.at < SIX_HOURS) continue;
         let sent = false;
         try { sent = await send(warningText(machine, account, incident), incident.id); } catch {}
         if (!sent) continue;
         // Even if the durable write fails, this process must not resend on every tick.
         delivered.add(incident.id);
-        const delivery = { at: Date.now(), credentials: version };
+        const delivery = { at: Date.now(), credentials: version, ...(expiry !== undefined ? { expiresAt: expiry } : {}) };
         lastSent.set(`${path()}:${accountKey}:${kind}`, { ...delivery, generation: health.generation });
         safely(() => update((state) => {
           const current = state[accountKey];
