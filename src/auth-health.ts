@@ -156,7 +156,7 @@ function readCredentials(account: Account) {
 /** Only metadata leaves the credential reader; tokens never enter state or logs. */
 export function credentialStatus(account: Account) {
   const { version, state, oauth, authMode } = readCredentials(account);
-  return { version, state, authMode: authMode ?? "login" as const, expiresAt: timestamp(oauth?.expiresAt), refreshTokenExpiresAt: timestamp(oauth && "refreshTokenExpiresAt" in oauth ? oauth.refreshTokenExpiresAt : null) };
+  return { version, state, hasRefreshToken: !!(oauth && "refreshToken" in oauth && typeof oauth.refreshToken === "string" && oauth.refreshToken.length), authMode: authMode ?? "login" as const, expiresAt: timestamp(oauth?.expiresAt), refreshTokenExpiresAt: timestamp(oauth && "refreshTokenExpiresAt" in oauth ? oauth.refreshTokenExpiresAt : null) };
 }
 export function checkAuthExpiry(account: Account, now = Date.now()): void {
   if (!account.isDefault && !existsSync(account.dir)) return;

@@ -33,6 +33,7 @@ export type ProbeWindow = { usedPercent: number; resetsAt: string | null };
 const DEFAULT_INTERVAL_MS = 12 * 60_000;
 const DEFAULT_INITIAL_DELAY_MS = 15_000;
 const PROBE_TIMEOUT_MS = 15_000;
+const FAILED_REFRESH_AGE_MS = 10 * 60_000;
 
 /** Windows from `claude -p /usage --output-format stream-json`, keyed like `rate_limit_event`. */
 export function parseUsageReport(text: string): Record<string, ProbeWindow> | undefined {
@@ -154,7 +155,7 @@ async function supportsUsage(account: Account): Promise<boolean> {
   return usageSupported;
 }
 
-export type ProbeOutcome = { account: string; result: "applied" | "newer data" | "unavailable" | `auth failed since ${string}` };
+export type ProbeOutcome = { account: string; result: "applied" | "newer data" | "unavailable" | `auth failed since ${string}`; reason?: string };
 
 /** Probe one account and record what it reports. */
 export async function probeAccount(
@@ -163,9 +164,10 @@ export async function probeAccount(
   timeoutMs = PROBE_TIMEOUT_MS,
 ): Promise<ProbeOutcome> {
   checkAuthExpiry(account);
+  let reason: string | undefined;
   const unavailable = (): ProbeOutcome => {
     const since = authHealth(account).authFailedSince;
-    return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable" };
+    return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable", ...(reason ? { reason } : {}) };
   };
   const initial = credentialStatus(account);
   if ((initial.authMode === "token" && initial.state === "failed") || (!account.isDefault && initial.version === "missing")) {
@@ -178,7 +180,7 @@ export async function probeAccount(
   }
   const observedId = authIncidentId(account);
   const startedAt = Date.now();
-  const observedCredentials = credentialStatus(account).version;
+  const observedCredentials = credentialStatus(account);
   const result = await runClaude(
     account,
     ["-p", "/usage", "--output-format", "stream-json", "--verbose", "--no-session-persistence",
@@ -210,8 +212,19 @@ export async function probeAccount(
       } catch {}
     }
     if (limited || !completed) return unavailable();
+    reason = "no meters in /usage report";
+    // A completed local command with no meters and unchanged, long-expired login
+    // credentials demonstrates that the CLI did not renew. A bearer 401 alone does not.
+    if (credentials.authMode === "login" && credentials.hasRefreshToken
+        && observedCredentials.version !== undefined && credentials.version === observedCredentials.version
+        && observedCredentials.expiresAt !== null
+        && observedCredentials.expiresAt < startedAt - FAILED_REFRESH_AGE_MS) {
+      reason = `refresh not renewing; access expired ${new Date(observedCredentials.expiresAt).toISOString()}`;
+      markAuthFailed(account);
+      return unavailable();
+    }
     // A rejected bearer inside the CLI's refresh buffer is not proof that login is dead.
-    if (authError && credentials.version === observedCredentials && (credentials.authMode === "token" || (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000)) {
+    if (authError && credentials.version === observedCredentials.version && (credentials.authMode === "token" || (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000)) {
       markAuthFailed(account);
       return unavailable();
     }
@@ -294,7 +307,7 @@ export function startUsageProbe(
         const auth = account ? authHealth(account) : undefined;
         const expiry = auth?.authMode === "token"
           ? ` expires=${auth.tokenExpiresAt === null ? "unknown" : new Date(auth.tokenExpiresAt).toISOString()}` : "";
-        return `${outcome.account} ${auth?.authMode ?? "removed"}${expiry} ${outcome.result}`;
+        return `${outcome.account} ${auth?.authMode ?? "removed"}${expiry} ${outcome.result}${outcome.reason ? ` (${outcome.reason})` : ""}`;
       });
       console.log(`Usage probe: ${reports.join(", ")}`);
     }

@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"What's contributing to your usage?\nApproximate · sessions on this machine only · shares overlap"}]},"local_command_run":{"command":"usage","args":""},"usage_report":{"rate_limits":null}}
+{"type":"result","is_error":false,"subtype":"success","num_turns":0,"total_cost_usd":0,"local_command":"usage","result":"What's contributing to your usage?\nApproximate · sessions on this machine only · shares overlap"}
