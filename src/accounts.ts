@@ -14,7 +14,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { accountToken } from "./account-token";
-import { authHealth, clearAuthIncident, recordAuthFailure } from "./auth-health";
+import { authHealth, clearAuthIncident, recordAuthFailure, clearRefreshSuspicion } from "./auth-health";
 import { withLock } from "./filelock";
 import { stateDir } from "./sessions";
 
@@ -277,6 +277,7 @@ export function isUnavailable(account: Account, now = Date.now()): boolean {
 
 /** Successful requests clear the cooldown immediately, including within one process. */
 export function markAuthSucceeded(account: Account, observedId: string | undefined): void {
+  clearRefreshSuspicion(account);
   // Normal successful turns have nothing to clear; avoid a disk lock on every turn.
   if (observedId === undefined && !authFailedUntil.has(account.name)) return;
   if (!clearAuthIncident(account, observedId)) return;

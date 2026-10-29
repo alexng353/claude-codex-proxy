@@ -8,7 +8,7 @@ import { tryLock, unlock, withLock } from "./filelock";
 import { stateDir } from "./sessions";
 import { STRIPPED_ENV } from "./claude-env";
 
-type FailureIncident = { id: string; since: string; delivered?: boolean };
+type FailureIncident = { id: string; since: string; delivered?: boolean; credentialsVersion?: string };
 type ExpiryIncident = FailureIncident & { expiresAt: number; authMode?: "token" | "login"; version?: string };
 type Delivery = { at: number; credentials: string | undefined; expiresAt?: number };
 type Health = {
@@ -19,6 +19,8 @@ type Health = {
   expiry?: ExpiryIncident;
   seenCredentials?: boolean;
   missingSince?: number;
+  refreshSuspectSince?: string;
+  refreshSuspectVersion?: string;
   lastSent?: Partial<Record<"failure" | "expiry", Delivery>>;
 };
 type State = Record<string, Health>;
@@ -81,7 +83,39 @@ function entry(state: State, account: Account): Health {
 function get(account: Account): Health | undefined | null {
   try { return read()[key(account)]; } catch { return null; }
 }
+function clearSuspicion(health: Health): void {
+  delete health.refreshSuspectSince;
+  delete health.refreshSuspectVersion;
+}
+export function clearRefreshSuspicion(account: Account): void {
+  if (!get(account)?.refreshSuspectSince) return;
+  safely(() => update(state => { const health = state[key(account)]; if (health) clearSuspicion(health); }));
+}
+/** Confirm only repeated failure of the same credentials across separate probe intervals. */
+export function confirmRefreshFailure(account: Account, version: string, now: number): boolean {
+  try {
+    return update(state => {
+      if (!account.isDefault && !existsSync(account.dir)) return false;
+      const current = credentialStatus(account);
+      if (current.version !== version || current.authMode !== "login") return false;
+      const health = entry(state, account);
+      if (health.refreshSuspectVersion !== version || !health.refreshSuspectSince) {
+        health.refreshSuspectSince = new Date(now).toISOString();
+        health.refreshSuspectVersion = version;
+        return false;
+      }
+      return now - Date.parse(health.refreshSuspectSince) >= 10 * 60_000;
+    });
+  } catch { console.error("Unable to update account authentication state"); return false; }
+}
+export function authIncidentCredentialsChanged(account: Account, observedId: string | undefined): boolean {
+  const incident = get(account)?.failure;
+  const current = credentialStatus(account);
+  return incident?.id === observedId && incident?.credentialsVersion !== undefined
+    && current.state === "present" && current.version !== undefined && current.version !== incident.credentialsVersion;
+}
 function noteCredentials(health: Health, version: string | undefined): void {
+  if (version !== undefined && health.refreshSuspectVersion !== version) clearSuspicion(health);
   if (!version || version === "missing") return;
   health.seenCredentials = true;
   delete health.missingSince;
@@ -92,7 +126,7 @@ export function recordCredentialObservation(account: Account, version: string | 
   if (!version || version === "missing") return;
   const known = get(account);
   if (known === null) return;
-  if (known?.seenCredentials && known.missingSince === undefined) return;
+  if (known?.seenCredentials && known.missingSince === undefined && (!known.refreshSuspectSince || known.refreshSuspectVersion === version)) return;
   safely(() => update(state => {
     if (!account.isDefault && !existsSync(account.dir)) return;
     noteCredentials(entry(state, account), version);
@@ -115,7 +149,7 @@ export function recordAuthFailure(account: Account): void {
       health.missingSince ??= Date.now();
       if (Date.now() - health.missingSince < 15 * 60_000) return;
     }
-    health.failure ??= { id: crypto.randomUUID(), since: new Date().toISOString() };
+    health.failure ??= { id: crypto.randomUUID(), since: new Date().toISOString(), credentialsVersion: credentials.version };
   }));
 }
 export function authIncidentId(account: Account): string | undefined {
@@ -167,6 +201,7 @@ export function checkAuthExpiry(account: Account, now = Date.now()): void {
     if (!account.isDefault && !existsSync(account.dir)) return;
     const health = entry(state, account);
     noteCredentials(health, version);
+    if (authMode === "token") clearSuspicion(health);
     if (health.expiry && (health.expiry.authMode ?? "login") !== authMode) delete health.expiry;
     if (authMode === "token" && health.expiry && (health.expiry.version !== version || (expiry !== null && health.expiry.expiresAt !== expiry))) delete health.expiry;
     if (expiry === null) return; // Unknown does not rearm an existing warning.

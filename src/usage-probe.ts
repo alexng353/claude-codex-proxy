@@ -8,7 +8,7 @@
  * timer, and feeds the result through `observeRateLimit` like a turn's report.
  * The parsing matches `scripts/limits.ts --probe`.
  */
-import { authHealth, authIncidentId, credentialStatus, checkAuthExpiry, validateSubscriptionAuth } from "./auth-health";
+import { authHealth, authIncidentId, authIncidentCredentialsChanged, clearRefreshSuspicion, confirmRefreshFailure, credentialStatus, checkAuthExpiry, validateSubscriptionAuth } from "./auth-health";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -192,7 +192,8 @@ export async function probeAccount(
   const windows = completed ? parseUsageReport(result.text) : undefined;
   // A valid report wins over startup diagnostics. Keep meters fresh even during an incident.
   const applied = windows ? applyProbe(account, windows, startedAt) : false;
-  if (windows && observedId === undefined) {
+  if (windows) clearRefreshSuspicion(account);
+  if (windows && (observedId === undefined || authIncidentCredentialsChanged(account, observedId))) {
     markAuthSucceeded(account, observedId);
     return { account: account.name, result: applied ? "applied" : "newer data" };
   }
@@ -213,12 +214,16 @@ export async function probeAccount(
     }
     if (limited || !completed) return unavailable();
     reason = "no meters in /usage report";
-    // A completed local command with no meters and unchanged, long-expired login
-    // credentials demonstrates that the CLI did not renew. A bearer 401 alone does not.
-    if (credentials.authMode === "login" && credentials.hasRefreshToken
+    // Network wake-up and endpoint outages can hide behind a successful local
+    // command. Require the same stalled login on probes at least ten minutes apart.
+    if (credentials.hasRefreshToken
         && observedCredentials.version !== undefined && credentials.version === observedCredentials.version
         && observedCredentials.expiresAt !== null
         && observedCredentials.expiresAt < startedAt - FAILED_REFRESH_AGE_MS) {
+      if (!confirmRefreshFailure(account, observedCredentials.version, startedAt)) {
+        reason = "refresh not renewing; confirming";
+        return unavailable();
+      }
       reason = `refresh not renewing; access expired ${new Date(observedCredentials.expiresAt).toISOString()}`;
       markAuthFailed(account);
       return unavailable();
