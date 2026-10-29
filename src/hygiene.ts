@@ -576,28 +576,32 @@ export function isBareUserMessage(item: ResponseInputItem): boolean {
 /**
  * Tags agents and scripts open their messages with when Today delivers them
  * bare (no delegation envelope, no turn trigger): "[agent] Shipped...",
- * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...", and
- * systemd timers ("[timer daily 08:00] ...", sent with `today-daemon send`, which
- * delivers like Alex's typing). Alex asked (Oct 23) that chat-to-chat traffic
- * never be gated, so overnight work goes on.
+ * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...". Alex asked
+ * (Oct 23) that chat-to-chat traffic never be gated, so overnight work goes on.
+ * Timers are not here: a tag is text Alex can type. They send with
+ * `today-daemon send --from NAME`, which Today wraps in the `script:NAME` envelope.
  */
-const AGENT_TAG = /^\[(?:agent\]|timer\b[^\]\n]*\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
+const AGENT_TAG = /^\[(?:agent\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
 
 /**
  * Today side prompts (/btw, /summary and automatic summaries) are short-lived,
  * read-only threads the client makes, so their first message comes from Alex's
- * client like his own typing. Their developer instructions carry Today's side
- * seed (today-proto `seed_reason` for a Side origin; today-client
- * `summary::prepare`). Only instructions count: Alex can't type there.
- * Without this, a /summary on 2026-10-29 got the gate text instead of running.
+ * client like his own typing. Today's daemon opens their developer instructions
+ * with this marker (today-proto `SIDE_CALL_MARKER`), as the whole first line.
+ * Only that position counts: Today also copies earlier conversation into
+ * developer instructions (restored-conversation, earlier_conversation,
+ * thread_memory, perpetual_memory), always after the start and with `<` escaped,
+ * so quoted history can't mark a chat. A Today without the marker leaves side
+ * calls gated. Without this, a /summary on 2026-10-29 got the gate text.
  */
-const SIDE_PROMPT_SEEDS = ["You are a side prompt of Alex's thread ", "You produce a concise catch-up "];
+export const SIDE_CALL_MARKER = "<today-side-call/>";
 
 export function isSidePrompt(request: ResponsesRequest): boolean {
-  const seeded = (text: unknown) => typeof text === "string" && SIDE_PROMPT_SEEDS.some((seed) => text.includes(seed));
-  if (seeded(request.instructions)) return true;
+  const marked = (text: unknown) =>
+    typeof text === "string" && (text === SIDE_CALL_MARKER || text.startsWith(`${SIDE_CALL_MARKER}\n`));
+  if (marked(request.instructions)) return true;
   if (!Array.isArray(request.input)) return false;
-  return request.input.some((item) => isContextMessage(item) && partsOf(item).some((part) => seeded(part.text)));
+  return request.input.some((item) => isContextMessage(item) && partsOf(item).some((part) => marked(part.text)));
 }
 
 /**
@@ -682,7 +686,6 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
     return { type: "exempt", reason: `request kind ${meta.requestKind}` };
   if (meta.threadSource && EXEMPT_THREAD_SOURCES.has(meta.threadSource))
     return { type: "exempt", reason: `thread source ${meta.threadSource}` };
-  if (isSidePrompt(request)) return { type: "exempt", reason: "Today side prompt" };
 
   // The turn's own input: user and context messages after the last thing the
   // model produced.
@@ -707,6 +710,8 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
     !gatedByCaller &&
     (EXEMPT_TRIGGERS.has(trigger) || EXEMPT_TRIGGER_PREFIXES.some((p) => trigger.startsWith(p)));
   if (exemptTrigger) return { type: "exempt", reason: `trigger ${trigger}` };
+  // After the caller's extra-gated triggers, which win over the side-call marker.
+  if (!gatedByCaller && isSidePrompt(request)) return { type: "exempt", reason: "Today side prompt" };
 
   const human = !agentStarted
     ? turnUsers.filter((index) => dthread.has(index) || !isSyntheticUserMessage(input[index]))

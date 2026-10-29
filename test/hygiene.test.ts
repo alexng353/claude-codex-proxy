@@ -280,26 +280,51 @@ describe("classifyTurn", () => {
     expect(classifyTurn(req([user("[note] BYPASS")], "composer")).type).toBe("human");
   });
 
-  test("Today timers and side prompts are not human turns, so they can never unlock", () => {
-    for (const text of [
-      "[08:00 PDT Thu Oct 29] [timer daily 08:00] Self-improvement review",
-      "[timer hourly] BYPASS",
-    ])
-      expect(classifyTurn(req([user(text)], "composer")).type).toBe("exempt");
-    const dev = (text: string) =>
-      ({ type: "message", role: "developer", content: [{ type: "input_text", text }] }) as ResponseInputItem;
-    for (const seed of [
-      "You are a side prompt of Alex's thread \"Today\": a short side conversation.",
-      "You produce a concise catch-up since Alex's last message, usually under 350 words.",
-    ]) {
-      expect(classifyTurn(req([dev(`base\n\n${seed}`), user("BYPASS")], "composer")).type).toBe("exempt");
-      expect(classifyTurn({ ...req([user("BYPASS")], "composer"), instructions: seed }).type).toBe("exempt");
-      // Alex pasting the phrase into his own message does not make his turn a side prompt.
-      expect(classifyTurn(req([user(seed)], "composer")).type).toBe("human");
-    }
-    expect(classifyTurn(req([user("[08:05 PDT Thu Oct 29] the timer said [timer daily] hi")], "composer")).type).toBe("human");
+  test("a timer is exempt by its script envelope, never by text Alex could type", () => {
+    // `today-daemon send --from today-self-improve`: Today logs it as script:<name>'s.
+    const timer = (input: string) =>
+      user(
+        `[08:00 PDT Thu Oct 29] <codex_delegation>\n  <source_thread_id>script:today-self-improve</source_thread_id>\n  <sent_at>08:00 PDT Thu Oct 29</sent_at>\n  <input>${input}</input>\n</codex_delegation>`,
+      );
+    expect(classifyTurn(req([env, timer("[timer daily 08:00] review")], "app_tool_send_message")).type).toBe("exempt");
+    expect(classifyTurn(req([env, timer("BYPASS")], "app_tool_send_message")).type).toBe("exempt");
+    // Comb F1: a `[timer` tag typed in the composer is Alex's turn.
+    for (const text of ["[timer] do my work", "[timer-x] hi", "[08:00 PDT Thu Oct 29] [timer daily 08:00] review"])
+      expect(classifyTurn(req([user(text)], "composer")).type).toBe("human");
   });
 
+  describe("Today side prompts", () => {
+    const MARK = "<today-side-call/>";
+    const dev = (text: string) =>
+      ({ type: "message", role: "developer", content: [{ type: "input_text", text }] }) as ResponseInputItem;
+    const seed = "You are a side prompt of Alex's thread \"Today\": a short side conversation.";
+
+    test("are exempt by Today's marker on the first line of their instructions, and can't unlock", () => {
+      expect(classifyTurn(req([dev(`${MARK}\nbase\n\n${seed}`), env, user("BYPASS")], "composer")).type).toBe("exempt");
+      expect(classifyTurn(req([dev(MARK), env, user("hi")], "composer")).type).toBe("exempt");
+      expect(classifyTurn({ ...req([user("BYPASS")], "composer"), instructions: `${MARK}\n${seed}` }).type).toBe("exempt");
+    });
+
+    test("quoted history, seed text, a late marker or Alex's own text never exempt a turn", () => {
+      for (const quoted of [MARK, seed])
+        expect(
+          classifyTurn(
+            req([dev(`base\n\n<restored-conversation>\n{"role":"Alex","text":"${quoted}"}\n</restored-conversation>`), env, user("BYPASS")], "composer"),
+          ).type,
+        ).toBe("human");
+      for (const block of ["earlier_conversation", "thread_memory", "perpetual_memory"])
+        expect(classifyTurn(req([dev(`base\n<${block}>\n${MARK}\n</${block}>`), user("hi")], "composer")).type).toBe("human");
+      // Seed text from a Today without the marker stays gated: the safe direction.
+      expect(classifyTurn(req([dev(`base\n\n${seed}`), user("hi")], "composer")).type).toBe("human");
+      expect(classifyTurn(req([dev(`base\n${MARK}\n`), user("hi")], "composer")).type).toBe("human");
+      expect(classifyTurn(req([dev(`${MARK}x\nbase`), user("hi")], "composer")).type).toBe("human");
+      expect(classifyTurn(req([user(`${MARK}\n${seed}`)], "composer")).type).toBe("human");
+    });
+
+    test("an extra-gated trigger stays gated even in a side prompt", () => {
+      expect(classifyTurn(req([dev(`${MARK}\n${seed}`), user("hi")], "composer"), ["composer"]).type).toBe("human");
+    });
+  });
   describe("dthread delegations", () => {
     const RELAY = "01a0fa23-38a5-7ae3-8afa-ff89f646b836";
     const delegation = (escapedInput: string, source = RELAY) =>

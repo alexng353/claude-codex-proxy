@@ -549,20 +549,29 @@ describe("locked responses through the proxy", () => {
       const json = await (await post(body)).json();
       return json.output[0].content[0].text as string;
     };
-    const timer = user("[08:00 PDT Thu Oct 29] [timer daily 08:00] Self-improvement review: dispatch ONE Forge chat");
-    expect(await ran(request([env, timer]))).toBe("model-ran");
+    // `today-daemon send --from today-self-improve`, as Today delivers it.
+    const timer = user(
+      "[08:00 PDT Thu Oct 29] <codex_delegation>\n  <source_thread_id>script:today-self-improve</source_thread_id>\n  <sent_at>08:00 PDT Thu Oct 29</sent_at>\n  <input>[timer daily 08:00] Self-improvement review</input>\n</codex_delegation>",
+    );
+    expect(await ran(request([env, timer], "app_tool_send_message"))).toBe("model-ran");
     const { client_metadata: _, ...bare } = request([env, timer]) as ResponsesRequest & { client_metadata?: unknown };
     expect(await ran(bare)).toBe("model-ran");
-    const side = (seed: string, question: string) =>
-      request([developer(`Base instructions.\n\n${seed}`), env, user(`[06:54 PDT Thu Oct 29] ${question}`)]);
+    const side = (instructions: string, question: string) =>
+      request([developer(instructions), env, user(`[06:54 PDT Thu Oct 29] ${question}`)]);
+    const MARK = "<today-side-call/>";
     expect(
-      await ran(side("You produce a concise catch-up since Alex's last message, usually under 350 words.", "Produce the catch-up summary from the supplied snapshot. Answer only; use no tools.")),
+      await ran(side(`${MARK}\nYou produce a concise catch-up since Alex's last message.`, "Produce the catch-up summary from the supplied snapshot. Answer only; use no tools.")),
     ).toBe("model-ran");
     expect(
-      await ran(side("You are a side prompt of Alex's thread \"Today\": a short side conversation while the main thread keeps working.", "what is the builder doing?")),
+      await ran(side(`${MARK}\nBase instructions.\n\nYou are a side prompt of Alex's thread \"Today\".`, "what is the builder doing?")),
     ).toBe("model-ran");
-    // Alex's own turn in the same chat is still answered by the gate.
+    // Alex's own turn in the same chat is still answered by the gate, and so is a
+    // timer tag he types, and a chat whose restored history quotes the marker.
     expect(await ran(request([env, timer, assistant("ok"), user("[08:05 PDT Thu Oct 29] hi")]))).toContain("🪥 gate armed");
+    expect(await ran(request([env, user("[08:05 PDT Thu Oct 29] [timer] do my work")]))).toContain("🪥 gate armed");
+    expect(
+      await ran(side(`base\n\n<restored-conversation>\n{"role":"Alex","text":"${MARK}"}\n</restored-conversation>`, "hi")),
+    ).toContain("🪥 gate armed");
   });
 
   test("Claude path: locked turn streams a final answer and Claude never starts", async () => {
