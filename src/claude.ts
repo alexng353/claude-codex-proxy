@@ -454,7 +454,7 @@ class ClaudeWorker {
       // backoff, but only demand login for a dead marker or a structured 401
       // rejecting this turn's fresh bearer. Helper stderr is not auth evidence.
       const failed = credentials.state === "failed" ||
-        (status === 401 && credentials.version === this.observedCredentials && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000);
+        (status === 401 && credentials.version === this.observedCredentials && (credentials.authMode === "token" || (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000));
       markAuthFailed(this.account, failed);
     }
     recordFailure({

@@ -1,3 +1,4 @@
+import { accountToken } from "./account-token";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { hostname, homedir } from "node:os";
@@ -8,7 +9,7 @@ import { stateDir } from "./sessions";
 import { STRIPPED_ENV } from "./claude-env";
 
 type FailureIncident = { id: string; since: string; delivered?: boolean };
-type ExpiryIncident = FailureIncident & { expiresAt: number };
+type ExpiryIncident = FailureIncident & { expiresAt: number; authMode?: "token" | "login"; version?: string };
 type Delivery = { at: number; credentials: string | undefined };
 type Health = {
   generation: string;
@@ -135,6 +136,8 @@ export function clearAuthIncident(account: Account, observedId: string | undefin
 const timestamp = (v: unknown): number | null =>
   typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 8.64e15 ? v : null;
 function readCredentials(account: Account) {
+  const token = accountToken(account);
+  if (token) return { version: token.version, state: token.state, oauth: token.state === "present" ? { accessToken: token.token, expiresAt: token.expiresAt } : undefined, authMode: "token" as const };
   let text: string;
   try { text = readFileSync(join(account.dir, ".credentials.json"), "utf8"); }
   catch (error) {
@@ -152,36 +155,44 @@ function readCredentials(account: Account) {
 }
 /** Only metadata leaves the credential reader; tokens never enter state or logs. */
 export function credentialStatus(account: Account) {
-  const { version, state, oauth } = readCredentials(account);
-  return { version, state, expiresAt: timestamp(oauth?.expiresAt), refreshTokenExpiresAt: timestamp(oauth?.refreshTokenExpiresAt) };
+  const { version, state, oauth, authMode } = readCredentials(account);
+  return { version, state, authMode: authMode ?? "login" as const, expiresAt: timestamp(oauth?.expiresAt), refreshTokenExpiresAt: timestamp(oauth && "refreshTokenExpiresAt" in oauth ? oauth.refreshTokenExpiresAt : null) };
 }
 export function checkAuthExpiry(account: Account, now = Date.now()): void {
   if (!account.isDefault && !existsSync(account.dir)) return;
-  const { version, expiresAt, refreshTokenExpiresAt: expiry } = credentialStatus(account);
+  const { version, expiresAt, refreshTokenExpiresAt, authMode } = credentialStatus(account);
+  const expiry = authMode === "token" ? expiresAt : refreshTokenExpiresAt;
+  const window = authMode === "token" ? 14 * 86400_000 : THREE_DAYS;
   safely(() => update((state) => {
     if (!account.isDefault && !existsSync(account.dir)) return;
     const health = entry(state, account);
     noteCredentials(health, version);
+    if (health.expiry && (health.expiry.authMode ?? "login") !== authMode) delete health.expiry;
+    if (authMode === "token" && health.expiry?.version !== version) delete health.expiry;
     if (expiry === null) return; // Unknown does not rearm an existing warning.
     // Match the CLI's stale metadata guard. An already-past deadline is silent.
-    if (expiry <= now || expiry > now + THREE_DAYS || (expiresAt !== null && expiresAt > expiry + THREE_DAYS)) {
+    if (expiry <= now || expiry > now + window || (authMode === "login" && expiresAt !== null && expiresAt > expiry + THREE_DAYS)) {
       delete health.expiry;
       return;
     }
-    health.expiry ??= { id: crypto.randomUUID(), since: new Date(now).toISOString(), expiresAt: expiry };
+    health.expiry ??= { id: crypto.randomUUID(), since: new Date(now).toISOString(), expiresAt: expiry, authMode, ...(authMode === "token" ? { version } : {}) };
   }));
 }
 export function authHealth(account: Account) {
-  return { authFailedSince: get(account)?.failure?.since ?? null,
-    refreshTokenExpiresAt: credentialStatus(account).refreshTokenExpiresAt };
+  const credentials = credentialStatus(account);
+  return { authMode: credentials.authMode, tokenExpiresAt: credentials.authMode === "token" ? credentials.expiresAt : null,
+    authFailedSince: get(account)?.failure?.since ?? null,
+    refreshTokenExpiresAt: credentials.refreshTokenExpiresAt };
 }
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 function warningText(machine: string, account: Account, incident: FailureIncident | ExpiryIncident): string {
+  const token = credentialStatus(account).authMode === "token";
   const reason = "expiresAt" in incident
-    ? `refresh token expires at ${new Date(incident.expiresAt).toISOString()} (within 3 days)`
+    ? `${token ? "setup token" : "refresh token"} expires at ${new Date(incident.expiresAt).toISOString()} (within ${token ? 14 : 3} days)`
     : `authentication failed since ${incident.since}`;
   const command = account.isDefault && process.env.CLAUDE_CONFIG_DIR === undefined
     ? "claude" : `CLAUDE_CONFIG_DIR=${quote(account.dir)} claude`;
+  if (token) return `[from claude-codex-proxy, ${machine}] Claude proxy on ${machine}: account ${account.name} ${reason}. On ${machine}, run \`${command} setup-token\` and replace this account’s oauth-token (mode 600) and expiry metadata.`;
   return `[from claude-codex-proxy, ${machine}] Claude proxy on ${machine}: account ${account.name} ${reason}. On ${machine}, run \`${command}\`, then /login.`;
 }
 const sending = new Set<string>();
@@ -269,7 +280,7 @@ export async function validateSubscriptionAuth(
   request: (url: string, options: RequestInit) => Promise<Response> = fetch,
 ): Promise<"healthy" | "failed" | "unknown"> {
   try {
-    const { version, state, oauth } = readCredentials(account);
+    const { version, state, oauth, authMode } = readCredentials(account);
     if (state === "failed") return "failed";
     if (typeof oauth?.accessToken !== "string" || !oauth.accessToken) return "unknown";
     const response = await request("https://api.anthropic.com/api/oauth/usage", {
@@ -280,7 +291,7 @@ export async function validateSubscriptionAuth(
     if (response.ok) result = usageBody(await response.json()) ? "healthy" : "unknown";
     else {
       await response.body?.cancel();
-      if (response.status === 401 && (timestamp(oauth.expiresAt) ?? 0) > Date.now() + REFRESH_BUFFER) result = "failed";
+      if (response.status === 401 && (authMode === "token" || (timestamp(oauth.expiresAt) ?? 0) > Date.now() + REFRESH_BUFFER)) result = "failed";
     }
     return credentialStatus(account).version === version ? result : "unknown";
   } catch { return "unknown"; }

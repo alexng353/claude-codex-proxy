@@ -167,7 +167,8 @@ export async function probeAccount(
     const since = authHealth(account).authFailedSince;
     return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable" };
   };
-  if (!account.isDefault && credentialStatus(account).version === "missing") {
+  const initial = credentialStatus(account);
+  if ((initial.authMode === "token" && initial.state === "failed") || (!account.isDefault && initial.version === "missing")) {
     markAuthFailed(account);
     return unavailable();
   }
@@ -210,7 +211,7 @@ export async function probeAccount(
     }
     if (limited || !completed) return unavailable();
     // A rejected bearer inside the CLI's refresh buffer is not proof that login is dead.
-    if (authError && credentials.version === observedCredentials && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000) {
+    if (authError && credentials.version === observedCredentials && (credentials.authMode === "token" || (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000)) {
       markAuthFailed(account);
       return unavailable();
     }
@@ -286,8 +287,17 @@ export function startUsageProbe(
       return;
     }
     const outcomes = await probeAllAccounts().catch(() => []);
-    if (outcomes.length)
-      console.log(`Usage probe: ${outcomes.map((o) => `${o.account} ${o.result}`).join(", ")}`);
+    if (outcomes.length) {
+      const accounts = listAccounts();
+      const reports = outcomes.map(outcome => {
+        const account = accounts.find(a => a.name === outcome.account);
+        const auth = account ? authHealth(account) : undefined;
+        const expiry = auth?.authMode === "token"
+          ? ` expires=${auth.tokenExpiresAt === null ? "unknown" : new Date(auth.tokenExpiresAt).toISOString()}` : "";
+        return `${outcome.account} ${auth?.authMode ?? "removed"}${expiry} ${outcome.result}`;
+      });
+      console.log(`Usage probe: ${reports.join(", ")}`);
+    }
     if (!stopped) schedule(intervalMs);
   };
   const schedule = (delay: number) => {

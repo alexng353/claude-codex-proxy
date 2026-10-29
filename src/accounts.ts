@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { accountToken } from "./account-token";
 import { authHealth, clearAuthIncident, recordAuthFailure } from "./auth-health";
 import { withLock } from "./filelock";
 import { stateDir } from "./sessions";
@@ -28,7 +29,7 @@ import { stateDir } from "./sessions";
 export type Account = { name: string; dir: string; isDefault: boolean };
 
 /** Per-account files; everything else is shared with the base directory. */
-const PRIVATE_ENTRIES = [".credentials.json", ".claude.json"];
+const PRIVATE_ENTRIES = [".credentials.json", ".claude.json", "oauth-token"];
 const FALLBACK_LIMIT_MS = 15 * 60_000;
 
 const limitedUntil = new Map<string, number>();
@@ -216,7 +217,10 @@ export function linkSharedEntries(dir: string): void {
 
 /** Environment overrides for a worker spawned on this account. */
 export function accountEnv(account: Account): Record<string, string> {
-  if (account.isDefault) return {};
+  const token = accountToken(account);
+  if (token?.state === "failed") throw new Error(`Refusing oauth-token for account ${account.name}: requires a readable regular file with mode 600`);
+  const auth: Record<string, string> = token ? { CLAUDE_CODE_OAUTH_TOKEN: token.token } : {};
+  if (account.isDefault) return auth;
   // Re-link occasionally so entries created later in the base dir appear.
   if (Date.now() - (linkedAt.get(account.dir) ?? 0) > 60_000) {
     try {
@@ -229,7 +233,7 @@ export function accountEnv(account: Account): Record<string, string> {
       );
     }
   }
-  return { CLAUDE_CONFIG_DIR: account.dir };
+  return { CLAUDE_CONFIG_DIR: account.dir, ...auth };
 }
 
 export function isLimited(account: Account, now = Date.now()): boolean {
@@ -237,6 +241,8 @@ export function isLimited(account: Account, now = Date.now()): boolean {
 }
 
 function credentialVersion(account: Account): string {
+  const token = accountToken(account);
+  if (token) return token.version;
   try {
     const stat = statSync(join(account.dir, ".credentials.json"));
     return `${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
@@ -252,6 +258,8 @@ function isAuthBlocked(account: Account, now: number): boolean {
 }
 
 function hasCredentials(account: Account): boolean {
+  const token = accountToken(account);
+  if (token) return token.state === "present";
   return account.isDefault || existsSync(join(account.dir, ".credentials.json"));
 }
 

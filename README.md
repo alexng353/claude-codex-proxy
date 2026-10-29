@@ -290,3 +290,103 @@ Photos that passed, or that looked like a bathroom photo, never reach the workin
 - **Cairn API.** `/hygiene/api/v1` lets Cairn send proofs and read status and the daily photos. It authenticates with Cairn relay device tokens and is the only path reachable through Tailscale Serve (`https://arch.taildf19.ts.net:4720`). The contract is in [docs/hygiene-api.md](docs/hygiene-api.md).
 - **Router.** The router (`~/.local/share/codex-patches/router`) imports `src/hygiene-events.mjs` and asks `POST /hygiene/gate` about GPT `/responses` requests and websocket `response.create` frames. Claude requests are gated inside `/v1/responses`. Restart both services when the gate changes.
 - **Tests.** `bun test test/hygiene.test.ts test/hygiene-gate.test.ts` covers the rules, exemptions, hashing, BYPASS, debt and penance, DELAY, the kill switch, and locked replies on both paths. All use an injected clock and classifier. Run the router's suite with `node --test router.test.mjs`.
+
+### Long-lived subscription tokens per account
+
+An account can use a `claude setup-token` token instead of its saved login.
+The proxy reads `oauth-token` from that account's config directory:
+
+| Account | Token file (default paths on Forge and Arch) |
+| --- | --- |
+| `default` | `~/.claude/oauth-token` (or `$CLAUDE_CONFIG_DIR/oauth-token` if the proxy sets that variable) |
+| Named account | `~/.local/state/claude-codex-proxy/accounts/<name>/oauth-token` (under `$PROXY_STATE_DIR/accounts` when overridden) |
+
+The file must be a regular file with **exactly mode 600**. Symlinks, empty files,
+and unreadable or incorrectly permissioned files are refused; they do not fall
+back to login. Token files and their metadata are private to each account and
+are never linked into another account. Remove the token file to return to the
+existing login. This does not change account order, caps, or pins.
+
+The proxy strips ambient authentication variables first, then supplies only that
+account's token as `CLAUDE_CODE_OAUTH_TOKEN` to workers, usage probes, memory
+summarizers, and hygiene classifiers. In token mode the proxy does not read
+`.credentials.json`. Tokens have no refresh cycle and do not receive the
+three-day refresh-token warning. `/accounts` exposes `authMode` (`token` or
+`login`) and `tokenExpiresAt` (Unix milliseconds or `null`); usage probe logs
+include the mode and known expiry without the token.
+
+**CLI behavior checked on 2026-10-28:** both the pinned 2.1.302 and shell 2.1.263
+support `setup-token`. Their bundled code requests 31,536,000 seconds (365 days)
+and only `user:inference`, prints the token, and skips normal login persistence.
+There is no logout or revocation call in that setup-token completion branch;
+server-side effects on existing logins were not tested. The token is opaque, so
+its actual expiry cannot be decoded from its text or inferred from file mtime.
+
+Both versions gate subscription usage fetching on `user:profile`, which these
+tokens lack. The pinned CLI's local `/usage` probe can therefore return no
+meters; shell 2.1.263 is also below the proxy's minimum version for safe headless
+`/usage`. A usage endpoint scope refusal (403) stays unknown, not an auth failure.
+Normal turns still provide rate-limit events. Token mode cannot promise fresh
+idle-account usage meters. No live token was created or tested for this change.
+
+#### Alex: create and install on each machine
+
+Repeat these steps **on Forge and on Arch, once for each account**. Alex must do
+the browser sign-in. Do not send tokens through chat, shell history, or logs.
+
+1. In a private terminal, choose the account's directory. For default use
+   `account_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"`; for a named account use
+   `account_dir="${PROXY_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-codex-proxy}/accounts/<name>"`,
+   replacing `<name>` with the existing account name. Check the proxy service's
+   configured paths if they differ from your shell.
+2. Run `CLAUDE_CONFIG_DIR="$account_dir" claude setup-token`. On Forge, use
+   `/home/alex/.local/share/claude/versions/2.1.302` in place of `claude` to match
+   the pinned proxy. In the browser, select the intended subscription account;
+   the directory name does not choose the browser's account. Finish that one
+   sign-in and keep the displayed token private.
+3. Run this installer in the same terminal. Paste the displayed token at its
+   hidden prompt. Supply an expiry only if known, as a UTC ISO timestamp such as
+   `2027-10-28T21:51:00Z`; leave it blank otherwise. It creates the token with mode
+   600, and replaces any old expiry metadata so it cannot survive a rotation.
+
+   ```bash
+   python3 - "$account_dir" <<'PY'
+   import datetime, getpass, os, pathlib, sys, tempfile
+   directory = pathlib.Path(sys.argv[1])
+   directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+   token = getpass.getpass('Paste setup token (hidden): ').strip()
+   if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
+       raise SystemExit('Expected one nonempty token without whitespace')
+   with open('/dev/tty', 'r+') as terminal:
+       terminal.write('Known expiry in UTC (ISO timestamp, or blank): ')
+       terminal.flush()
+       expiry = terminal.readline().strip()
+   if expiry:
+       if not expiry.endswith('Z'):
+           raise SystemExit('Expiry must end in Z (UTC)')
+       datetime.datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+   fd, staging = tempfile.mkstemp(prefix='.oauth-install-', dir=directory)
+   try:
+       with os.fdopen(fd, 'w') as output:
+           output.write(token + '\n')
+       metadata = directory / 'oauth-token.expires-at'
+       metadata.unlink(missing_ok=True)
+       if expiry:
+           metadata.write_text(expiry + '\n')
+       os.replace(staging, directory / 'oauth-token')
+   finally:
+       if os.path.exists(staging):
+           os.unlink(staging)
+   PY
+   ```
+
+4. Check `/accounts` for `authMode: "token"`. New subprocesses read the file;
+   workers already running keep their current authentication until they exit.
+   Do not restart the proxy during active turns. Confirm a normal request when
+   convenient; an unavailable `/usage` result alone does not mean the token is bad.
+
+The optional `oauth-token.expires-at` file contains only that UTC timestamp.
+Known expiries generate one Today warning within 14 days of expiry. Authentication
+failures generate a separate deduplicated warning; mint and install a replacement
+token manually when needed. Replace or remove the expiry metadata whenever you
+replace a token. An unknown expiry is reported as unknown, with no expiry warning.

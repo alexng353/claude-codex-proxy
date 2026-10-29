@@ -372,7 +372,8 @@ export function createScrubber(options = {}) {
   function scrub(text) {
     if (typeof text !== "string" || text.length < MIN_VALUE_LENGTH) return text;
     refresh();
-    let out = text;
+    let out = text.replace(/\b(CLAUDE_CODE_OAUTH_TOKEN)(["']?\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;}\]]+)/g,
+      (_whole, name, separator) => `${name}${separator}[REDACTED:${name}]`);
     if (literal) out = out.replace(literal, (value) => `[REDACTED:${labels.get(value)}]`);
     for (const [pattern, label] of PATTERNS)
       out = out.replace(pattern, `[REDACTED:${label}]`);
@@ -385,6 +386,7 @@ export function createScrubber(options = {}) {
   /** Copy-on-write walk: returns the same object when nothing changed. */
   function scrubValue(value, key) {
     if (typeof value === "string") {
+      if (key === "CLAUDE_CODE_OAUTH_TOKEN") return "[REDACTED:CLAUDE_CODE_OAUTH_TOKEN]";
       if (key === "encrypted_content" || value.startsWith("data:")) return value;
       return scrub(value);
     }
