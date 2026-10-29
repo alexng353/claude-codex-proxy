@@ -8,14 +8,15 @@
  * timer, and feeds the result through `observeRateLimit` like a turn's report.
  * The parsing matches `scripts/limits.ts --probe`.
  */
-import { authHealth, checkAuthExpiry, markAuthHealthy, validateSubscriptionAuth } from "./auth-health";
+import { authHealth, authIncidentId, credentialStatus, checkAuthExpiry, validateSubscriptionAuth } from "./auth-health";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   accountEnv,
   isAuthError,
   markAuthFailed,
-  clearAuthFailure,
+  markAuthSucceeded,
+  isLimitError,
   accountStatus,
   listAccounts,
   observeRateLimit,
@@ -108,8 +109,9 @@ export function applyProbe(
 type RunResult = { text: string; stderr: string; code: number | null; timedOut: boolean };
 
 async function runClaude(account: Account, args: string[], timeoutMs: number): Promise<RunResult> {
-  const env = { ...process.env, ...accountEnv(account) } as Record<string, string>;
+  const env = { ...process.env } as Record<string, string>;
   for (const key of STRIPPED_ENV) delete env[key];
+  Object.assign(env, accountEnv(account));
   const child = Bun.spawn([process.env.CLAUDE_BIN ?? "claude", ...args], {
     env,
     cwd: stateDir(),
@@ -119,14 +121,14 @@ async function runClaude(account: Account, args: string[], timeoutMs: number): P
     detached: process.platform !== "win32",
   });
   let timedOut = false;
+  const signal = (value: NodeJS.Signals) => {
+    try { process.kill(-child.pid, value); } catch { child.kill(value); }
+  };
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
   const timer = setTimeout(() => {
     timedOut = true;
-    // CLI helpers can hold the pipe open after their parent dies.
-    try {
-      process.kill(-child.pid, "SIGKILL");
-    } catch {
-      child.kill("SIGKILL");
-    }
+    signal("SIGTERM"); // Give CLI refresh its cleanup window before killing helpers holding pipes.
+    killTimer = setTimeout(() => signal("SIGKILL"), 1000);
   }, timeoutMs);
   try {
     const [text, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
@@ -135,6 +137,7 @@ async function runClaude(account: Account, args: string[], timeoutMs: number): P
     return { text: "", stderr: "", code: null, timedOut };
   } finally {
     clearTimeout(timer);
+    if (killTimer) clearTimeout(killTimer);
   }
 }
 
@@ -157,44 +160,64 @@ export type ProbeOutcome = { account: string; result: "applied" | "newer data" |
 export async function probeAccount(
   account: Account,
   validate: typeof validateSubscriptionAuth = validateSubscriptionAuth,
+  timeoutMs = PROBE_TIMEOUT_MS,
 ): Promise<ProbeOutcome> {
   checkAuthExpiry(account);
-  if (!(await supportsUsage(account))) return { account: account.name, result: "unavailable" };
+  const unavailable = (): ProbeOutcome => {
+    const since = authHealth(account).authFailedSince;
+    return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable" };
+  };
+  if (!(await supportsUsage(account))) {
+    if (credentialStatus(account).state === "failed") markAuthFailed(account);
+    return unavailable();
+  }
+  const observedId = authIncidentId(account);
   const startedAt = Date.now();
   const result = await runClaude(
     account,
     ["-p", "/usage", "--output-format", "stream-json", "--verbose", "--no-session-persistence",
       "--safe-mode", "--tools", "", "--strict-mcp-config"],
-    PROBE_TIMEOUT_MS,
+    timeoutMs,
   );
-  let authError = isAuthError(undefined, result.stderr);
-  for (const line of result.text.split("\n")) {
-    try {
-      const event = JSON.parse(line);
-      if (event?.type === "result" && event.is_error) {
+  checkAuthExpiry(account);
+  const completed = !result.timedOut && result.code === 0;
+  const windows = completed ? parseUsageReport(result.text) : undefined;
+  // A valid report wins over startup diagnostics. Keep meters fresh even during an incident.
+  const applied = windows ? applyProbe(account, windows, startedAt) : false;
+  if (windows && observedId === undefined) {
+    markAuthSucceeded(account, observedId);
+    return { account: account.name, result: applied ? "applied" : "newer data" };
+  }
+  if (!windows) {
+    const credentials = credentialStatus(account);
+    if (credentials.state === "failed") { markAuthFailed(account); return unavailable(); }
+    let limited = isLimitError(undefined, result.stderr) || /\b429\b/.test(result.stderr);
+    let authError = isAuthError(undefined, result.stderr);
+    for (const line of result.text.split("\n")) {
+      try {
+        const event = JSON.parse(line);
+        if (event?.type !== "result" || !event.is_error) continue;
         const message = [event.result, ...(Array.isArray(event.errors) ? event.errors : [])]
           .filter((value) => typeof value === "string").join("\n");
+        limited ||= isLimitError(event.api_error_status, message);
         authError ||= isAuthError(event.api_error_status, message);
-      }
-    } catch {}
+      } catch {}
+    }
+    if (limited || !completed) return unavailable();
+    // A rejected bearer inside the CLI's refresh buffer is not proof that login is dead.
+    if (authError && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000) {
+      markAuthFailed(account);
+      return unavailable();
+    }
   }
-  checkAuthExpiry(account);
-  if (authError) {
-    markAuthFailed(account);
-    return { account: account.name, result: `auth failed since ${authHealth(account).authFailedSince ?? new Date().toISOString()}` };
-  }
-  const windows = !result.timedOut && result.code === 0 ? parseUsageReport(result.text) : undefined;
-  if (!windows || authHealth(account).authFailedSince) {
-    const validation = await validate(account);
-    if (validation === "failed") markAuthFailed(account);
-    if (validation === "healthy") { markAuthHealthy(account); clearAuthFailure(account); }
-    const since = authHealth(account).authFailedSince;
-    if (since || !windows)
-      return { account: account.name, result: since ? `auth failed since ${since}` : "unavailable" };
-  }
-  markAuthHealthy(account);
-  clearAuthFailure(account);
-  return { account: account.name, result: applyProbe(account, windows, startedAt) ? "applied" : "newer data" };
+  // Only a completed empty report or recovery of an existing incident needs HTTP validation.
+  // The CLI can hide both 401 and 429 behind the same empty report; only an exposed
+  // rate-limit diagnostic can suppress this fallback. A fallback 429 stays unknown.
+  const validation = await validate(account);
+  if (validation === "failed") markAuthFailed(account);
+  if (validation === "healthy") markAuthSucceeded(account, observedId);
+  if (authHealth(account).authFailedSince || !windows) return unavailable();
+  return { account: account.name, result: applied ? "applied" : "newer data" };
 }
 
 let running: Promise<ProbeOutcome[]> | undefined;

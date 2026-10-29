@@ -35,12 +35,15 @@ import { appendFileSync } from "node:fs";
 if (process.argv.includes("--version")) { console.log("${version} (Claude Code)"); process.exit(0); }
 appendFileSync(${JSON.stringify(join(root, "calls"))}, JSON.stringify({ args: process.argv.slice(2), dir: process.env.CLAUDE_CONFIG_DIR ?? null }) + "\\n");
 const weekly = process.env.CLAUDE_CONFIG_DIR?.endsWith("/second") ? 100 : 95;
-console.log(JSON.stringify({ type: "system", subtype: "init" }));
-console.log(JSON.stringify({ type: "assistant", local_command_run: { command: "usage", args: "" }, usage_report: { rate_limits: { limits: [
-  { kind: "session", percent: 7, resets_at: new Date(Date.now() + ${HOUR}).toISOString() },
-  { kind: "weekly_all", percent: weekly, resets_at: new Date(Date.now() + ${48 * HOUR}).toISOString() },
-] } } }));
-console.log(JSON.stringify({ type: "result", is_error: false }));
+const lines = ${JSON.stringify(await readFile(join(import.meta.dir, "fixtures/cli-2.1.302/m-fresh200b.jsonl"), "utf8"))}.trim().split("\\n");
+for (const line of lines) {
+  const event = JSON.parse(line);
+  for (const window of event.usage_report?.rate_limits?.limits ?? []) {
+    window.percent = window.kind === "session" ? 7 : weekly;
+    window.resets_at = new Date(Date.now() + ${48 * HOUR}).toISOString();
+  }
+  console.log(JSON.stringify(event));
+}
 `,
   );
   await chmod(cli, 0o755);
@@ -61,6 +64,7 @@ beforeEach(async () => {
   await rm(join(root, "state"), { recursive: true, force: true });
   await rm(join(root, "calls"), { force: true });
   await mkdir(join(root, "base"), { recursive: true });
+  await writeFile(join(root, "base/.credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "FAKE", refreshToken: "FAKE-R", expiresAt: Date.now() + HOUR } }));
   await mkdir(join(root, "state"), { recursive: true });
   process.env.CLAUDE_CONFIG_DIR = join(root, "base");
   process.env.PROXY_STATE_DIR = join(root, "state");
@@ -199,55 +203,6 @@ test("no probe runs while the old single copy (first move) is still draining", a
   expect(accountStatus()[0].observedAt).toBeNull();
   expect(existsSync(join(root, "calls"))).toBe(false);
 });
-
-for (const failure of ['stderr', 'result', 'status', 'network'] as const) {
-  test(`probe distinguishes ${failure} failures and recovers auth state`, async () => {
-    await fakeCli();
-    const cli = join(root, 'claude');
-    const body = await readFile(cli, 'utf8');
-    const error = failure === 'network' ? 'Connection timed out' : 'Not logged in';
-    const emit = failure === 'stderr' || failure === 'network'
-      ? `console.error(${JSON.stringify(error)}); process.exit(1);`
-      : `console.log(JSON.stringify({type:'result', is_error:true, ${failure === 'status' ? 'api_error_status:401' : 'errors:["OAuth token refresh failed: invalid_grant"]'}})); process.exit(0);`;
-    await writeFile(cli, body.replace('const weekly =', `${emit}\nconst weekly =`));
-    const [outcome] = await probeAllAccounts();
-    if (failure === 'network') {
-      expect(outcome.result).toBe('unavailable');
-      expect((accountStatus()[0] as any).authFailedSince).toBeNull();
-    } else {
-      expect(outcome.result).toStartWith('auth failed since ');
-      expect((accountStatus()[0] as any).authFailedSince).toBeString();
-      await fakeCli();
-      expect((await probeAccount(listAccounts()[0], async () => 'healthy')).result).toBe('applied');
-      expect((accountStatus()[0] as any).authFailedSince).toBeNull();
-      expect(accountStatus()[0].authFailedUntil).toBeNull();
-    }
-  });
-}
-
-test('keepalive visits capped and exhausted accounts without a model turn and uses a stub warning sender', async () => {
-  const { loginKeepalive } = await import('../scripts/login-keepalive');
-  await fakeCli();
-  const second = join(root, 'state/accounts/second');
-  await mkdir(second, { recursive: true });
-  await writeFile(join(second, '.credentials.json'), JSON.stringify({ claudeAiOauth: { refreshTokenExpiresAt: Date.now() + HOUR } }));
-  const oldCaps = process.env.CLAUDE_ACCOUNT_WEEKLY_CAP;
-  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = 'second=50';
-  process.env.CLAUDE_ACCOUNT_ORDER = 'default';
-  observeRateLimit(listAccounts()[1], { status: 'rejected', resetsAt: Math.floor((Date.now() + HOUR) / 1000), unifiedWindows: { seven_day: { utilization: 1 } } });
-  const warnings: string[] = [];
-  try {
-    const result = await loginKeepalive(async (message) => { warnings.push(message); return true; });
-    expect(result.map((r) => r.account)).toEqual(['default', 'second']);
-    expect(warnings).toHaveLength(1);
-    const calls = (await readFile(join(root, 'calls'), 'utf8')).trim().split('\n').map((s) => JSON.parse(s));
-    expect(calls.every((c) => c.args.includes('/usage') && !c.args.includes('--model'))).toBe(true);
-  } finally {
-    if (oldCaps === undefined) delete process.env.CLAUDE_ACCOUNT_WEEKLY_CAP;
-    else process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = oldCaps;
-  }
-});
-
 
 test('a cached usage report cannot end an authentication incident without validation', async () => {
   const { markAuthFailed } = await import('../src/accounts');

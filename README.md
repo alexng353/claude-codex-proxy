@@ -117,6 +117,12 @@ Limit readings otherwise arrive only while an account is serving turns, so idle 
 
 Failures and account switches are appended to `$PROXY_STATE_DIR/failures.jsonl` (default `~/.local/state/claude-codex-proxy/failures.jsonl`, mode 0600). Entries include UTC time, request ID, account, worker/attempt where available, failure category, numeric API status where available, and the next account for failover. Raw CLI messages, credentials, and conversation text are omitted. Logging failures do not interrupt requests.
 
+The existing 12-minute usage probe also renews due OAuth access tokens on every account, including skipped accounts, without model turns. Refresh does not extend the refresh-token deadline. The proxy warns through Today when authentication fails and during the three days before `refreshTokenExpiresAt`; stale or already-past expiry metadata is silent. Warnings name the machine and give the account's exact sign-in command. For the default account without a config override this is `claude`, then `/login`; otherwise it includes `CLAUDE_CONFIG_DIR`.
+
+`GET /accounts` includes `authFailedSince` (ISO timestamp or null), which persists until a successful authenticated check or turn clears the observed incident, and `refreshTokenExpiresAt` (epoch milliseconds or null). `authFailedUntil` remains the separate, temporary routing cooldown. An expired access token alone is not a broken login. Unreadable credentials, transient refresh errors, and network failures remain unknown. Failed login incidents and warning delivery state persist locally by account name and directory; repeated warnings are suppressed for six hours unless credentials change.
+
+An inherited `CLAUDE_CODE_OAUTH_TOKEN` is removed from the proxy process environment before account-specific overrides are merged for CLI launches. This prevents one account's inherited token from overriding another account's login, while leaving room for explicit per-account token mode.
+
 Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory keeps its own `.credentials.json` and `.claude.json`; every other entry is a symlink to your main Claude config. Because `projects/` is shared, a conversation can resume its transcript on another account. A switch still misses the prompt cache once, since each account has its own cache.
 
 ### Live usage dashboard

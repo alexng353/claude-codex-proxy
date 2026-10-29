@@ -1,4 +1,4 @@
-import { markAuthHealthy } from "./auth-health";
+import { authIncidentId } from "./auth-health";
 import { normalizeContext } from "./context.mjs";
 import {
   mkdirSync,
@@ -16,7 +16,7 @@ import {
   isUnavailable,
   isAuthError,
   markAuthFailed,
-  clearAuthFailure,
+  markAuthSucceeded,
   markLimited,
   markTurn,
   observeRateLimit,
@@ -277,6 +277,7 @@ class ClaudeWorker {
   private workerTurn = 0;
   private turn: TurnContext = { requestId: "" };
   private attempt = 1;
+  private observedAuthIncident: string | undefined;
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
@@ -305,6 +306,7 @@ class ClaudeWorker {
     }
     const {
       CLAUDECODE: _nested,
+      CLAUDE_CODE_OAUTH_TOKEN: _inheritedToken,
       CLAUDE_CODE_EFFORT_LEVEL: _effortLevel,
       ...env
     } = process.env;
@@ -356,6 +358,7 @@ class ClaudeWorker {
     // The account actually serving this attempt (a reused worker, a failover).
     markTurn(this.account);
     this.attempt = attempt;
+    this.observedAuthIncident = authIncidentId(this.account);
     this.workerTurn++;
     idleWorkers.delete(this);
     clearTimeout(this.idleTimer);
@@ -490,7 +493,7 @@ class ClaudeWorker {
       return;
     }
     if (event?.type !== "result" || !this.pending) return;
-    if (!event.is_error) { markAuthHealthy(this.account); clearAuthFailure(this.account); }
+    if (!event.is_error) markAuthSucceeded(this.account, this.observedAuthIncident);
     // The model sometimes answers in plain text and then submits StructuredOutput
     // with empty text; keep the answer instead of returning nothing to Codex.
     const output = event.structured_output;

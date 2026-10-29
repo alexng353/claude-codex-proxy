@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { authHealth, recordAuthFailure } from "./auth-health";
+import { authHealth, clearAuthIncident, recordAuthFailure } from "./auth-health";
 import { withLock } from "./filelock";
 import { stateDir } from "./sessions";
 
@@ -148,8 +148,9 @@ export function listAccounts(): Account[] {
   if (!existsSync(root)) return orderAccounts(accounts);
   for (const name of readdirSync(root).sort()) {
     const dir = join(root, name);
-    if (existsSync(join(dir, ".credentials.json")))
-      accounts.push({ name, dir, isDefault: false });
+    try {
+      if (statSync(dir).isDirectory()) accounts.push({ name, dir, isDefault: false });
+    } catch {}
   }
   return orderAccounts(accounts);
 }
@@ -255,7 +256,10 @@ export function isUnavailable(account: Account, now = Date.now()): boolean {
 }
 
 /** Successful requests clear the cooldown immediately, including within one process. */
-export function clearAuthFailure(account: Account): void {
+export function markAuthSucceeded(account: Account, observedId: string | undefined): void {
+  // Normal successful turns have nothing to clear; avoid a disk lock on every turn.
+  if (observedId === undefined && !authFailedUntil.has(account.name)) return;
+  if (!clearAuthIncident(account, observedId)) return;
   authFailedUntil.delete(account.name);
   failedCredentials.delete(account.name);
 }
@@ -269,7 +273,7 @@ export function markAuthFailed(account: Account): void {
 }
 
 export function isAuthError(status: unknown, text: string | undefined): boolean {
-  return status === 401 || /(?:API Error:\s*401\b|failed to authenticate|authentication failed on every account|OAuth (?:access )?token (?:has expired|is invalid)|invalid authentication credentials|invalid_grant|refresh token (?:has expired|is invalid|expired|revoked)|not logged in\b)/i.test(text ?? "");
+  return status === 401 || /(?:API Error:\s*401\b|failed to authenticate|authentication failed on every account|OAuth (?:access )?token (?:has expired|is invalid)|invalid authentication credentials|invalid_grant|refresh token (?:has expired|is invalid|expired|revoked)|not logged in[.\s].*login)/i.test(text ?? "");
 }
 
 /** First account in order that can serve a request, or undefined if none. */

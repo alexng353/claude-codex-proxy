@@ -189,7 +189,7 @@ const CLASSIFIER_TIMEOUT_MS = 60_000;
 /** One-shot Claude Code call on the cheapest model; no session, tools or customizations. */
 export const claudeClassifier: Classifier = async (image, wanted) => {
   const account = listAccounts().find((a) => !unavailable(a)) ?? listAccounts()[0];
-  const { CLAUDECODE: _nested, CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
+  const { CLAUDECODE: _nested, CLAUDE_CODE_OAUTH_TOKEN: _inheritedToken, CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
   const child = Bun.spawn(
     [
       process.env.CLAUDE_BIN ?? "claude",

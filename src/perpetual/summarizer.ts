@@ -426,7 +426,7 @@ const SUMMARY_TIMEOUT_MS = 180_000;
 export function claudeRunner(model: string, effort?: string): SummaryRunner {
   return (threadId) => {
     const account = summaryAccount(threadId);
-    const { CLAUDECODE: _nested, CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
+    const { CLAUDECODE: _nested, CLAUDE_CODE_OAUTH_TOKEN: _inheritedToken, CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
     const child = Bun.spawn(
       [
         process.env.CLAUDE_BIN ?? "claude",

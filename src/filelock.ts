@@ -67,7 +67,7 @@ function legacyHolder(pid: number | undefined): boolean {
  * Re-taking a lock this process holds succeeds and adds a hold; it is let go when
  * every hold has been given back with `unlock`.
  */
-export function tryLock(path: string): { held: true } | { held: false; owner?: number } {
+export function tryLock(path: string, legacy = true): { held: true } | { held: false; owner?: number } {
   const mine = held.get(path);
   if (mine) {
     mine.holds++;
@@ -79,7 +79,7 @@ export function tryLock(path: string): { held: true } | { held: false; owner?: n
     return { held: false, owner: lockOwner(path) };
   }
   const named = lockOwner(path);
-  if (legacyHolder(named)) {
+  if (legacy && legacyHolder(named)) {
     closeSync(fd); // drops the flock
     return { held: false, owner: named };
   }
@@ -105,10 +105,10 @@ export function unlock(path: string): void {
  * Runs `fn` holding `path`, waiting up to `waitMs` for another process to let go.
  * Throws when the wait runs out. For short synchronous critical sections (it blocks).
  */
-export function withLock<T>(path: string, fn: () => T, waitMs = 2000): T {
+export function withLock<T>(path: string, fn: () => T, waitMs = 2000, legacy = true): T {
   const until = Date.now() + waitMs;
   for (;;) {
-    if (tryLock(path).held) break;
+    if (tryLock(path, legacy).held) break;
     if (Date.now() >= until) throw new Error(`lock ${path} is busy`);
     Bun.sleepSync(5);
   }

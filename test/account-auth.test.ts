@@ -106,3 +106,41 @@ test("authentication classification accepts numeric status and explicit CLI erro
   expect(isAuthError(undefined, "invalid authentication credentials")).toBe(true);
   expect(isAuthError(400, "Invalid request")).toBe(false);
 });
+
+test('successful turn clears the observed persisted incident and strips inherited OAuth token', async () => {
+  const { authIncidentId } = await import('../src/auth-health');
+  const { listAccounts } = await import('../src/accounts');
+  const root = await mkdtemp(join(tmpdir(), 'auth-turn-success-'));
+  const keys = ['CLAUDE_BIN', 'CLAUDE_CONFIG_DIR', 'PROXY_STATE_DIR', 'CLAUDE_CODE_OAUTH_TOKEN'];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  const base = join(root, 'base');
+  await mkdir(base);
+  process.env.PROXY_STATE_DIR = join(root, 'state');
+  process.env.CLAUDE_CONFIG_DIR = base;
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = 'test-inherited-token';
+  const cli = join(root, 'claude');
+  await writeFile(cli, `#!${process.execPath}
+import { createInterface } from 'node:readline';
+for await (const line of createInterface({input:process.stdin})) {
+ if (process.env.CLAUDE_CODE_OAUTH_TOKEN) { console.error('unexpected inherited token'); process.exit(1); }
+ console.log(JSON.stringify({type:'result',is_error:false,structured_output:{text:'ok',tool_calls:[]}}));
+}`);
+  await chmod(cli, 0o755); process.env.CLAUDE_BIN = cli;
+  closeIdleWorkers(); resetAccountState();
+  try {
+    const account = listAccounts()[0];
+    markAuthFailed(account);
+    expect(authIncidentId(account)).toBeString();
+    // Credential replacement permits a new attempt; it must not itself clear the incident.
+    await writeFile(join(base, '.credentials.json'), '{"updated":true}');
+    expect(isUnavailable(account)).toBe(false);
+    expect(accountStatus()[0].authFailedSince).toBeString();
+    expect((await runClaude({model:'sonnet',input:'hello'})).text).toBe('ok');
+    expect(accountStatus()[0].authFailedSince).toBeNull();
+    expect(accountStatus()[0].authFailedUntil).toBeNull();
+  } finally {
+    closeIdleWorkers(); resetAccountState();
+    for (const k of keys) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    await rm(root, {recursive:true,force:true});
+  }
+});
