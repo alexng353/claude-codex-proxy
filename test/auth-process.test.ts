@@ -71,9 +71,9 @@ test('new auth locks ignore an unlocked file naming a live bun process', async (
 test('repeated observations do not rewrite state; same name in different dirs stays distinct', () => {
   const account = setup(); markAuthFailed(account);
   const path = join(process.env.PROXY_STATE_DIR!, 'account-auth.json');
-  const first = statSync(path).mtimeMs;
+  const first = statSync(path).ino;
   checkAuthExpiry(account); markAuthFailed(account);
-  expect(statSync(path).mtimeMs).toBe(first);
+  expect(statSync(path).ino).toBe(first);
   const another = { ...account, dir: join(root, 'another') };
   markAuthFailed(another);
   expect(authIncidentId(another)).not.toBe(authIncidentId(account));
@@ -86,13 +86,16 @@ test('real sender adapter sets client identity and removes thread identity', asy
   process.env.CODEX_THREAD_ID = 'must-not-leak';
   const spawn = Bun.spawn;
   let called = 0;
+  let captured: {args: string[], env: any} | undefined;
   (Bun as any).spawn = (args: string[], options: any) => {
     called++;
-    expect(args.slice(-4)).toEqual(['--client', 'claude-codex-proxy', 'today', '-']);
-    expect(options.env.CODEX_THREAD_ID).toBeUndefined();
+    captured = { args, env: options.env };
     return { exited: Promise.resolve(0), kill() {} };
   };
-  try { const stop = startAuthWarnings(); await stop(); expect(called).toBe(1); }
+  try { const stop = startAuthWarnings(); await stop(); expect(called).toBe(1);
+    expect(captured!.args.slice(-4)).toEqual(['--client', 'claude-codex-proxy', 'today', '-']);
+    expect(captured!.args[0]).toBe(process.env.TODAY_DAEMON_BIN!);
+    expect(captured!.env.CODEX_THREAD_ID).toBeUndefined(); }
   finally { Bun.spawn = spawn; }
 });
 
@@ -144,4 +147,32 @@ test('hysteresis uses a newer delivery recorded by another process', async () =>
   try { await flushAuthWarnings(async () => { count++; return true; }); }
   finally { Date.now = originalNow; }
   expect(count).toBe(0);
+});
+
+test('success clears local cooldown after another process cleared the same incident', async () => {
+  const account = setup(); markAuthFailed(account);
+  const id = authIncidentId(account);
+  const child = run(`import {clearAuthIncident} from ${JSON.stringify(modulePath)};
+    clearAuthIncident(${JSON.stringify(account)}, ${JSON.stringify(id)});`, 'clear-incident');
+  expect(await child.exited).toBe(0);
+  expect(authIncidentId(account)).toBeUndefined();
+  markAuthSucceeded(account, id);
+  expect(accountStatus()[0].authFailedUntil).toBeNull();
+});
+
+test('legacy name-keyed incidents and delivery history migrate without losing dedupe', async () => {
+  const account = setup();
+  const file = join(process.env.PROXY_STATE_DIR!, 'account-auth.json');
+  mkdirSync(process.env.PROXY_STATE_DIR!, {recursive:true});
+  writeFileSync(file,JSON.stringify({default:{dir:account.dir,failure:{id:'old-id',since:'2026-10-28T00:00:00Z',delivered:true},
+    lastSent:{at:Date.now(),credentials:'legacy'}}}));
+  expect(authIncidentId(account)).toBe('old-id');
+  let sends = 0;
+  await flushAuthWarnings(async () => { sends++; return true; });
+  expect(sends).toBe(0);
+  checkAuthExpiry(account);
+  const state = JSON.parse(readFileSync(file,'utf8'));
+  expect(state[JSON.stringify(['default',account.dir])].failure.id).toBe('old-id');
+  expect(state[JSON.stringify(['default',account.dir])].lastSent.failure.credentials).toBe('legacy');
+  expect(state[JSON.stringify(['default',account.dir])].lastSent.expiry.credentials).toBe('legacy');
 });

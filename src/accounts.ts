@@ -251,8 +251,12 @@ function isAuthBlocked(account: Account, now: number): boolean {
   return false;
 }
 
+function hasCredentials(account: Account): boolean {
+  return account.isDefault || existsSync(join(account.dir, ".credentials.json"));
+}
+
 export function isUnavailable(account: Account, now = Date.now()): boolean {
-  return isAuthBlocked(account, now) || isLimited(account, now) || isOverWeeklyCap(account, now);
+  return !hasCredentials(account) || isAuthBlocked(account, now) || isLimited(account, now) || isOverWeeklyCap(account, now);
 }
 
 /** Successful requests clear the cooldown immediately, including within one process. */
@@ -265,8 +269,8 @@ export function markAuthSucceeded(account: Account, observedId: string | undefin
 }
 
 /** Authentication can recover after a CLI refresh or a new login. */
-export function markAuthFailed(account: Account): void {
-  recordAuthFailure(account);
+export function markAuthFailed(account: Account, persistIncident = true): void {
+  if (persistIncident) recordAuthFailure(account);
   authFailedUntil.set(account.name, Date.now() + FALLBACK_LIMIT_MS);
   failedCredentials.set(account.name, credentialVersion(account));
   console.error(`Claude account ${account.name} authentication failed; skipping for 15 minutes`);
@@ -285,7 +289,7 @@ export function pickAccount(): Account | undefined {
 /** The account to use when all are limited: the one that resets first. */
 export function soonestAccount(): Account {
   const now = Date.now();
-  const accounts = listAccounts().filter((account) => !isAuthBlocked(account, now));
+  const accounts = listAccounts().filter((account) => hasCredentials(account) && !isAuthBlocked(account, now));
   if (!accounts.length) throw new Error("No Claude accounts available: authentication failed on every account");
   return accounts.reduce((best, account) =>
     (limitedUntil.get(account.name) ?? 0) < (limitedUntil.get(best.name) ?? 0)

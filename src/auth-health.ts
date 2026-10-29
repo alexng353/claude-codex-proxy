@@ -9,7 +9,15 @@ import { stateDir } from "./sessions";
 type FailureIncident = { id: string; since: string; delivered?: boolean };
 type ExpiryIncident = FailureIncident & { expiresAt: number };
 type Delivery = { at: number; credentials: string | undefined };
-type Health = { name: string; dir: string; failure?: FailureIncident; expiry?: ExpiryIncident; lastSent?: Delivery };
+type Health = {
+  name: string;
+  dir: string;
+  failure?: FailureIncident;
+  expiry?: ExpiryIncident;
+  seenCredentials?: boolean;
+  missingSince?: number;
+  lastSent?: Partial<Record<"failure" | "expiry", Delivery>>;
+};
 type State = Record<string, Health>;
 export type WarningSender = (message: string, incidentId: string) => Promise<boolean>;
 const THREE_DAYS = 3 * 86400_000;
@@ -24,6 +32,8 @@ function read(): State {
     return Object.fromEntries(Object.entries(saved).map(([oldKey, value]) => {
       const health = value as Health;
       const name = health.name ?? oldKey;
+      const legacy = health.lastSent as Delivery | undefined;
+      if (legacy && "at" in legacy) health.lastSent = { failure: legacy, expiry: legacy };
       return [key({ name, dir: health.dir }), { ...health, name }];
     }));
   } catch (error) {
@@ -57,7 +67,15 @@ function get(account: Account): Health | undefined {
 }
 export function recordAuthFailure(account: Account): void {
   safely(() => update((state) => {
-    entry(state, account).failure ??= { id: crypto.randomUUID(), since: new Date().toISOString() };
+    const health = entry(state, account);
+    const credentials = credentialStatus(account);
+    if (credentials.version && credentials.version !== "missing") health.seenCredentials = true;
+    if (!account.isDefault && credentials.version === "missing" && !health.seenCredentials) {
+      // account add creates the directory before interactive login has finished.
+      health.missingSince ??= Date.now();
+      if (Date.now() - health.missingSince < 15 * 60_000) return;
+    }
+    health.failure ??= { id: crypto.randomUUID(), since: new Date().toISOString() };
   }));
 }
 export function authIncidentId(account: Account): string | undefined {
@@ -68,7 +86,7 @@ export function clearAuthIncident(account: Account, observedId: string | undefin
   try {
     return update((state) => {
       const health = state[key(account)];
-      if (health?.failure?.id !== observedId) return false;
+      if (health?.failure && health.failure.id !== observedId) return false;
       if (health) delete health.failure;
       return true;
     });
@@ -99,10 +117,11 @@ export function credentialStatus(account: Account) {
   return { version, state, expiresAt: timestamp(oauth?.expiresAt), refreshTokenExpiresAt: timestamp(oauth?.refreshTokenExpiresAt) };
 }
 export function checkAuthExpiry(account: Account, now = Date.now()): void {
-  const { expiresAt, refreshTokenExpiresAt: expiry } = credentialStatus(account);
+  const { version, expiresAt, refreshTokenExpiresAt: expiry } = credentialStatus(account);
   safely(() => update((state) => {
-    if (expiry === null) return; // Unknown does not rearm an existing warning.
     const health = entry(state, account);
+    if (version && version !== "missing") health.seenCredentials = true;
+    if (expiry === null) return; // Unknown does not rearm an existing warning.
     // Match the CLI's stale metadata guard. An already-past deadline is silent.
     if (expiry <= now || expiry > now + THREE_DAYS || (expiresAt !== null && expiresAt > expiry + THREE_DAYS)) {
       delete health.expiry;
@@ -122,7 +141,7 @@ function warningText(machine: string, account: Account, incident: FailureInciden
     : `authentication failed since ${incident.since}`;
   const command = account.isDefault && process.env.CLAUDE_CONFIG_DIR === undefined
     ? "claude" : `CLAUDE_CONFIG_DIR=${quote(account.dir)} claude`;
-  return `Claude proxy on ${machine}: account ${account.name} ${reason}. On ${machine}, run \`${command}\`, then /login.`;
+  return `[from claude-codex-proxy, ${machine}] Claude proxy on ${machine}: account ${account.name} ${reason}. On ${machine}, run \`${command}\`, then /login.`;
 }
 const sending = new Set<string>();
 const delivered = new Set<string>();
@@ -146,8 +165,8 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         const incident = health?.[kind];
         if (!incident || incident.id !== candidate.id || incident.delivered || delivered.has(incident.id)) continue;
         const version = credentialStatus(account).version;
-        const remembered = lastSent.get(`${path()}:${accountKey}`);
-        const previous = remembered && remembered.at > (health.lastSent?.at ?? 0) ? remembered : health.lastSent;
+        const remembered = lastSent.get(`${path()}:${accountKey}:${kind}`);
+        const previous = remembered && remembered.at > (health.lastSent?.[kind]?.at ?? 0) ? remembered : health.lastSent?.[kind];
         if (previous && previous.credentials === version && Date.now() - previous.at < SIX_HOURS) continue;
         let sent = false;
         try { sent = await send(warningText(machine, account, incident), incident.id); } catch {}
@@ -155,11 +174,11 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         // Even if the durable write fails, this process must not resend on every tick.
         delivered.add(incident.id);
         const delivery = { at: Date.now(), credentials: version };
-        lastSent.set(`${path()}:${accountKey}`, delivery);
+        lastSent.set(`${path()}:${accountKey}:${kind}`, delivery);
         safely(() => update((state) => {
           const current = state[accountKey];
           if (!current) return;
-          current.lastSent = delivery;
+          (current.lastSent ??= {})[kind] = delivery;
           if (current[kind]?.id === incident.id) current[kind]!.delivered = true;
         }));
       }
@@ -168,7 +187,7 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
 }
 async function sendTodayWarning(message: string, _incidentId: string): Promise<boolean> {
   const { CODEX_THREAD_ID: _thread, ...env } = process.env;
-  const child = Bun.spawn([join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
+  const child = Bun.spawn([process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
     `/run/user/${process.getuid!()}/today/daemon.sock`, "--client", "claude-codex-proxy", "today", "-"], {
     env, stdin: new TextEncoder().encode(message), stdout: "ignore", stderr: "ignore",
   });

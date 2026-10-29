@@ -12,7 +12,7 @@ already in the past do not produce expiry warnings; a dead login produces an
 authentication warning instead.
 
 Warnings persist per account name and directory. Delivery retries on failure;
-a successful delivery suppresses another warning for six hours unless the
+a successful delivery suppresses another warning of the same kind for six hours unless the
 credentials file changes. A cross-process lock prevents concurrent sends, and
 in-process memory prevents repeated sends if recording delivery fails. A crash
 between sending and recording success can still duplicate a warning until Today

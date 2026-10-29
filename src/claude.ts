@@ -1,4 +1,4 @@
-import { authIncidentId } from "./auth-health";
+import { authIncidentId, credentialStatus } from "./auth-health";
 import { normalizeContext } from "./context.mjs";
 import {
   mkdirSync,
@@ -277,6 +277,7 @@ class ClaudeWorker {
   private workerTurn = 0;
   private turn: TurnContext = { requestId: "" };
   private attempt = 1;
+  private observedCredentials: string | undefined;
   private observedAuthIncident: string | undefined;
   private stderr = "";
   private idleTimer?: ReturnType<typeof setTimeout>;
@@ -359,6 +360,7 @@ class ClaudeWorker {
     markTurn(this.account);
     this.attempt = attempt;
     this.observedAuthIncident = authIncidentId(this.account);
+    this.observedCredentials = credentialStatus(this.account).version;
     this.workerTurn++;
     idleWorkers.delete(this);
     clearTimeout(this.idleTimer);
@@ -448,7 +450,14 @@ class ClaudeWorker {
    */
   private noteFailure(status: unknown, message: string): void {
     if (isLimitError(status, message)) markLimited(this.account);
-    if (isAuthError(status, message)) markAuthFailed(this.account);
+    if (isAuthError(status, message)) {
+      const credentials = credentialStatus(this.account);
+      // An expired bearer can fail after a transient refresh outage. Retain routing
+      // backoff, but only demand login for a dead marker or this turn's fresh bearer.
+      const failed = credentials.state === "failed" ||
+        (credentials.version === this.observedCredentials && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000);
+      markAuthFailed(this.account, failed);
+    }
     recordFailure({
       event: "failure",
       requestId: this.turn.requestId,

@@ -2,7 +2,7 @@ import { afterEach, expect, test, spyOn } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { listAccounts, accountStatus, markAuthFailed, resetAccountState, isAuthError } from "../src/accounts";
+import { listAccounts, accountStatus, markAuthFailed, resetAccountState, isAuthError, isUnavailable, soonestAccount, markLimited } from "../src/accounts";
 import { probeAccount, resetUsageProbe } from "../src/usage-probe";
 import * as health from "../src/auth-health";
 
@@ -20,10 +20,10 @@ function setup(oauth: unknown = { accessToken: 'FAKE', refreshToken: 'FAKE-R', e
 function credentials(oauth: unknown) {
   writeFileSync(join(process.env.CLAUDE_CONFIG_DIR!, '.credentials.json'), JSON.stringify({ claudeAiOauth: oauth }));
 }
-function replay(name: string, stderr = '', code = 0) {
+function replay(name: string, stderr = '', code = 0, percent?: number) {
   const fixture = readFileSync(join(import.meta.dir, 'fixtures/cli-2.1.302', name + '.jsonl'), 'utf8').trim().split('\n').map((line) => {
     const event = JSON.parse(line);
-    for (const window of event.usage_report?.rate_limits?.limits ?? []) window.resets_at = new Date(Date.now() + 3600000).toISOString();
+    for (const window of event.usage_report?.rate_limits?.limits ?? []) { window.resets_at = new Date(Date.now() + 3600000).toISOString(); if (percent !== undefined) window.percent = percent; }
     return JSON.stringify(event);
   }).join('\n');
   const cli = join(root, 'cli');
@@ -75,8 +75,9 @@ test('valid usage wins over noisy stderr and updates meters during an unresolved
   expect((await probeAccount(account)).result).toBe('applied');
   markAuthFailed(account);
   const since = accountStatus()[0].authFailedSince;
+  replay('m-fresh200b', '', 0, 67);
   await probeAccount(account, async () => 'unknown');
-  expect(accountStatus()[0].windows.seven_day.usedPercent).toBe(34);
+  expect(accountStatus()[0].windows.seven_day.usedPercent).toBe(67);
   expect(accountStatus()[0].authFailedSince).toBe(since);
 });
 
@@ -112,7 +113,14 @@ test('configured account directories remain visible when credentials are missing
   replay('m-empty');
   const account = listAccounts().find((a) => a.name === 'missing');
   expect(account).toBeDefined();
-  expect((await probeAccount(account!)).result).toStartWith('auth failed since ');
+  expect(isUnavailable(account!)).toBe(true);
+  markLimited(listAccounts()[0], Date.now() + 3600000);
+  expect(soonestAccount().name).toBe('default');
+  expect((await probeAccount(account!)).result).toBe('unavailable');
+  const originalNow = Date.now; const later = originalNow() + 16 * 60000;
+  Date.now = () => later;
+  try { expect((await probeAccount(account!)).result).toStartWith('auth failed since '); }
+  finally { Date.now = originalNow; }
 });
 
 test('timeout signals TERM before KILL and never validates the endpoint', async () => {
@@ -152,4 +160,118 @@ test('invalid_grant detected after the CLI blanks previously present credentials
   writeFileSync(cli, readFileSync(cli, 'utf8').replace('process.stdout.write(', `require('node:fs').writeFileSync(${JSON.stringify(join(account.dir, '.credentials.json'))}, ${JSON.stringify(blank)}); process.stdout.write(`));
   const outcome = await probeAccount(account, async () => { throw new Error('dead marker needs no endpoint'); });
   expect(outcome.result).toStartWith('auth failed since ');
+});
+
+test('healthy recovery applies meters and clears both incident and cooldown', async () => {
+  const account = setup(); replay('m-fresh200b');
+  markAuthFailed(account);
+  expect((await probeAccount(account, async () => 'healthy')).result).toBe('applied');
+  expect(accountStatus()[0].authFailedSince).toBeNull();
+  expect(accountStatus()[0].authFailedUntil).toBeNull();
+});
+
+test('synthetic stale CLI diagnostic cannot fail a replacement login', async () => {
+  const account = setup(); replay('m-empty', 'API Error: 401 Invalid bearer token');
+  const cli = process.env.CLAUDE_BIN!;
+  const replacement = JSON.stringify({ claudeAiOauth: { accessToken: 'NEW', refreshToken: 'R', expiresAt: Date.now() + 3600000 } });
+  writeFileSync(cli, readFileSync(cli, 'utf8').replace('process.stdout.write(', `require('node:fs').writeFileSync(${JSON.stringify(join(account.dir, '.credentials.json'))}, ${JSON.stringify(replacement)}); process.stdout.write(`));
+  let calls = 0;
+  expect((await probeAccount(account, async () => { calls++; return 'healthy'; })).result).toBe('unavailable');
+  expect(calls).toBe(1);
+  expect(accountStatus()[0].authFailedSince).toBeNull();
+});
+
+for (const mode of ['expired', 'buffer', 'fresh', 'rotated', 'dead'] as const) test(`captured turn refresh 500 keeps routing cooldown without a login incident: ${mode}`, async () => {
+  const { runClaude, closeIdleWorkers } = await import('../src/claude');
+  const account = setup({accessToken:'FAKE',refreshToken:'R',expiresAt:Date.now()+(mode === 'expired' ? -3600000 : mode === 'buffer' ? 60000 : 3600000)});
+  const fixture = readFileSync(join(import.meta.dir,'fixtures/cli-2.1.302/m-turn-refresh500.jsonl'),'utf8');
+  const cli = join(root,'turn-cli');
+  writeFileSync(cli, `#!${process.execPath}
+import {createInterface} from 'node:readline';
+for await (const line of createInterface({input:process.stdin})) {
+  if (${JSON.stringify(mode)} === 'rotated' || ${JSON.stringify(mode)} === 'dead') {
+    require('node:fs').writeFileSync(${JSON.stringify(join(account.dir,'.credentials.json'))}, JSON.stringify({claudeAiOauth:
+      ${JSON.stringify(mode)} === 'dead' ? {accessToken:'',refreshToken:'',expiresAt:0} :
+      {accessToken:'NEW',refreshToken:'R',expiresAt:Date.now()+3600000}}));
+  }
+  process.stdout.write(${JSON.stringify(fixture)});
+}
+`);
+  chmodSync(cli,0o755); process.env.CLAUDE_BIN=cli; closeIdleWorkers();
+  try {
+    await expect(runClaude({model:'sonnet',input:'hello'})).rejects.toThrow();
+    expect(accountStatus()[0].authFailedUntil).toBeString();
+    if (mode === 'fresh' || mode === 'dead') expect(health.authIncidentId(account)).toBeString();
+    else expect(health.authIncidentId(account)).toBeUndefined();
+  } finally { closeIdleWorkers(); }
+});
+
+// Defensive CLI diagnostics: synthetic events cover older/alternate CLI envelopes.
+// Captured 2.1.302 empty reports remain the main regression fixtures above.
+for (const source of ['stderr', 'result', 'errors'] as const)
+for (const remaining of [3600000, 300000, -1000]) test(`synthetic ${source} auth diagnostic with ${remaining}ms access lifetime`, async () => {
+  const account = setup({accessToken:'FAKE',refreshToken:'R',expiresAt:Date.now()+remaining});
+  replay('m-empty', source === 'stderr' ? 'API Error: 401 Invalid bearer token' : '');
+  if (source !== 'stderr') {
+    const cli = process.env.CLAUDE_BIN!;
+    const event = {type:'result',is_error:true,...(source === 'result'
+      ? {result:'Failed to authenticate. API Error: 401 Invalid bearer token'}
+      : {errors:['Not logged in. Run claude auth login.']})};
+    writeFileSync(cli,readFileSync(cli,'utf8').replace('process.stdout.write(', `console.log(${JSON.stringify(JSON.stringify(event))}); process.stdout.write(`));
+  }
+  let calls = 0;
+  const result = await probeAccount(account, async () => { calls++; return 'unknown'; });
+  if (remaining > 300000) {
+    expect(result.result).toStartWith('auth failed since ');
+    expect(calls).toBe(0);
+  } else {
+    expect(result.result).toBe('unavailable');
+    expect(calls).toBe(1);
+    expect(accountStatus()[0].authFailedSince).toBeNull();
+  }
+});
+
+test('synthetic bare stderr 429 suppresses validation without rate-limit prose', async () => {
+  const account = setup(); replay('m-empty', 'HTTP 429');
+  let calls = 0;
+  await probeAccount(account, async () => { calls++; return 'failed'; });
+  expect(calls).toBe(0);
+  expect(accountStatus()[0].authFailedSince).toBeNull();
+});
+
+test('synthetic numeric result 429 suppresses validation', async () => {
+  const account = setup(); replay('m-empty');
+  const cli = process.env.CLAUDE_BIN!;
+  writeFileSync(cli,readFileSync(cli,'utf8').replace('process.stdout.write(', `console.log('{"type":"result","is_error":true,"api_error_status":429}'); process.stdout.write(`));
+  let calls = 0;
+  await probeAccount(account, async () => { calls++; return 'failed'; });
+  expect(calls).toBe(0);
+});
+
+test('a report clears a routing-only cooldown with no persisted incident', async () => {
+  const account = setup(); replay('m-fresh200b');
+  markAuthFailed(account, false);
+  expect(accountStatus()[0].authFailedUntil).toBeString();
+  expect((await probeAccount(account)).result).toBe('applied');
+  expect(accountStatus()[0].authFailedUntil).toBeNull();
+});
+
+test('unsupported CLI still detects the dead credential marker', async () => {
+  const account = setup({accessToken:'',refreshToken:'',expiresAt:0});
+  replay('m-dead');
+  const cli = process.env.CLAUDE_BIN!;
+  writeFileSync(cli,readFileSync(cli,'utf8').replace('2.1.302 (Claude Code)','2.1.100 (Claude Code)'));
+  expect((await probeAccount(account)).result).toStartWith('auth failed since ');
+});
+
+test('missing credentials on a previously observed account bypass login grace', async () => {
+  setup();
+  const dir = join(process.env.PROXY_STATE_DIR!, 'accounts', 'previous');
+  mkdirSync(dir,{recursive:true});
+  const account = {name:'previous',dir,isDefault:false};
+  writeFileSync(join(dir,'.credentials.json'),JSON.stringify({claudeAiOauth:{accessToken:'FAKE',refreshToken:'R'}}));
+  health.checkAuthExpiry(account);
+  rmSync(join(dir,'.credentials.json'));
+  replay('m-empty');
+  expect((await probeAccount(account)).result).toStartWith('auth failed since ');
 });

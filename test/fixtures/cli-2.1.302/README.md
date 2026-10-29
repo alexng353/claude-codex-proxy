@@ -10,4 +10,7 @@ session IDs are historical fixture data, not directories tests should create.
 `m-fresh200b`: successful usage meters. `m-turn-fresh401`: model turn auth error.
 
 Replay helpers may advance meter reset dates to keep fixtures useful after their
-capture date. Other parser edge cases deliberately use malformed synthetic data.
+capture date. Other parser and diagnostic edge cases use explicitly labelled synthetic data.
+
+`m-turn-refresh500`: a transient refresh 500 followed by a model-turn 401 with
+an expired access token. This must back off routing without demanding login.

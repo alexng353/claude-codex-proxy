@@ -88,7 +88,7 @@ test("authentication cooldown expires independently from quota", async () => {
   process.env.PROXY_STATE_DIR = directory;
   try {
     resetAccountState();
-    const account = { name: "expired-auth", dir: "/unused", isDefault: false };
+    const account = { name: "expired-auth", dir: directory, isDefault: true };
     const before = Date.now();
     markAuthFailed(account);
     expect(isUnavailable(account, before + 60_000)).toBe(true);

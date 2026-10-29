@@ -173,6 +173,7 @@ export async function probeAccount(
   }
   const observedId = authIncidentId(account);
   const startedAt = Date.now();
+  const observedCredentials = credentialStatus(account).version;
   const result = await runClaude(
     account,
     ["-p", "/usage", "--output-format", "stream-json", "--verbose", "--no-session-persistence",
@@ -205,7 +206,7 @@ export async function probeAccount(
     }
     if (limited || !completed) return unavailable();
     // A rejected bearer inside the CLI's refresh buffer is not proof that login is dead.
-    if (authError && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000) {
+    if (authError && credentials.version === observedCredentials && (credentials.expiresAt ?? 0) > Date.now() + 5 * 60_000) {
       markAuthFailed(account);
       return unavailable();
     }

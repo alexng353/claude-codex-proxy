@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -6,6 +6,8 @@ import { join } from "node:path";
 const scratch = process.env.TMPDIR ?? join(homedir(), ".cache/claude-codex-proxy-tests");
 mkdirSync(scratch, { recursive: true, mode: 0o700 });
 const root = mkdtempSync(join(scratch, "proxy-tests-"));
+process.env.TODAY_DAEMON_BIN = join(root, "test-only-today-daemon");
+writeFileSync(process.env.TODAY_DAEMON_BIN, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
 process.env.TMPDIR = root;
 process.env.PROXY_STATE_DIR = join(root, "state");
 process.env.XDG_STATE_HOME = join(root, "xdg-state");

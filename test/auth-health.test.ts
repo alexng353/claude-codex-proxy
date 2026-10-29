@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { classifyTurn } from "../src/hygiene";
 import * as health from "../src/auth-health";
 import { accountStatus, isAuthError, listAccounts, markAuthFailed, markAuthSucceeded, resetAccountState } from "../src/accounts";
 
@@ -53,6 +54,7 @@ test('warnings dedupe across repeated failures and retry failed delivery; recove
   expect(messages[0]).toContain('forge');
   expect(messages[0]).toContain(`CLAUDE_CONFIG_DIR='${root}' claude`);
   expect(messages[0]).toContain('/login');
+  expect(classifyTurn({model:'sonnet',input:[{role:'user',content:messages[0]}]}).type).not.toBe('human');
   markAuthSucceeded(account, health.authIncidentId(account));
   writeFileSync(join(root, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "new-test-token" } }));
   markAuthFailed(account);
@@ -119,16 +121,12 @@ test('unknown expiry does not rearm a delivered incident', async () => {
   expect(sent).toBe(1);
 });
 
-test('expired and stale refresh deadlines are silent', async () => {
+for (const kind of ['expired', 'stale'] as const) test(`${kind} refresh deadline is silent`, async () => {
   const account = setup();
-  for (const oauth of [
-    { refreshTokenExpiresAt: Date.now() - 1 },
-    { refreshTokenExpiresAt: Date.now() + 86400000, expiresAt: Date.now() + 5 * 86400000 },
-  ]) {
-    writeFileSync(join(root, '.credentials.json'), JSON.stringify({ claudeAiOauth: oauth }));
-    health.checkAuthExpiry(account);
-    await health.flushAuthWarnings(async () => { throw new Error('must not send'); });
-  }
+  const oauth = kind === 'expired' ? { refreshTokenExpiresAt: Date.now() - 1 }
+    : { refreshTokenExpiresAt: Date.now() + 86400000, expiresAt: Date.now() + 5 * 86400000 };
+  writeFileSync(join(root, '.credentials.json'), JSON.stringify({ claudeAiOauth: oauth }));
+  health.checkAuthExpiry(account);
   let count = 0;
   await health.flushAuthWarnings(async () => { count++; return true; });
   expect(count).toBe(0);
@@ -186,7 +184,10 @@ test('a failed durable delivery record does not resend in this process', async (
   let count = 0;
   await health.flushAuthWarnings(async () => { count++; mkdirSync(next); return true; });
   rmSync(next, { recursive: true });
-  await health.flushAuthWarnings(async () => { count++; return true; });
+  const originalNow = Date.now; const later = originalNow() + 7 * 3600000;
+  Date.now = () => later;
+  try { await health.flushAuthWarnings(async () => { count++; return true; }); }
+  finally { Date.now = originalNow; }
   expect(count).toBe(1);
 });
 
@@ -219,4 +220,28 @@ test('failure warning rearms after six hours without a credential change', async
   Date.now = () => later;
   try { await health.flushAuthWarnings(sender); } finally { Date.now = originalNow; }
   expect(count).toBe(2);
+});
+
+test('expiry delivery does not suppress a new failure warning', async () => {
+  const account = setup();
+  writeFileSync(join(root,'.credentials.json'), JSON.stringify({claudeAiOauth:{refreshTokenExpiresAt:Date.now()+86400000}}));
+  health.checkAuthExpiry(account);
+  let count = 0;
+  const send = async () => { count++; return true; };
+  await health.flushAuthWarnings(send);
+  markAuthFailed(account);
+  await health.flushAuthWarnings(send);
+  expect(count).toBe(2);
+});
+
+test('expiry delivery rechecks a deadline that passed after observation', async () => {
+  const account = setup();
+  writeFileSync(join(root,'.credentials.json'),JSON.stringify({claudeAiOauth:{refreshTokenExpiresAt:Date.now()+60000}}));
+  health.checkAuthExpiry(account);
+  const now = Date.now; const later = now()+120000;
+  Date.now = () => later;
+  let sent = 0;
+  try { await health.flushAuthWarnings(async () => { sent++; return true; }); }
+  finally { Date.now = now; }
+  expect(sent).toBe(0);
 });
