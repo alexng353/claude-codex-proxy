@@ -219,7 +219,7 @@ test('every Claude launcher strips every inherited credential variable', async (
   } finally {Bun.spawn=spawn;closeIdleWorkers();resetUsageProbe();}
 });
 
-test('removal in another process resets in-memory delivery hysteresis', async () => {
+test('account replacement resets delivery hysteresis across processes and locally', async () => {
   const {forgetAccountAuth}=await import('../src/auth-health');
   setup(); const dir=join(process.env.PROXY_STATE_DIR!,'accounts','reborn');
   mkdirSync(dir,{recursive:true});
@@ -241,12 +241,12 @@ test('removal in another process resets in-memory delivery hysteresis', async ()
 });
 
 test('late probe observations never recreate removed account state', async () => {
-  const {forgetAccountAuth}=await import('../src/auth-health');
+  const {forgetAccountAuth,recordCredentialObservation}=await import('../src/auth-health');
   const {probeAccount}=await import('../src/usage-probe');
   setup(); const account={name:'gone',dir:join(root,'gone'),isDefault:false};
   mkdirSync(account.dir);writeFileSync(join(account.dir,'.credentials.json'),'{}');
   markAuthFailed(account);forgetAccountAuth(account);rmSync(account.dir,{recursive:true});
-  checkAuthExpiry(account);markAuthFailed(account);await probeAccount(account);
+  checkAuthExpiry(account);markAuthFailed(account);recordCredentialObservation(account,"fake-version");await probeAccount(account);
   const state=JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!,'account-auth.json'),'utf8'));
   expect(state[JSON.stringify([account.name,account.dir])]).toBeUndefined();
 });
@@ -304,4 +304,69 @@ for(const kind of ['both','neither'] as const) test(`legacy delivery migration h
     expect(health.lastSent.failure.credentials).toBe('old');
     expect(health.lastSent.expiry.credentials).toBe('old');
   } else expect(health.lastSent).toBeUndefined();
+});
+
+test('legacy record recreation adopts a fresh persisted generation',async()=>{
+  const account=setup();
+  const file=join(process.env.PROXY_STATE_DIR!,'account-auth.json');
+  mkdirSync(process.env.PROXY_STATE_DIR!,{recursive:true});
+  const createLegacy=(id:string)=>writeFileSync(file,JSON.stringify({default:{dir:account.dir,failure:{id,since:new Date().toISOString()}}}));
+  createLegacy('first');
+  let sent=0;const send=async()=>{sent++;return true;};
+  await flushAuthWarnings(send);
+  const first=JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,account.dir])].generation;
+  const child=run(`import {forgetAccountAuth} from ${JSON.stringify(modulePath)};forgetAccountAuth(${JSON.stringify(account)});`,'legacy-remove');
+  expect(await child.exited).toBe(0);
+  createLegacy('replacement'); // Older handoff slot creates a record with no generation.
+  expect(authIncidentId(account)).toBe('replacement');
+  const adopted=JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,account.dir])];
+  expect(adopted.generation).toBeString();
+  expect(adopted.generation).not.toBe(first);
+  expect(authIncidentId(account)).toBe('replacement');
+  expect(JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,account.dir])].generation).toBe(adopted.generation);
+  await flushAuthWarnings(send);
+  expect(sent).toBe(2);
+});
+
+for(const operation of ['turn','failure','expiry'] as const) test(`removal while acquiring state lock cannot recreate account: ${operation}`,async()=>{
+  const health=await import('../src/auth-health');
+  const locks=await import('../src/filelock');
+  setup();
+  const account={name:'removed',dir:join(root,'removed'),isDefault:false};
+  mkdirSync(account.dir);writeFileSync(join(account.dir,'.credentials.json'),'{}');
+  mkdirSync(process.env.PROXY_STATE_DIR!,{recursive:true});
+  const file=join(process.env.PROXY_STATE_DIR!,'account-auth.json');writeFileSync(file,'{}');
+  const original=locks.withLock;
+  let reached=false;
+  const lock=spyOn(locks,'withLock').mockImplementation(((path:string,fn:()=>unknown,timeout:number,legacy:boolean)=>original(path,()=>{
+    if(path===file+'.lock') {reached=true;rmSync(account.dir,{recursive:true,force:true});}
+    return fn();
+  },timeout,legacy)) as typeof locks.withLock);
+  try {
+    if(operation==='turn') health.recordCredentialObservation(account,'fake-version');
+    else if(operation==='failure') health.recordAuthFailure(account);
+    else health.checkAuthExpiry(account);
+  } finally {lock.mockRestore();}
+  expect(reached).toBe(true);
+  expect(JSON.parse(readFileSync(file,'utf8'))[JSON.stringify([account.name,account.dir])]).toBeUndefined();
+});
+
+test('send finishing after account replacement cannot attach old delivery history',async()=>{
+  const {forgetAccountAuth}=await import('../src/auth-health');
+  setup();const dir=join(process.env.PROXY_STATE_DIR!,'accounts','replacement');
+  mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'.credentials.json'),'{}');
+  const account={name:'replacement',dir,isDefault:false};markAuthFailed(account);
+  let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+  let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});
+  let sent=0;
+  const flushing=flushAuthWarnings(async()=>{sent++;entered();await gate;return true;});
+  await started;
+  forgetAccountAuth(account);rmSync(dir,{recursive:true});
+  mkdirSync(dir);writeFileSync(join(dir,'.credentials.json'),'{}');markAuthFailed(account);
+  release();await flushing;
+  const state=JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!,'account-auth.json'),'utf8'))[JSON.stringify([account.name,dir])];
+  expect(state.lastSent).toBeUndefined();
+  expect(state.failure.delivered).toBeUndefined();
+  await flushAuthWarnings(async()=>{sent++;return true;});
+  expect(sent).toBe(2);
 });

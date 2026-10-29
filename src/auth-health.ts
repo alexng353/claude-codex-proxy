@@ -27,7 +27,7 @@ const SIX_HOURS = 6 * 3600_000;
 const REFRESH_BUFFER = 5 * 60_000;
 const key = (account: Pick<Account, "name" | "dir">) => JSON.stringify([account.name, account.dir]);
 function path() { return join(stateDir(), "account-auth.json"); }
-function read(): State {
+function readState(): State {
   try {
     const saved = JSON.parse(readFileSync(path(), "utf8"));
     // Preserve incidents created by the first version, before keys included dirs.
@@ -41,8 +41,6 @@ function read(): State {
         if (health.failure?.delivered || (!health.expiry?.delivered && health.failure)) history.failure = legacy;
         health.lastSent = Object.keys(history).length ? history : undefined;
       }
-      // Stable for old records until the next write; new entries always use UUIDs.
-      health.generation ??= `legacy:${key({ name, dir: health.dir })}`;
       return [key({ name, dir: health.dir }), { ...health, name }];
     }));
   } catch (error) {
@@ -50,11 +48,19 @@ function read(): State {
     throw error; // Never reset dedupe after an unreadable/corrupt state file.
   }
 }
+function read(): State {
+  const state = readState();
+  // An older handoff slot can recreate records without generations. Adopt the
+  // current disk record under the lock, never a deterministic name-based identity.
+  return Object.values(state).some(health => health.generation == null)
+    ? update(current => current) : state;
+}
 function update<T>(fn: (state: State) => T): T {
   mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
   return withLock(`${path()}.lock`, () => {
-    const state = read();
+    const state = readState();
     const before = JSON.stringify(state);
+    for (const health of Object.values(state)) health.generation ??= crypto.randomUUID();
     const result = fn(state);
     const after = JSON.stringify(state);
     if (before !== after) {
@@ -86,7 +92,10 @@ export function recordCredentialObservation(account: Account, version: string | 
   const known = get(account);
   if (known === null) return;
   if (known?.seenCredentials && known.missingSince === undefined) return;
-  safely(() => update(state => noteCredentials(entry(state, account), version)));
+  safely(() => update(state => {
+    if (!account.isDefault && !existsSync(account.dir)) return;
+    noteCredentials(entry(state, account), version);
+  }));
 }
 /** Called by account remove; discarded identities must not affect a later re-add. */
 export function forgetAccountAuth(account: Account): void {
@@ -96,6 +105,7 @@ export function forgetAccountAuth(account: Account): void {
 export function recordAuthFailure(account: Account): void {
   if (!account.isDefault && !existsSync(account.dir)) return;
   safely(() => update((state) => {
+    if (!account.isDefault && !existsSync(account.dir)) return;
     const health = entry(state, account);
     const credentials = credentialStatus(account);
     noteCredentials(health, credentials.version);
@@ -149,6 +159,7 @@ export function checkAuthExpiry(account: Account, now = Date.now()): void {
   if (!account.isDefault && !existsSync(account.dir)) return;
   const { version, expiresAt, refreshTokenExpiresAt: expiry } = credentialStatus(account);
   safely(() => update((state) => {
+    if (!account.isDefault && !existsSync(account.dir)) return;
     const health = entry(state, account);
     noteCredentials(health, version);
     if (expiry === null) return; // Unknown does not rearm an existing warning.
