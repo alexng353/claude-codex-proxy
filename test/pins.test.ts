@@ -8,6 +8,8 @@ import { listAccounts, resetAccountState } from "../src/accounts";
 import { handleRequest } from "../src/app";
 import { closeIdleWorkers } from "../src/claude";
 import { pinsToken } from "../src/pins";
+import { processStartTime } from "../src/handoff";
+import { inFlightPath, sharedThreadsInFlight } from "../src/in-flight";
 import { pinThreadAccount, threadAccount, threadPin } from "../src/sessions";
 import { openUsageDb } from "../src/usage";
 
@@ -103,7 +105,7 @@ afterAll(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-type Init = { token?: string | null; headers?: Record<string, string>; host?: string; method?: string };
+type Init = { token?: string | null; headers?: Record<string, string>; host?: string; method?: string; peer?: string | null };
 
 const call = async (path: string, body?: unknown, init: Init = {}) => {
   const token = init.token === undefined ? pinsToken() : init.token;
@@ -113,7 +115,7 @@ const call = async (path: string, body?: unknown, init: Init = {}) => {
     method: init.method ?? (body === undefined ? "GET" : "POST"),
     headers,
     body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
-  }));
+  }), init.peer === undefined ? "127.0.0.1" : init.peer ?? undefined);
   return { status: response.status, body: await response.json() as any };
 };
 
@@ -363,6 +365,44 @@ test("refuses order, caps, credentials and login; leaves them untouched", async 
   expect((await call("/pins/order", {})).status).toBe(404);
 });
 
+test("answers loopback peers only, and refuses when the peer is unknown", async () => {
+  for (const peer of ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"])
+    expect((await call("/pins", undefined, { peer })).status).toBe(200);
+  const before = (await call("/pins")).body.counts;
+  for (const peer of ["192.168.1.5", "100.64.0.1", "::ffff:10.0.0.2", "fe80::1", null]) {
+    expect((await call("/pins", undefined, { peer })).status).toBe(403);
+    const write = await call("/pins/move", { from: "default", to: "spare" }, { peer });
+    expect(write.status).toBe(403);
+    expect(write.body.error.message).toContain("loopback");
+  }
+  expect((await call("/pins")).body.counts).toEqual(before);
+});
+
+test("the idle filter skips a thread running in another proxy copy, and ignores a dead copy's marks", async () => {
+  const thread = `eng-${crypto.randomUUID()}`;
+  pinThreadAccount(thread, "nocreds");
+  // A live process standing in for the other handoff slot.
+  const other = Bun.spawn(["sleep", "60"]);
+  try {
+    sharedThreadsInFlight(); // creates the table
+    const marks = new Database(inFlightPath());
+    try {
+      marks.query("INSERT INTO threads_in_flight (thread_id, pid, start, count) VALUES (?, ?, ?, 1)")
+        .run(thread, other.pid, processStartTime(other.pid) ?? null);
+    } finally {
+      marks.close();
+    }
+    const busy = await call("/pins/move", { from: "nocreds", to: "spare", idleForMs: 0, dryRun: true });
+    expect(busy.body.changes.map((change: any) => change.threadId)).not.toContain(thread);
+    expect(busy.body.warnings.join("\n")).toContain(`${thread}: skipped, a turn is running in another proxy copy (pid ${other.pid})`);
+  } finally {
+    other.kill();
+    await other.exited;
+  }
+  const free = await call("/pins/move", { from: "nocreds", to: "spare", idleForMs: 0, threadIds: [thread], dryRun: true });
+  expect(free.body.changes.map((change: any) => change.threadId)).toEqual([thread]);
+});
+
 test("is unreachable through a forwarded hop", async () => {
   const response = await handleRequest(new Request("http://127.0.0.1:3456/pins", {
     headers: { "x-forwarded-for": "100.64.0.1", authorization: `Bearer ${pinsToken()}` },
@@ -413,6 +453,8 @@ test("runClaude saves with the generation it read: a mid-turn A -> C -> A surviv
   const thread = `eng-${crypto.randomUUID()}`;
   pinThreadAccount(thread, "nocreds");
   await turn(thread, async () => {
+    // Marked where the other handoff slot can see it too.
+    expect(sharedThreadsInFlight().get(thread)).toEqual([process.pid]);
     const idle = await call("/pins/move", { from: "nocreds", to: "spare", idleForMs: 0, dryRun: true });
     expect(idle.body.changes.map((change: any) => change.threadId)).not.toContain(thread);
     expect(idle.body.warnings.join("\n")).toContain(thread);
@@ -421,4 +463,5 @@ test("runClaude saves with the generation it read: a mid-turn A -> C -> A surviv
   });
   // The turn ran on default (nocreds is logged out) but must not overwrite the explicit pin.
   expect(threadAccount(thread)).toBe("nocreds");
+  expect(sharedThreadsInFlight().has(thread)).toBe(false);
 }, 30_000);

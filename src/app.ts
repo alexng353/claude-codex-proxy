@@ -97,7 +97,8 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
   }
 }
 
-export async function handleRequest(request: Request): Promise<Response> {
+/** `peer` is the socket's remote address (Bun's `server.requestIP`); /pins answers loopback peers only. */
+export async function handleRequest(request: Request, peer?: string): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/health" && request.method === "GET")
     return json(healthInfo());
@@ -109,7 +110,7 @@ export async function handleRequest(request: Request): Promise<Response> {
   if (forwarded) return error(`Only ${API_PREFIX} is reachable from outside this machine`, 403);
   // Local only (forwarded requests were refused above). It checks Origin, Host and
   // its own token, accepting PROXY_API_KEY too, so it runs before the shared key check.
-  const pins = await handlePinsRoute(request, url);
+  const pins = await handlePinsRoute(request, url, peer);
   if (pins) return pins;
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")

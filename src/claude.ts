@@ -49,6 +49,7 @@ import {
   stateDir,
   type SessionKey,
 } from "./sessions";
+import { markThreadInFlight } from "./in-flight";
 import {
   conversationRequest,
   deltaRequest,
@@ -817,12 +818,27 @@ export async function runClaude(
       : undefined;
   if (!threadId) return runClaudeRequest(request, undefined);
   inFlight.set(threadId, (inFlight.get(threadId) ?? 0) + 1);
+  // The shared mark lets the pin API in the other handoff slot see this turn.
+  // A failed mark never fails the turn; this copy's own map still covers it.
+  let marked = false;
+  try {
+    markThreadInFlight(threadId, 1);
+    marked = true;
+  } catch (cause) {
+    console.error("Unable to mark the turn in flight for other proxy copies:", (cause as Error).message);
+  }
   try {
     return await runClaudeRequest(request, threadId);
   } finally {
     const left = (inFlight.get(threadId) ?? 1) - 1;
     if (left > 0) inFlight.set(threadId, left);
     else inFlight.delete(threadId);
+    if (marked)
+      try {
+        markThreadInFlight(threadId, -1);
+      } catch (cause) {
+        console.error("Unable to clear the turn's in-flight mark:", (cause as Error).message);
+      }
   }
 }
 

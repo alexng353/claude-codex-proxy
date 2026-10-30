@@ -131,7 +131,7 @@ Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory k
 
 A local API edits pins (`thread_accounts` in `sessions.sqlite`, keyed by the Codex thread id, not the Today thread id). It changes pins only: fields naming account order, weekly caps, credentials or login get a 403.
 
-Access is local and scripted only. Requests through a forwarded hop (Tailscale Serve) are refused like `/accounts`. A request with an `Origin` header (a browser) gets a 403. The `Host` header must be `127.0.0.1:PORT` or `localhost:PORT`, which blocks DNS rebinding. A POST must send `content-type: application/json` (415 otherwise). A write needs `Authorization: Bearer <token>`, where the token is in `$PROXY_STATE_DIR/pins.token`; the proxy creates that file 0600 at startup. `PROXY_API_KEY` is also accepted, and when it is set, reads need a token too. Each machine has its own token, so a tunnel to another machine's port does not give write access there.
+Access is local and scripted only. Requests through a forwarded hop (Tailscale Serve) are refused like `/accounts`. The socket peer must be a loopback address (`127.0.0.0/8`, `::1`, or IPv4-mapped loopback), so a proxy bound beyond localhost (`HOST` with `PROXY_API_KEY`) still answers pins only to this machine; any other peer gets a 403. A request with an `Origin` header (a browser) gets a 403. The `Host` header must be `127.0.0.1:PORT` or `localhost:PORT`, which blocks DNS rebinding. A POST must send `content-type: application/json` (415 otherwise). A write needs `Authorization: Bearer <token>`, where the token is in `$PROXY_STATE_DIR/pins.token`; the proxy creates that file 0600 at startup. `PROXY_API_KEY` is also accepted, and when it is set, reads need a token too. Each machine has its own token, so a tunnel to another machine's port does not give write access there.
 
 ```bash
 token=$(cat ~/.local/state/claude-codex-proxy/pins.token)
@@ -150,7 +150,7 @@ A write is refused (409) in these cases:
 
 `move` may start from an account that has been removed.
 
-With `idleForMs`, `move` takes only threads whose newest turn is older than that. It skips threads with a request running in this proxy copy; during a handoff, the other slot's running turns are not visible to it. If the usage history cannot be read, it returns 503 and changes nothing.
+With `idleForMs`, `move` takes only threads whose newest turn is older than that. It skips threads with a turn running in any live proxy copy, with a warning naming the copy's pid. Each copy marks its running turns in `$PROXY_STATE_DIR/in-flight.sqlite` (not fsynced: a mark matters only while its process lives), so during a handoff each slot sees the other's. Marks left by a copy that died mid-turn are ignored and pruned once its process (pid and start time) is gone. A copy running code older than this table writes no marks, so the first handoff onto this code cannot see the old slot's turns. If the usage history or the in-flight table cannot be read, it returns 503 and changes nothing.
 
 A write runs in one transaction:
 

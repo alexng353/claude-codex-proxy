@@ -28,6 +28,7 @@ import {
   type PinSnapshot,
   type PinWrite,
 } from "./sessions";
+import { sharedThreadsInFlight } from "./in-flight";
 import { openUsageDb } from "./usage";
 
 /**
@@ -41,10 +42,12 @@ import { openUsageDb } from "./usage";
  *   POST /pins/clear {threadIds}                          clear
  * Writes take `reason` (backup label) and `dryRun`.
  *
- * Access: no Origin header (browsers), Host 127.0.0.1:PORT or localhost:PORT
- * (DNS rebinding), JSON bodies only (no-cors form posts), and for writes a
- * bearer token from this machine's pins.token (or PROXY_API_KEY). A process
- * on another machine reaching this port through a tunnel has no token here.
+ * Access: a loopback socket peer (a proxy bound beyond localhost still answers
+ * pins only to this machine), no Origin header (browsers), Host
+ * 127.0.0.1:PORT or localhost:PORT (DNS rebinding), JSON bodies only (no-cors
+ * form posts), and for writes a bearer token from this machine's pins.token
+ * (or PROXY_API_KEY). A process on another machine reaching this port through
+ * a tunnel has no token here.
  */
 
 export class PinError extends Error {
@@ -101,10 +104,19 @@ const same = (a: string, b: string) => {
   return left.length === right.length && timingSafeEqual(left, right);
 };
 
+/** 127.0.0.0/8, ::1, or IPv4-mapped loopback. */
+export function isLoopback(address: string): boolean {
+  const v4 = address.toLowerCase().replace(/^::ffff:/, "");
+  return address === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
 /** Undefined when the request may proceed; otherwise the refusal. */
-function refuse(request: Request, url: URL): Response | undefined {
+function refuse(request: Request, url: URL, peer: string | undefined): Response | undefined {
   const fail = (message: string, status: number) =>
     Response.json({ error: { message, type: "invalid_request_error" } }, { status });
+  // Fails closed: a caller that cannot name the socket peer gets nothing.
+  if (peer === undefined || !isLoopback(peer))
+    return fail(`Pins: only loopback peers are answered (peer ${peer ?? "unknown"})`, 403);
   if (request.headers.has("origin"))
     return fail("Pins: browser requests (with an Origin header) are refused", 403);
   const port = process.env.PORT ?? "3456";
@@ -457,8 +469,18 @@ export function movePins(input: unknown): PinResult {
   const reason = label(fields.reason ?? `move-${from}-${to}`);
   // Fails closed: unreadable usage must not make every thread look idle.
   const turns = idleSince === undefined ? undefined : lastTurns(true);
-  // Only this copy's requests are visible; during a handoff the other slot's are not.
+  // This copy's own turns, plus every live copy's from the shared table (the
+  // other handoff slot). Fails closed like the usage history.
   const running = idleSince === undefined ? undefined : threadsInFlight();
+  let elsewhere: Map<string, number[]> | undefined;
+  if (idleSince !== undefined) {
+    try {
+      elsewhere = sharedThreadsInFlight();
+    } catch (cause) {
+      console.error("Pins: in-flight table unreadable:", (cause as Error).message);
+      throw new PinError("Running turns are unreadable, so idleness cannot be checked; nothing changed", 503);
+    }
+  }
   const warnings = only ? unknownIds(only) : [];
   return apply({
     dryRun,
@@ -472,6 +494,11 @@ export function movePins(input: unknown): PinResult {
           if (idleSince === undefined) return true;
           if (running!.has(threadId)) {
             warnings.push(`${threadId}: skipped, a turn is running in this proxy copy`);
+            return false;
+          }
+          const pids = elsewhere!.get(threadId)?.filter((pid) => pid !== process.pid);
+          if (pids?.length) {
+            warnings.push(`${threadId}: skipped, a turn is running in another proxy copy (pid ${pids.join(", ")})`);
             return false;
           }
           return (turns!.get(threadId)?.ts ?? 0) < idleSince;
@@ -493,13 +520,14 @@ export function clearPins(input: unknown): PinResult {
 }
 
 /** Routes under /pins, or undefined for any other path. The caller has already
- * refused forwarded (non-local) requests; this checks origin, host and token. */
-export async function handlePinsRoute(request: Request, url: URL): Promise<Response | undefined> {
+ * refused forwarded (non-local) requests; this checks the socket peer, origin,
+ * host and token. */
+export async function handlePinsRoute(request: Request, url: URL, peer?: string): Promise<Response | undefined> {
   if (url.pathname !== "/pins" && !url.pathname.startsWith("/pins/")) return undefined;
   const fail = (message: string, status: number) =>
     Response.json({ error: { message, type: "invalid_request_error" } }, { status });
   try {
-    const refused = refuse(request, url);
+    const refused = refuse(request, url, peer);
     if (refused) return refused;
     if (url.pathname === "/pins" && request.method === "GET") {
       const filter = url.searchParams.get("account") ?? undefined;

@@ -27,7 +27,12 @@ try {
 
 // reusePort: during a handoff the next copy listens on the same port beside this one
 // (alex-0230), so nothing is refused while one starts and the other drains.
-const server = Bun.serve({ hostname, port, reusePort: true, fetch: handleRequest });
+const server = Bun.serve({
+  hostname,
+  port,
+  reusePort: true,
+  fetch: (request, self) => handleRequest(request, self.requestIP(request)?.address),
+});
 console.log(`Claude Codex Proxy ${runningCommit()} listening at ${server.url}`);
 const own = healthPort
   ? Bun.serve({
