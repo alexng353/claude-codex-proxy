@@ -1,13 +1,32 @@
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  chmodSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { listAccounts } from "./accounts";
+import { baseConfigDir, isUnavailable, listAccounts, type Account } from "./accounts";
+import { threadsInFlight } from "./claude";
 import {
-  backupSessions,
   listThreadAccounts,
+  stateDir,
   writeThreadAccounts,
   type PinChange,
+  type PinSnapshot,
   type PinWrite,
 } from "./sessions";
 import { openUsageDb } from "./usage";
@@ -17,12 +36,16 @@ import { openUsageDb } from "./usage";
  * Pins only: account order, weekly caps, credentials and login stay Alex's
  * and are never reachable from here.
  *
- *   GET  /pins[?account=NAME]                      list
- *   POST /pins       {pins:[{threadId,account}]}   set one or many
- *   POST /pins/move  {from,to,threadIds?,idleForMs?}  bulk move
- *   POST /pins/clear {threadIds}                   clear
- * Writes take `reason` (backup file label) and `dryRun`. A write backs up
- * sessions.sqlite first, applies in one transaction, and returns the changes.
+ *   GET  /pins[?account=NAME]                             list
+ *   POST /pins       {pins:[{threadId,account}], force?}  set one or many
+ *   POST /pins/move  {from,to,threadIds?,idleForMs?,force?}  bulk move
+ *   POST /pins/clear {threadIds}                          clear
+ * Writes take `reason` (backup label) and `dryRun`.
+ *
+ * Access: no Origin header (browsers), Host 127.0.0.1:PORT or localhost:PORT
+ * (DNS rebinding), JSON bodies only (no-cors form posts), and for writes a
+ * bearer token from this machine's pins.token (or PROXY_API_KEY). A process
+ * on another machine reaching this port through a tunnel has no token here.
  */
 
 export class PinError extends Error {
@@ -32,7 +55,9 @@ export class PinError extends Error {
 }
 
 const MAX_THREADS = 2000;
+const KEEP_BACKUPS = 50;
 const POLICY = /order|cap|credential|token|login|auth|password|secret|key/i;
+const BACKUP = /^pins-\d{8}T\d{6}Z-[a-z0-9-]+-[0-9a-f]{8}\.json$/;
 
 export type PinInfo = {
   threadId: string;
@@ -44,13 +69,72 @@ export type PinInfo = {
   archived: boolean | null;
 };
 
+// --- Access token -----------------------------------------------------------
+
+export function pinsTokenPath(): string {
+  return join(stateDir(), "pins.token");
+}
+
+/** This machine's pin-write token, created 0600 on first use. Two slots may race: link() publishes one. */
+export function pinsToken(): string {
+  const path = pinsTokenPath();
+  if (!existsSync(path)) {
+    mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+    const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    writeFileSync(tmp, `${randomBytes(32).toString("hex")}\n`, { mode: 0o600, flag: "wx" });
+    try {
+      linkSync(tmp, path);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "EEXIST") throw cause;
+    } finally {
+      rmSync(tmp, { force: true });
+    }
+  }
+  if ((statSync(path).mode & 0o077) !== 0) chmodSync(path, 0o600);
+  const token = readFileSync(path, "utf8").trim();
+  if (!/^[0-9a-f]{64}$/.test(token)) throw new Error(`${path} does not hold a pins token`);
+  return token;
+}
+
+const same = (a: string, b: string) => {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+};
+
+/** Undefined when the request may proceed; otherwise the refusal. */
+function refuse(request: Request, url: URL): Response | undefined {
+  const fail = (message: string, status: number) =>
+    Response.json({ error: { message, type: "invalid_request_error" } }, { status });
+  if (request.headers.has("origin"))
+    return fail("Pins: browser requests (with an Origin header) are refused", 403);
+  const port = process.env.PORT ?? "3456";
+  const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
+  const host = request.headers.get("host");
+  if (!hosts.includes(url.host) || (host !== null && !hosts.includes(host)))
+    return fail(`Pins: Host must be ${hosts.join(" or ")}`, 403);
+  const write = request.method !== "GET";
+  if (write) {
+    const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+    if (type !== "application/json") return fail("Pins: content-type must be application/json", 415);
+  }
+  const apiKey = process.env.PROXY_API_KEY;
+  if (!write && !apiKey) return undefined;
+  const header = request.headers.get("authorization") ?? "";
+  const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
+  if (bearer && (same(bearer, pinsToken()) || (apiKey !== undefined && same(bearer, apiKey)))) return undefined;
+  return fail(`Pins: ${write ? "writes need" : "PROXY_API_KEY is set, so reads need"} a bearer token from ${pinsTokenPath()}`, 401);
+}
+
+// --- Reading ----------------------------------------------------------------
+
 function todayDbPath(): string {
   return process.env.TODAY_DB_PATH ?? join(homedir(), ".local/state/today/daemon.sqlite");
 }
 
 type TodayRow = { engine: string; thread_id: string; title: string; archived: number };
 
-/** Today's engine-thread -> chat map, read-only; empty when Today is absent. */
+/** Today's engine-thread -> chat map, read-only; empty when Today is absent or unreadable. */
 function todayThreads(): Map<string, TodayRow> {
   const path = todayDbPath();
   const map = new Map<string, TodayRow>();
@@ -58,14 +142,17 @@ function todayThreads(): Map<string, TodayRow> {
   let db: Database | undefined;
   try {
     db = new Database(path, { readonly: true });
+    // Later rows win in the map: bindings oldest first, then each thread's own
+    // current engine id, which beats any binding.
     const rows = db.query(
-      `SELECT b.engine_thread_id AS engine, t.thread_id, t.title, t.archived
-         FROM engine_bindings b JOIN threads t ON t.thread_id = b.thread_id
-       UNION ALL
-       SELECT engine_thread_id, thread_id, title, archived FROM threads
-         WHERE engine_thread_id IS NOT NULL`,
+      `SELECT engine, thread_id, title, archived FROM (
+         SELECT b.engine_thread_id AS engine, t.thread_id, t.title, t.archived, 0 AS precedence, b.bound_at_ms AS at
+           FROM engine_bindings b JOIN threads t ON t.thread_id = b.thread_id
+         UNION ALL
+         SELECT engine_thread_id, thread_id, title, archived, 1, updated_at_ms FROM threads
+           WHERE engine_thread_id IS NOT NULL)
+       ORDER BY precedence, at`,
     ).all() as TodayRow[];
-    // The thread's own current engine id wins over an older binding.
     for (const row of rows) map.set(row.engine, row);
   } catch (cause) {
     console.error("Pins: Today database unreadable:", (cause as Error).message);
@@ -75,8 +162,11 @@ function todayThreads(): Map<string, TodayRow> {
   return map;
 }
 
-function lastTurns(): Map<string, { ts: number; account: string | null }> {
-  const map = new Map<string, { ts: number; account: string | null }>();
+type LastTurn = { ts: number; account: string | null };
+
+/** Each thread's newest turn. `strict` turns an unreadable history into a 503 instead of "never used". */
+function lastTurns(strict = false): Map<string, LastTurn> {
+  const map = new Map<string, LastTurn>();
   try {
     const rows = openUsageDb().query(
       `SELECT thread_id, MAX(ts) AS ts, account FROM turns
@@ -85,6 +175,8 @@ function lastTurns(): Map<string, { ts: number; account: string | null }> {
     for (const row of rows) map.set(row.thread_id, { ts: row.ts, account: row.account });
   } catch (cause) {
     console.error("Pins: usage database unreadable:", (cause as Error).message);
+    if (strict)
+      throw new PinError("Usage history is unreadable, so idleness cannot be checked; nothing changed", 503);
   }
   return map;
 }
@@ -117,6 +209,8 @@ export function listPins(account?: string) {
     .sort((a, b) => (b.lastUsedAt ?? "").localeCompare(a.lastUsedAt ?? ""));
   return { accounts: accountNames(), counts, pins };
 }
+
+// --- Validation -------------------------------------------------------------
 
 function body(value: unknown, allowed: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -155,31 +249,156 @@ function label(value: unknown): string {
   return clean || "pins";
 }
 
-type Write = { dryRun: boolean; reason: string; plan: (current: ReadonlyMap<string, string>) => PinWrite[] };
-
-export type PinResult = { dryRun: boolean; backup: string | null; changed: number; changes: PinChange[] };
-
-function apply(write: Write): PinResult {
-  if (write.dryRun) {
-    const current = new Map(listThreadAccounts().map((pin) => [pin.threadId, pin.account]));
-    const changes = write.plan(current)
-      .map((edit) => ({ threadId: edit.threadId, from: current.get(edit.threadId) ?? null, to: edit.account }))
-      .filter((change) => change.from !== change.to);
-    return { dryRun: true, backup: null, changed: changes.length, changes };
-  }
-  const backup = backupSessions(write.reason);
-  const changes = writeThreadAccounts(write.plan);
-  console.error(`Pins: ${changes.length} change(s) (${write.reason}), backup ${backup}`);
-  return { dryRun: false, backup, changed: changes.length, changes };
+function flag(value: unknown, name: string): boolean {
+  if (value !== undefined && typeof value !== "boolean") throw new PinError(`${name} must be a boolean`);
+  return value === true;
 }
 
-const dryRun = (value: unknown) => {
-  if (value !== undefined && typeof value !== "boolean") throw new PinError("dryRun must be a boolean");
-  return value === true;
+/** Claude Code's project folder for the proxy's working directory (claude.ts runs it there). */
+function projectSlug(): string {
+  return (process.env.CLAUDE_CWD || process.cwd()).replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+/** True when the account resumes from the shared transcript folder (claude-account-move step 1). */
+function sharesTranscripts(target: Account): boolean {
+  if (target.isDefault) return true;
+  const slug = projectSlug();
+  const link = join(target.dir, "projects", slug);
+  try {
+    return lstatSync(link).isSymbolicLink() &&
+      realpathSync(link) === realpathSync(join(baseConfigDir(), "projects", slug));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Refuse changes a resume cannot survive: a source or target account that does
+ * not share transcripts (always), or an unavailable target (unless forced: the
+ * next turn would move the thread off it again). Runs inside the write
+ * transaction against the rows it changes.
+ */
+function checkChanges(changes: PinChange[], force: boolean, warnings: string[]): void {
+  const accounts = new Map(listAccounts().map((entry) => [entry.name, entry]));
+  const touched = new Set<string>();
+  for (const change of changes) {
+    if (change.from) touched.add(change.from);
+    if (change.to) touched.add(change.to);
+  }
+  for (const name of touched) {
+    const entry = accounts.get(name);
+    if (!entry) continue; // A removed account: nothing left to share.
+    if (!sharesTranscripts(entry))
+      throw new PinError(
+        `Account "${name}" does not share transcripts (accounts/${name}/projects/${projectSlug()} is not a link to ` +
+          `the shared folder), so a moved chat would fail with "No conversation found with session ID". ` +
+          "Run step 1 of the claude-account-move skill first.",
+        409,
+      );
+  }
+  for (const name of new Set(changes.map((change) => change.to))) {
+    const entry = name === null ? undefined : accounts.get(name);
+    if (!entry || !isUnavailable(entry)) continue;
+    const warning = `"${entry.name}" is unavailable now (rate-limited, over its weekly cap, or logged out): ` +
+      "the next turn of a thread pinned to it runs on another account and moves the pin there.";
+    if (!force) throw new PinError(`${warning} Pass force: true to pin it anyway.`, 409);
+    warnings.push(warning);
+  }
+}
+
+// --- Writing ----------------------------------------------------------------
+
+function backupDir(): string {
+  return join(stateDir(), "pin-backups");
+}
+
+/**
+ * Save the pre-edit pins as JSON (a few KB, so the write stays fast): written
+ * 0600 under a temp name, fsynced, read back and compared, then renamed into
+ * place. A failure removes the temp file and aborts the write.
+ */
+function saveBackup(reason: string, snapshot: PinSnapshot): string {
+  const directory = backupDir();
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  const name = `pins-${stamp}-${reason}-${randomBytes(4).toString("hex")}.json`;
+  const path = join(directory, name);
+  const tmp = join(directory, `.${name}.tmp`);
+  const text = `${JSON.stringify({ savedAt: new Date().toISOString(), database: join(stateDir(), "sessions.sqlite"), ...snapshot })}\n`;
+  try {
+    const fd = openSync(tmp, "wx", 0o600);
+    try {
+      writeFileSync(fd, text);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    chmodSync(tmp, 0o600);
+    const copy = JSON.parse(readFileSync(tmp, "utf8")) as PinSnapshot;
+    if (JSON.stringify([copy.threadAccounts, copy.generations]) !==
+        JSON.stringify([snapshot.threadAccounts, snapshot.generations]))
+      throw new Error(`Pin backup ${name} did not read back intact`);
+    renameSync(tmp, path);
+  } catch (cause) {
+    rmSync(tmp, { force: true });
+    throw cause;
+  }
+  try {
+    // Only published (verified) backups match BACKUP; temp files are never pruned here.
+    const published = readdirSync(directory).filter((file) => BACKUP.test(file)).sort();
+    for (const file of published.slice(0, Math.max(0, published.length - KEEP_BACKUPS)))
+      rmSync(join(directory, file), { force: true });
+  } catch (cause) {
+    console.error("Pins: pruning old backups failed:", (cause as Error).message);
+  }
+  return path;
+}
+
+type Write = {
+  dryRun: boolean;
+  force: boolean;
+  reason: string;
+  warnings: string[];
+  plan: (current: ReadonlyMap<string, string>) => PinWrite[];
 };
 
+export type PinResult = {
+  dryRun: boolean;
+  backup: string | null;
+  changed: number;
+  changes: PinChange[];
+  warnings: string[];
+};
+
+function diff(current: ReadonlyMap<string, string>, writes: PinWrite[]): PinChange[] {
+  return writes
+    .map((edit) => ({ threadId: edit.threadId, from: current.get(edit.threadId) ?? null, to: edit.account }))
+    .filter((change) => change.from !== change.to);
+}
+
+function apply(write: Write): PinResult {
+  const { warnings } = write;
+  if (write.dryRun) {
+    const current = new Map(listThreadAccounts().map((pin) => [pin.threadId, pin.account]));
+    const changes = diff(current, write.plan(current));
+    checkChanges(changes, write.force, warnings);
+    return { dryRun: true, backup: null, changed: changes.length, changes, warnings };
+  }
+  const result = writeThreadAccounts(
+    (current) => {
+      const writes = write.plan(current);
+      checkChanges(diff(current, writes), write.force, warnings);
+      return writes;
+    },
+    (snapshot) => saveBackup(write.reason, snapshot),
+  );
+  if (result.changes.length)
+    console.error(`Pins: ${result.changes.length} change(s) (${write.reason}), backup ${result.backup}`);
+  return { dryRun: false, backup: result.backup, changed: result.changes.length, changes: result.changes, warnings };
+}
+
 export function setPins(input: unknown): PinResult {
-  const fields = body(input, ["pins", "reason", "dryRun"]);
+  const fields = body(input, ["pins", "reason", "dryRun", "force"]);
   const names = accountNames();
   if (!Array.isArray(fields.pins) || fields.pins.length === 0 || fields.pins.length > MAX_THREADS)
     throw new PinError(`pins must be a list of 1 to ${MAX_THREADS} {threadId, account}`);
@@ -190,11 +409,23 @@ export function setPins(input: unknown): PinResult {
   });
   if (new Set(edits.map((edit) => edit.threadId)).size !== edits.length)
     throw new PinError("pins lists a thread more than once");
-  return apply({ dryRun: dryRun(fields.dryRun), reason: label(fields.reason), plan: () => edits });
+  const warnings: string[] = [];
+  const turns = lastTurns();
+  const today = todayThreads();
+  for (const edit of edits)
+    if (!turns.has(edit.threadId) && !today.has(edit.threadId))
+      warnings.push(`${edit.threadId}: no turns and no Today chat; is this the Codex (engine) thread id?`);
+  return apply({
+    dryRun: flag(fields.dryRun, "dryRun"),
+    force: flag(fields.force, "force"),
+    reason: label(fields.reason),
+    warnings,
+    plan: () => edits,
+  });
 }
 
 export function movePins(input: unknown): PinResult {
-  const fields = body(input, ["from", "to", "threadIds", "idleForMs", "reason", "dryRun"]);
+  const fields = body(input, ["from", "to", "threadIds", "idleForMs", "reason", "dryRun", "force"]);
   const names = accountNames();
   // A pin can name an account that was since removed; moving off it is allowed.
   if (typeof fields.from !== "string" || !fields.from) throw new PinError("from must be an account name");
@@ -208,16 +439,30 @@ export function movePins(input: unknown): PinResult {
       throw new PinError("idleForMs must be a non-negative number");
     idleSince = Date.now() - fields.idleForMs;
   }
-  const turns = idleSince === undefined ? undefined : lastTurns();
+  const dryRun = flag(fields.dryRun, "dryRun");
+  const force = flag(fields.force, "force");
+  const reason = label(fields.reason ?? `move-${from}-${to}`);
+  // Fails closed: unreadable usage must not make every thread look idle.
+  const turns = idleSince === undefined ? undefined : lastTurns(true);
+  // Only this copy's requests are visible; during a handoff the other slot's are not.
+  const running = idleSince === undefined ? undefined : threadsInFlight();
+  const warnings: string[] = [];
   return apply({
-    dryRun: dryRun(fields.dryRun),
-    reason: label(fields.reason ?? `move-${from}-${to}`),
+    dryRun,
+    force,
+    reason,
+    warnings,
     plan: (current) =>
       [...current]
-        .filter(([threadId, pinned]) =>
-          pinned === from &&
-          (!only || only.has(threadId)) &&
-          (idleSince === undefined || (turns!.get(threadId)?.ts ?? 0) < idleSince))
+        .filter(([threadId, pinned]) => {
+          if (pinned !== from || (only && !only.has(threadId))) return false;
+          if (idleSince === undefined) return true;
+          if (running!.has(threadId)) {
+            warnings.push(`${threadId}: skipped, a turn is running in this proxy copy`);
+            return false;
+          }
+          return (turns!.get(threadId)?.ts ?? 0) < idleSince;
+        })
         .map(([threadId]) => ({ threadId, account: to })),
   });
 }
@@ -226,19 +471,23 @@ export function clearPins(input: unknown): PinResult {
   const fields = body(input, ["threadIds", "reason", "dryRun"]);
   const ids = threadIds(fields.threadIds, "threadIds");
   return apply({
-    dryRun: dryRun(fields.dryRun),
+    dryRun: flag(fields.dryRun, "dryRun"),
+    force: false,
     reason: label(fields.reason ?? "clear"),
+    warnings: [],
     plan: () => ids.map((threadId) => ({ threadId, account: null })),
   });
 }
 
-/** Routes under /pins, or undefined for any other path. Caller has already
- * refused forwarded (non-local) requests and checked the API key. */
+/** Routes under /pins, or undefined for any other path. The caller has already
+ * refused forwarded (non-local) requests; this checks origin, host and token. */
 export async function handlePinsRoute(request: Request, url: URL): Promise<Response | undefined> {
   if (url.pathname !== "/pins" && !url.pathname.startsWith("/pins/")) return undefined;
   const fail = (message: string, status: number) =>
     Response.json({ error: { message, type: "invalid_request_error" } }, { status });
   try {
+    const refused = refuse(request, url);
+    if (refused) return refused;
     if (url.pathname === "/pins" && request.method === "GET") {
       const filter = url.searchParams.get("account") ?? undefined;
       return Response.json(listPins(filter));

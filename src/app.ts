@@ -107,12 +107,13 @@ export async function handleRequest(request: Request): Promise<Response> {
   const hygieneApi = await handleHygieneApi(request, url);
   if (hygieneApi) return hygieneApi;
   if (forwarded) return error(`Only ${API_PREFIX} is reachable from outside this machine`, 403);
+  // Local only (forwarded requests were refused above). It checks Origin, Host and
+  // its own token, accepting PROXY_API_KEY too, so it runs before the shared key check.
+  const pins = await handlePinsRoute(request, url);
+  if (pins) return pins;
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });
-  // Local only: forwarded requests were refused above.
-  const pins = await handlePinsRoute(request, url);
-  if (pins) return pins;
   if (url.pathname.startsWith("/perpetual/") && request.method === "GET") {
     const status = perpetualStatus(decodeURIComponent(url.pathname.slice("/perpetual/".length)));
     return status ? json(status) : error("No open perpetual chat with that id", 404);

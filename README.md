@@ -129,17 +129,45 @@ Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory k
 
 #### Moving pins
 
-A local API edits pins (`thread_accounts` in `sessions.sqlite`, keyed by the Codex thread id). It is refused through a forwarded hop, like `/accounts`, and changes pins only: fields naming account order, weekly caps, credentials or login get a 403.
+A local API edits pins (`thread_accounts` in `sessions.sqlite`, keyed by the Codex thread id, not the Today thread id). It changes pins only: fields naming account order, weekly caps, credentials or login get a 403.
+
+Access is local and scripted only. Requests through a forwarded hop (Tailscale Serve) are refused like `/accounts`. A request with an `Origin` header (a browser) gets a 403. The `Host` header must be `127.0.0.1:PORT` or `localhost:PORT`, which blocks DNS rebinding. A POST must send `content-type: application/json` (415 otherwise). A write needs `Authorization: Bearer <token>`, where the token is in `$PROXY_STATE_DIR/pins.token`; the proxy creates that file 0600 at startup. `PROXY_API_KEY` is also accepted, and when it is set, reads need a token too. Each machine has its own token, so a tunnel to another machine's port does not give write access there.
 
 ```bash
-curl -s 127.0.0.1:3456/pins                     # every pin, last turn, Today chat id and title
+token=$(cat ~/.local/state/claude-codex-proxy/pins.token)
+j=(-H 'content-type: application/json' -H "authorization: Bearer $token")
+curl -s 127.0.0.1:3456/pins                     # every pin, its last turn, Today chat id and title
 curl -s '127.0.0.1:3456/pins?account=val'
-curl -s 127.0.0.1:3456/pins -d '{"pins":[{"threadId":"T","account":"default"}],"reason":"why"}'
-curl -s 127.0.0.1:3456/pins/move -d '{"from":"hinson","to":"default","idleForMs":600000,"dryRun":true}'
-curl -s 127.0.0.1:3456/pins/clear -d '{"threadIds":["T"]}'
+curl -s "${j[@]}" 127.0.0.1:3456/pins -d '{"pins":[{"threadId":"T","account":"default"}],"reason":"why"}'
+curl -s "${j[@]}" 127.0.0.1:3456/pins/move -d '{"from":"hinson","to":"default","idleForMs":600000,"dryRun":true}'
+curl -s "${j[@]}" 127.0.0.1:3456/pins/clear -d '{"threadIds":["T"]}'
 ```
 
-Accounts must be configured ones (`move` may start from a removed account). A write first takes an online copy of the database (`VACUUM INTO sessions.sqlite.bak-api-<reason>-<time>`, checked with `quick_check`; the newest 20 are kept), then applies every edit in one transaction and returns `{backup, changed, changes:[{threadId, from, to}]}`. `dryRun` returns the changes without a backup or a write. A pin is read from the table at the start of each turn and not cached, so an edit takes effect on the thread's next turn with no restart; a turn already running saves its pin back only if the pin still names the account it started on, so it never undoes an edit.
+A write is refused (409) in these cases:
+
+- An account it moves threads onto or off does not share transcripts. Its `projects/<cwd slug>` must be a link to the default account's folder; otherwise the next resume fails with "No conversation found with session ID". Run step 1 of the claude-account-move skill first.
+- The target account is unavailable now (rate-limited, over its weekly cap, or logged out), because the next turn would move the thread off it again. `force: true` pins it anyway and returns a warning.
+
+`move` may start from an account that has been removed.
+
+With `idleForMs`, `move` takes only threads whose newest turn is older than that. It skips threads with a request running in this proxy copy; during a handoff, the other slot's running turns are not visible to it. If the usage history cannot be read, it returns 503 and changes nothing.
+
+A write runs in one transaction:
+
+1. If anything changes, it first saves the current pins and their generations as JSON to `$PROXY_STATE_DIR/pin-backups/pins-<time>-<reason>-<id>.json`. The file is written 0600 under a temporary name, fsynced, read back and compared, then renamed into place. The newest 50 backups are kept.
+2. It applies the edits.
+
+It returns `{backup, changed, changes:[{threadId, from, to}], warnings}`. If the backup or any edit fails, nothing changes. `dryRun` returns the changes without a backup or a write.
+
+To put back the pins a backup lists (other pins stay as they are), use the `sqlite3` shell, which has `readfile`:
+
+```bash
+sqlite3 ~/.local/state/claude-codex-proxy/sessions.sqlite "INSERT OR REPLACE INTO thread_accounts
+  SELECT json_extract(value, '\$.threadId'), json_extract(value, '\$.account')
+  FROM json_each(readfile('BACKUP.json'), '\$.threadAccounts')"
+```
+
+Edits take effect on each thread's next turn, with no restart. A turn reads its pin and the pin's generation from SQLite when it starts; nothing caches them. At the end of the turn, it saves the account it ran on only if the pin still has that account and generation. Every API edit increments the generation, and a clear keeps it in `thread_account_generations`. So a turn that is running during an edit never undoes the edit, even an edit away and back to the same account.
 
 ### Live usage dashboard
 

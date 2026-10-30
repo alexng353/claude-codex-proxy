@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
+import { pinsToken } from "./pins";
 import { closeIdleWorkers } from "./claude";
 import { healthInfo, isDraining, runningCommit, setDraining } from "./handoff";
 import { drainPerpetual, perpetualBusy } from "./perpetual";
@@ -15,6 +16,13 @@ const DRAIN_WARN_MS = Number(process.env.DRAIN_WARN_MS ?? 2 * 60 * 60_000);
 
 if (!["127.0.0.1", "localhost", "::1"].includes(hostname) && !process.env.PROXY_API_KEY) {
   throw new Error("PROXY_API_KEY is required when binding outside localhost");
+}
+
+// The pin API's write token (src/pins.ts), made now so local tools can read it before any pin call.
+try {
+  pinsToken();
+} catch (cause) {
+  console.error("Pins: unable to create the pin token:", (cause as Error).message);
 }
 
 // reusePort: during a handoff the next copy listens on the same port beside this one

@@ -39,7 +39,7 @@ import {
 } from "./budget";
 import {
   findSessions,
-  threadAccount,
+  threadPin,
   claimThreadAccount,
   pinThreadAccount,
   pruneSessions,
@@ -127,6 +127,8 @@ export type TurnContext = {
   requestId: string;
   threadId?: string;
   pinnedAccount?: string;
+  /** The pin's generation when this turn read it; the end-of-turn save compares it. */
+  pinnedGeneration?: number;
   /** The account that produced the latest result for this request. */
   account?: Account;
 };
@@ -799,14 +801,36 @@ function parseStructuredOutput(result: ClaudeResult): StructuredOutput {
   return structured;
 }
 
+const inFlight = new Map<string, number>();
+
+/** Threads with a request running in this process (not the other handoff slot's). */
+export function threadsInFlight(): ReadonlySet<string> {
+  return new Set(inFlight.keys());
+}
+
 export async function runClaude(
   request: ResponsesRequest,
 ): Promise<ProxyOutput> {
-  const requestId = crypto.randomUUID();
   const threadId =
     typeof request.prompt_cache_key === "string"
       ? request.prompt_cache_key
       : undefined;
+  if (!threadId) return runClaudeRequest(request, undefined);
+  inFlight.set(threadId, (inFlight.get(threadId) ?? 0) + 1);
+  try {
+    return await runClaudeRequest(request, threadId);
+  } finally {
+    const left = (inFlight.get(threadId) ?? 1) - 1;
+    if (left > 0) inFlight.set(threadId, left);
+    else inFlight.delete(threadId);
+  }
+}
+
+async function runClaudeRequest(
+  request: ResponsesRequest,
+  threadId: string | undefined,
+): Promise<ProxyOutput> {
+  const requestId = crypto.randomUUID();
   const checkpoints = new Map<string, string | undefined>();
   for (;;) {
     const turn: TurnContext = { requestId, threadId };
@@ -823,7 +847,7 @@ export async function runClaude(
     }
     if (threadId && turn.account) {
       try {
-        pinThreadAccount(threadId, turn.account.name, turn.pinnedAccount);
+        pinThreadAccount(threadId, turn.account.name, turn.pinnedAccount, turn.pinnedGeneration);
       } catch (error) {
         // Persistence failure must not discard an already completed response.
         console.error("Unable to save thread account:", (error as Error).message);
@@ -839,11 +863,15 @@ async function runClaudeTurn(
   checkpoints: Map<string, string | undefined>,
 ): Promise<ProxyOutput> {
   validateCompactionItems(original);
-  const pinnedName = turn.threadId
-    ? threadAccount(turn.threadId) ??
-      claimThreadAccount(turn.threadId, availableAccount().name)
+  // Read from SQLite at every turn start; nothing caches pins, so an API edit applies here.
+  const pin = turn.threadId
+    ? threadPin(turn.threadId) ??
+      (claimThreadAccount(turn.threadId, availableAccount().name), threadPin(turn.threadId))
     : undefined;
+  if (turn.threadId && !pin) throw new Error("Unable to record the thread's Claude account");
+  const pinnedName = pin?.account;
   turn.pinnedAccount = pinnedName;
+  turn.pinnedGeneration = pin?.generation;
   const pinned = listAccounts().find((account) => account.name === pinnedName);
   const account = pinned && !isUnavailable(pinned) ? pinned : availableAccount();
 

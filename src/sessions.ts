@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -69,6 +69,12 @@ function open(): Database {
     thread_id TEXT PRIMARY KEY,
     account TEXT NOT NULL
   )`);
+  // Kept apart from thread_accounts so a clear keeps the count, and so slots
+  // still running older code (they read only thread_accounts) are unaffected.
+  db.exec(`CREATE TABLE IF NOT EXISTS thread_account_generations (
+    thread_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL
+  )`);
   return db;
 }
 
@@ -86,10 +92,37 @@ export function claimThreadAccount(threadId: string, account: string): string {
   return threadAccount(threadId)!;
 }
 
-export function pinThreadAccount(threadId: string, account: string, expected?: string): void {
+/**
+ * A pin and its generation. The generation counts explicit edits (the pin API)
+ * and survives a clear, so a finishing turn can tell "still the pin I read"
+ * from "edited away and back again" (A -> C -> A).
+ */
+export type ThreadPin = { account: string; generation: number };
+
+export function threadPin(threadId: string): ThreadPin | undefined {
+  const row = open().query(`SELECT a.account, COALESCE(g.generation, 0) AS generation
+      FROM thread_accounts a LEFT JOIN thread_account_generations g ON g.thread_id = a.thread_id
+      WHERE a.thread_id = ?`).get(threadId) as ThreadPin | null;
+  return row ?? undefined;
+}
+
+/**
+ * Save the account a turn ran on. With `expected` the save is a compare-and-set:
+ * it applies only while the pin still names the account the turn read at its
+ * start and, given `generation`, no explicit edit happened since. A pin moved
+ * through the API mid-turn therefore stays as the API left it.
+ */
+export function pinThreadAccount(
+  threadId: string,
+  account: string,
+  expected?: string,
+  generation?: number,
+): void {
   if (expected !== undefined) {
-    open().query("UPDATE thread_accounts SET account = ? WHERE thread_id = ? AND account = ?")
-      .run(account, threadId, expected);
+    open().query(`UPDATE thread_accounts SET account = ?1
+      WHERE thread_id = ?2 AND account = ?3 AND (?4 IS NULL OR
+        COALESCE((SELECT generation FROM thread_account_generations WHERE thread_id = ?2), 0) = ?4)`)
+      .run(account, threadId, expected, generation ?? null);
     return;
   }
   open().query(`INSERT INTO thread_accounts (thread_id, account) VALUES (?, ?)
@@ -105,67 +138,53 @@ export function listThreadAccounts(): Array<{ threadId: string; account: string 
 /** One pin edit: a new account, or null to clear the pin. */
 export type PinWrite = { threadId: string; account: string | null };
 export type PinChange = { threadId: string; from: string | null; to: string | null };
+export type PinSnapshot = {
+  threadAccounts: Array<{ threadId: string; account: string }>;
+  generations: Array<{ threadId: string; generation: number }>;
+};
 
 /**
- * Apply pin edits in one transaction. `plan` runs inside it, so a bulk move
- * selects from the same snapshot it writes. Any throw rolls back every edit.
- * Turns read the pin from this table when they start (nothing caches it) and
- * save their pin back only while it still holds the account they started with
- * (pinThreadAccount's `expected`), so an edit made mid-turn is not overwritten.
+ * Apply pin edits in one IMMEDIATE transaction. `plan` runs inside it, so a
+ * bulk move selects from the same snapshot it writes. When anything changes,
+ * `backup` receives the pre-edit pins first, inside the transaction, and must
+ * return where it saved them; a throw from it or from any write rolls back
+ * every edit. Each edit bumps the thread's generation.
  */
 export function writeThreadAccounts(
   plan: (current: ReadonlyMap<string, string>) => PinWrite[],
-): PinChange[] {
+  backup: (snapshot: PinSnapshot) => string,
+): { changes: PinChange[]; backup: string | null } {
   const database = open();
   const run = database.transaction(() => {
-    const current = new Map(listThreadAccounts().map((row) => [row.threadId, row.account]));
+    const before = listThreadAccounts();
+    const current = new Map(before.map((row) => [row.threadId, row.account]));
+    const working = new Map(current);
+    const changes: PinChange[] = [];
+    for (const write of plan(current)) {
+      const from = working.get(write.threadId) ?? null;
+      if (from === write.account) continue;
+      if (write.account === null) working.delete(write.threadId);
+      else working.set(write.threadId, write.account);
+      changes.push({ threadId: write.threadId, from, to: write.account });
+    }
+    if (!changes.length) return { changes, backup: null };
+    const generations = (database.query("SELECT thread_id, generation FROM thread_account_generations ORDER BY thread_id")
+      .all() as Array<{ thread_id: string; generation: number }>)
+      .map((row) => ({ threadId: row.thread_id, generation: row.generation }));
+    const saved = backup({ threadAccounts: before, generations });
     const upsert = database.query(`INSERT INTO thread_accounts (thread_id, account) VALUES (?, ?)
       ON CONFLICT(thread_id) DO UPDATE SET account = excluded.account`);
     const remove = database.query("DELETE FROM thread_accounts WHERE thread_id = ?");
-    const changes: PinChange[] = [];
-    for (const write of plan(current)) {
-      const from = current.get(write.threadId) ?? null;
-      if (from === write.account) continue;
-      if (write.account === null) {
-        remove.run(write.threadId);
-        current.delete(write.threadId);
-      } else {
-        upsert.run(write.threadId, write.account);
-        current.set(write.threadId, write.account);
-      }
-      changes.push({ threadId: write.threadId, from, to: write.account });
+    const bump = database.query(`INSERT INTO thread_account_generations (thread_id, generation) VALUES (?, 1)
+      ON CONFLICT(thread_id) DO UPDATE SET generation = generation + 1`);
+    for (const change of changes) {
+      if (change.to === null) remove.run(change.threadId);
+      else upsert.run(change.threadId, change.to);
+      bump.run(change.threadId);
     }
-    return changes;
+    return { changes, backup: saved };
   });
   return run.immediate();
-}
-
-/**
- * Online snapshot of sessions.sqlite next to it, checked with quick_check.
- * VACUUM INTO copies one consistent snapshot while other connections keep
- * writing, as sqlite3's .backup does. Keeps the newest `keep` API backups.
- */
-export function backupSessions(label: string, keep = 20): string {
-  const database = open();
-  const directory = stateDir();
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
-  const name = `sessions.sqlite.bak-api-${label}-${stamp}-${crypto.randomUUID().slice(0, 8)}`;
-  const path = join(directory, name);
-  database.query("VACUUM INTO ?").run(path);
-  const copy = new Database(path, { readonly: true });
-  try {
-    const check = copy.query("PRAGMA quick_check").get() as { quick_check: string } | null;
-    if (check?.quick_check !== "ok") throw new Error(`Backup ${name} failed quick_check`);
-  } finally {
-    copy.close();
-  }
-  const old = readdirSync(directory)
-    .filter((file) => file.startsWith("sessions.sqlite.bak-api-"))
-    .map((file) => ({ file, mtime: statSync(join(directory, file)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime)
-    .slice(keep);
-  for (const { file } of old) rmSync(join(directory, file), { force: true });
-  return path;
 }
 
 /** Record a session as soon as its process starts, so pruning can delete its
@@ -329,3 +348,4 @@ export function pruneSessions(
   }
   return expired.length;
 }
+
