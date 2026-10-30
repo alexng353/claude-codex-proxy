@@ -5,6 +5,7 @@ import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
 import { GATE_ONLY_HEADER, HOP_HEADER, loopResponse, remoteGate } from "./hygiene-remote";
 import { PerpetualWaitAborted, perpetualStatus, preparePerpetualWaiting } from "./perpetual";
 import { healthInfo } from "./handoff";
+import { handlePinsRoute } from "./pins";
 import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
@@ -109,6 +110,9 @@ export async function handleRequest(request: Request): Promise<Response> {
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });
+  // Local only: forwarded requests were refused above.
+  const pins = await handlePinsRoute(request, url);
+  if (pins) return pins;
   if (url.pathname.startsWith("/perpetual/") && request.method === "GET") {
     const status = perpetualStatus(decodeURIComponent(url.pathname.slice("/perpetual/".length)));
     return status ? json(status) : error("No open perpetual chat with that id", 404);

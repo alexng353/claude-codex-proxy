@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -94,6 +94,78 @@ export function pinThreadAccount(threadId: string, account: string, expected?: s
   }
   open().query(`INSERT INTO thread_accounts (thread_id, account) VALUES (?, ?)
     ON CONFLICT(thread_id) DO UPDATE SET account = excluded.account`).run(threadId, account);
+}
+
+export function listThreadAccounts(): Array<{ threadId: string; account: string }> {
+  return (open().query("SELECT thread_id, account FROM thread_accounts ORDER BY account, thread_id")
+    .all() as Array<{ thread_id: string; account: string }>)
+    .map((row) => ({ threadId: row.thread_id, account: row.account }));
+}
+
+/** One pin edit: a new account, or null to clear the pin. */
+export type PinWrite = { threadId: string; account: string | null };
+export type PinChange = { threadId: string; from: string | null; to: string | null };
+
+/**
+ * Apply pin edits in one transaction. `plan` runs inside it, so a bulk move
+ * selects from the same snapshot it writes. Any throw rolls back every edit.
+ * Turns read the pin from this table when they start (nothing caches it) and
+ * save their pin back only while it still holds the account they started with
+ * (pinThreadAccount's `expected`), so an edit made mid-turn is not overwritten.
+ */
+export function writeThreadAccounts(
+  plan: (current: ReadonlyMap<string, string>) => PinWrite[],
+): PinChange[] {
+  const database = open();
+  const run = database.transaction(() => {
+    const current = new Map(listThreadAccounts().map((row) => [row.threadId, row.account]));
+    const upsert = database.query(`INSERT INTO thread_accounts (thread_id, account) VALUES (?, ?)
+      ON CONFLICT(thread_id) DO UPDATE SET account = excluded.account`);
+    const remove = database.query("DELETE FROM thread_accounts WHERE thread_id = ?");
+    const changes: PinChange[] = [];
+    for (const write of plan(current)) {
+      const from = current.get(write.threadId) ?? null;
+      if (from === write.account) continue;
+      if (write.account === null) {
+        remove.run(write.threadId);
+        current.delete(write.threadId);
+      } else {
+        upsert.run(write.threadId, write.account);
+        current.set(write.threadId, write.account);
+      }
+      changes.push({ threadId: write.threadId, from, to: write.account });
+    }
+    return changes;
+  });
+  return run.immediate();
+}
+
+/**
+ * Online snapshot of sessions.sqlite next to it, checked with quick_check.
+ * VACUUM INTO copies one consistent snapshot while other connections keep
+ * writing, as sqlite3's .backup does. Keeps the newest `keep` API backups.
+ */
+export function backupSessions(label: string, keep = 20): string {
+  const database = open();
+  const directory = stateDir();
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+  const name = `sessions.sqlite.bak-api-${label}-${stamp}-${crypto.randomUUID().slice(0, 8)}`;
+  const path = join(directory, name);
+  database.query("VACUUM INTO ?").run(path);
+  const copy = new Database(path, { readonly: true });
+  try {
+    const check = copy.query("PRAGMA quick_check").get() as { quick_check: string } | null;
+    if (check?.quick_check !== "ok") throw new Error(`Backup ${name} failed quick_check`);
+  } finally {
+    copy.close();
+  }
+  const old = readdirSync(directory)
+    .filter((file) => file.startsWith("sessions.sqlite.bak-api-"))
+    .map((file) => ({ file, mtime: statSync(join(directory, file)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .slice(keep);
+  for (const { file } of old) rmSync(join(directory, file), { force: true });
+  return path;
 }
 
 /** Record a session as soon as its process starts, so pruning can delete its

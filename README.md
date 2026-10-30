@@ -127,6 +127,20 @@ An inherited `CLAUDE_CODE_OAUTH_TOKEN` is removed from the child environment bef
 
 Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory keeps its own `.credentials.json` and `.claude.json`; every other entry is a symlink to your main Claude config. Because `projects/` is shared, a conversation can resume its transcript on another account. A switch still misses the prompt cache once, since each account has its own cache.
 
+#### Moving pins
+
+A local API edits pins (`thread_accounts` in `sessions.sqlite`, keyed by the Codex thread id). It is refused through a forwarded hop, like `/accounts`, and changes pins only: fields naming account order, weekly caps, credentials or login get a 403.
+
+```bash
+curl -s 127.0.0.1:3456/pins                     # every pin, last turn, Today chat id and title
+curl -s '127.0.0.1:3456/pins?account=val'
+curl -s 127.0.0.1:3456/pins -d '{"pins":[{"threadId":"T","account":"default"}],"reason":"why"}'
+curl -s 127.0.0.1:3456/pins/move -d '{"from":"hinson","to":"default","idleForMs":600000,"dryRun":true}'
+curl -s 127.0.0.1:3456/pins/clear -d '{"threadIds":["T"]}'
+```
+
+Accounts must be configured ones (`move` may start from a removed account). A write first takes an online copy of the database (`VACUUM INTO sessions.sqlite.bak-api-<reason>-<time>`, checked with `quick_check`; the newest 20 are kept), then applies every edit in one transaction and returns `{backup, changed, changes:[{threadId, from, to}]}`. `dryRun` returns the changes without a backup or a write. A pin is read from the table at the start of each turn and not cached, so an edit takes effect on the thread's next turn with no restart; a turn already running saves its pin back only if the pin still names the account it started on, so it never undoes an edit.
+
 ### Live usage dashboard
 
 Run `bun run dashboard`, then open [the local dashboard](http://127.0.0.1:3458). It shows the last 24 hours of overlapping quota lines, output tokens by model, and input/output/cache percentages. The page refreshes every 30 seconds while visible, or immediately with **Reload**. It reads `limits-history.jsonl` and `usage.sqlite` without changing them or making model requests. Keep the five-minute quota recorder running for fresh observations. The timestamp shows when data was loaded; quota observations can be older and gaps are left open. Failed refreshes preserve the last successful view and display an error.
