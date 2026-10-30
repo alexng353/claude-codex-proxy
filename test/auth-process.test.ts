@@ -372,3 +372,74 @@ test('send finishing after account replacement cannot attach old delivery histor
   await flushAuthWarnings(async()=>{sent++;return true;});
   expect(sent).toBe(2);
 });
+
+function warningTransport(localError = 'today-daemon send: this daemon has no Today thread', localCode = 1) {
+  const daemon = join(root, 'today-daemon');
+  const ssh = join(root, 'ssh');
+  process.env.TODAY_DAEMON_BIN = daemon;
+  process.env.TODAY_WARNING_SSH = 'forge';
+  process.env.PATH = `${root}:${process.env.PATH}`;
+  process.env.WARNING_TEST_ROOT = root;
+  writeFileSync(daemon, `#!${process.execPath}\nawait Bun.stdin.text(); console.error(${JSON.stringify(localError)}); process.exit(${localCode});\n`, { mode: 0o700 });
+  writeFileSync(ssh, `#!${process.execPath}
+import {appendFileSync, existsSync} from 'node:fs';
+const root = process.env.WARNING_TEST_ROOT;
+appendFileSync(root + '/ssh-calls', JSON.stringify({args: process.argv.slice(2), message: await Bun.stdin.text(), thread: process.env.CODEX_THREAD_ID}) + '\\n');
+process.exit(existsSync(root + '/fail-ssh') ? 1 : 0);
+`, { mode: 0o700 });
+  return () => existsSync(join(root, 'ssh-calls'))
+    ? readFileSync(join(root, 'ssh-calls'), 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+}
+async function flushRealSender() { await startAuthWarnings()(); }
+
+test('no Today thread falls back over SSH and persists delivery once', async () => {
+  const account = setup(); markAuthFailed(account);
+  const calls = warningTransport();
+  process.env.CODEX_THREAD_ID = 'must-not-leak';
+  await flushRealSender();
+  await flushRealSender();
+  expect(calls()).toHaveLength(1);
+  expect(calls()[0].args.slice(0, 4)).toEqual(['-o', 'BatchMode=yes', '--', 'forge']);
+  expect(calls()[0].args[4]).toContain('--from claude-codex-proxy today -');
+  expect(calls()[0].thread).toBeUndefined();
+  expect(calls()[0].message).toContain('authentication failed since');
+  const state = JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!, 'account-auth.json'), 'utf8'));
+  expect(state[JSON.stringify([account.name, account.dir])].failure.delivered).toBe(true);
+  const child = run(`import {startAuthWarnings} from ${JSON.stringify(modulePath)}; await startAuthWarnings()();`, 'retry-warning');
+  expect(await child.exited).toBe(0);
+  expect(calls()).toHaveLength(1);
+});
+
+test('SSH warning failure logs once and retries until delivery succeeds', async () => {
+  const account = setup(); markAuthFailed(account);
+  const calls = warningTransport();
+  writeFileSync(join(root, 'fail-ssh'), '');
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    await flushRealSender(); await flushRealSender();
+    expect(calls()).toHaveLength(2);
+    expect(log).toHaveBeenCalledTimes(1);
+    rmSync(join(root, 'fail-ssh'));
+    await flushRealSender(); await flushRealSender();
+    expect(calls()).toHaveLength(3);
+    expect(log).toHaveBeenCalledTimes(1);
+  } finally { log.mockRestore(); }
+});
+
+for (const [error, code] of [['connection refused', 1], ['this daemon has no Today thread', 0]] as const) {
+  test(`SSH warning fallback is skipped for local result ${code}: ${error}`, async () => {
+    const account = setup(); markAuthFailed(account);
+    const calls = warningTransport(error, code);
+    await flushRealSender();
+    expect(calls()).toHaveLength(0);
+  });
+}
+
+test('no Today thread without a configured fallback stays undelivered', async () => {
+  const account = setup(); markAuthFailed(account);
+  const calls = warningTransport(); delete process.env.TODAY_WARNING_SSH;
+  await flushRealSender();
+  expect(calls()).toHaveLength(0);
+  const state = JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!, 'account-auth.json'), 'utf8'));
+  expect(state[JSON.stringify([account.name, account.dir])].failure.delivered).toBeUndefined();
+});

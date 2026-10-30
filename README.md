@@ -121,6 +121,18 @@ The existing 12-minute usage probe also renews due OAuth access tokens on every 
 
 `GET /accounts` includes `authFailedSince` (ISO timestamp or null), which persists until a successful authenticated check or turn clears the observed incident, and `refreshTokenExpiresAt` (epoch milliseconds or null). `authFailedUntil` remains the separate, temporary routing cooldown. An expired access token alone is not a broken login. A completed usage probe that returns no meters records a refresh suspicion when login credentials remain unchanged, a refresh token is present, and the access token was already expired by more than ten minutes before the probe started. The first strike logs “refresh not renewing; confirming” without a cooldown or warning. A later matching probe at least ten minutes later with the same credentials confirms the failure; its log includes the expired access-token timestamp. Meters, changed credentials, a successful turn, or token mode clear the suspicion. Meters with credentials different from those that opened an incident also clear that incident. Refreshed credentials, setup-token accounts, incomplete probes, and visible rate limits do not trigger this rule. Outside that completed-probe condition, unreadable credentials, transient refresh errors, and network failures remain unknown. Worker-exit stderr alone starts only a routing cooldown; a probe must confirm authentication failure unless the CLI has written its dead-login marker. Failed login incidents and warning delivery state persist locally by account name and directory; repeated warnings of the same kind are suppressed for six hours unless credentials change. Warnings are sent with `today-daemon send --from claude-codex-proxy`, so Today delivers them in the `script:claude-codex-proxy` envelope rather than as Alex's turn, and an armed hygiene gate lets them run. The sender executable can be overridden with `TODAY_DAEMON_BIN` (tests use a stub).
 
+On a machine whose daemon runs with `--no-today`, set `TODAY_WARNING_SSH=forge`
+(or another SSH destination hosting Today) in the proxy service environment.
+Only the local “this daemon has no Today thread” error triggers this fallback.
+It uses `ssh -o BatchMode=yes`, runs `$HOME/.local/bin/today-daemon` on the
+remote host with that user's runtime socket, and sends the warning on stdin
+with `--from claude-codex-proxy`. The service user needs working noninteractive
+SSH authentication and a trusted host key. Local and remote attempts share a
+10-second deadline. Failed delivery is logged once per incident and retried;
+success retains the existing persistent incident deduplication. Unset the
+variable to disable the fallback. `TODAY_DAEMON_BIN` overrides only the local
+executable.
+
 New account folders remain visible in status but cannot receive turns until a credentials file exists. A missing file starts a login-failure incident after a 15-minute grace period from the first failed observation, or immediately if the proxy previously observed a credentials file for that account.
 
 An inherited `CLAUDE_CODE_OAUTH_TOKEN` is removed from the child environment before account-specific overrides are merged for CLI launches. The Today warning subprocess also strips inherited Claude OAuth, API, and CLI-session variables, as well as `CODEX_THREAD_ID`. This prevents one account's inherited token from overriding another account's login, while leaving room for explicit per-account token mode.

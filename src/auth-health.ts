@@ -289,12 +289,30 @@ async function sendTodayWarning(message: string, _incidentId: string): Promise<b
   for (const key of STRIPPED_ENV) delete env[key];
   // `--from` makes Today deliver it in the script:claude-codex-proxy envelope, so
   // the hygiene gate (which no longer exempts a bare `[from ...]` tag) lets it run.
-  const child = Bun.spawn([process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
-    `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "claude-codex-proxy", "today", "-"], {
-    env, stdin: new TextEncoder().encode(message), stdout: "ignore", stderr: "ignore",
-  });
-  const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
-  try { return await child.exited === 0; } finally { clearTimeout(timer); }
+  const deadline = Date.now() + 10_000;
+  async function run(args: string[]): Promise<{ ok: boolean; error: string }> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { ok: false, error: "" };
+    const child = Bun.spawn(args, {
+      env, stdin: new TextEncoder().encode(message), stdout: "ignore", stderr: "pipe",
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), remaining);
+    try {
+      const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+      return { ok: code === 0, error };
+    } finally { clearTimeout(timer); }
+  }
+  const local = await run([process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
+    `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "claude-codex-proxy", "today", "-"]);
+  if (local.ok) return true;
+  const host = process.env.TODAY_WARNING_SSH?.trim();
+  // This error is emitted before SendMessage: retrying on another machine cannot
+  // duplicate a locally accepted warning. Other failures may have lost a receipt.
+  if (!host || !local.error.includes("this daemon has no Today thread")) return false;
+  // Resolve home and uid on the destination; no warning text enters its shell.
+  return (await run(["ssh", "-o", "BatchMode=yes", "--", host,
+    'exec env -u CODEX_THREAD_ID "$HOME/.local/bin/today-daemon" send --socket "/run/user/$(id -u)/today/daemon.sock" --from claude-codex-proxy today -',
+  ])).ok;
 }
 /** One batch at a time; stopping always waits for the actual in-flight batch. */
 export function startAuthWarnings(send: WarningSender = sendTodayWarning, intervalMs = 15_000): () => Promise<void> {
