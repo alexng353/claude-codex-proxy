@@ -54,7 +54,10 @@ test('warnings dedupe across repeated failures and retry failed delivery; recove
   expect(messages[0]).toContain('forge');
   expect(messages[0]).toContain(`CLAUDE_CONFIG_DIR='${root}' claude`);
   expect(messages[0]).toContain('/login');
-  expect(classifyTurn({model:'sonnet',input:[{role:'user',content:messages[0]}]}).type).not.toBe('human');
+  // `--from claude-codex-proxy`: Today delivers it in the script envelope, which the
+  // hygiene gate exempts; the bare `[from ...]` tag alone no longer would.
+  const enveloped = `<codex_delegation>\n  <source_thread_id>script:claude-codex-proxy</source_thread_id>\n  <input>${messages[0].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</input>\n</codex_delegation>`;
+  expect(classifyTurn({model:'sonnet',input:[{role:'user',content:enveloped}]}).type).not.toBe('human');
   markAuthSucceeded(account, health.authIncidentId(account));
   writeFileSync(join(root, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "new-test-token" } }));
   markAuthFailed(account);

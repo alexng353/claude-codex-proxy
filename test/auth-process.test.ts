@@ -81,7 +81,9 @@ test('repeated observations do not rewrite state; same name in different dirs st
   expect(authIncidentId(account)).toBeString();
 });
 
-test('real sender adapter sets client identity and removes thread identity', async () => {
+// The hygiene gate exempts a bare tag no more: the warning must come in Today's
+// script envelope (script:claude-codex-proxy), or an armed gate would answer it.
+test('real sender adapter sends as a script and removes thread identity', async () => {
   const account = setup(); markAuthFailed(account);
   process.env.CODEX_THREAD_ID = 'must-not-leak';
   const stripped = ['CLAUDECODE','ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_BASE_URL','CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'];
@@ -95,7 +97,7 @@ test('real sender adapter sets client identity and removes thread identity', asy
     return { exited: Promise.resolve(0), kill() {} };
   };
   try { const stop = startAuthWarnings(); await stop(); expect(called).toBe(1);
-    expect(captured!.args.slice(-4)).toEqual(['--client', 'claude-codex-proxy', 'today', '-']);
+    expect(captured!.args.slice(-4)).toEqual(['--from', 'claude-codex-proxy', 'today', '-']);
     expect(captured!.args[0]).toBe(process.env.TODAY_DAEMON_BIN!);
     expect(captured!.env.CODEX_THREAD_ID).toBeUndefined();
     for (const key of stripped) expect(captured!.env[key]).toBeUndefined(); }

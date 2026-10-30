@@ -279,8 +279,10 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
 async function sendTodayWarning(message: string, _incidentId: string): Promise<boolean> {
   const { CODEX_THREAD_ID: _thread, ...env } = process.env;
   for (const key of STRIPPED_ENV) delete env[key];
+  // `--from` makes Today deliver it in the script:claude-codex-proxy envelope, so
+  // the hygiene gate (which no longer exempts a bare `[from ...]` tag) lets it run.
   const child = Bun.spawn([process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
-    `/run/user/${process.getuid!()}/today/daemon.sock`, "--client", "claude-codex-proxy", "today", "-"], {
+    `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "claude-codex-proxy", "today", "-"], {
     env, stdin: new TextEncoder().encode(message), stdout: "ignore", stderr: "ignore",
   });
   const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);

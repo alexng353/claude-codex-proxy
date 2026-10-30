@@ -465,7 +465,7 @@ const EXEMPT_TRIGGER_PREFIXES = ["automation_"];
 /**
  * Turns another chat (`app_tool_send_message`), Today's daemon
  * (`today_follow_up`) or a stop hook (`today_hook`) started. Their own
- * prompts arrive wrapped (`<codex_delegation>`, `<hook_prompt`, `[agent]`), but
+ * prompts arrive wrapped (`<codex_delegation>`, `<hook_prompt`), but
  * Codex keeps the trigger for the whole turn, so a message Alex steers into
  * one carries it too. In these turns a fully bare message is his.
  */
@@ -477,6 +477,15 @@ const EXEMPT_THREAD_SOURCES = new Set(["subagent", "memory_consolidation"]);
  * Message openings Codex or other agents write in the user role. Mirrors
  * plate-activity's list plus wrappers for heartbeats, delegated prompts and
  * skills, as a fallback when turn metadata is missing.
+ *
+ * Each one is also text Alex could type to skip the gate, so an entry stays
+ * only while something still writes it. Agents and scripts reach a chat in
+ * the `<codex_delegation>` envelope (`script:NAME` for `today-daemon send
+ * --from NAME`); the proxy cannot see the Today client, so the envelope is
+ * how their turns are recognised. Bare tags such as `[agent]`, `[from ...]`
+ * or `[ship-arch.sh]` are not exempt: no sender has used them since
+ * 2026-10-23. `<developer>` was dropped on 2026-10-30: neither Codex nor
+ * Today writes it in a user message.
  */
 const SYNTHETIC_PREFIXES = [
   "<environment_context>",
@@ -487,7 +496,6 @@ const SYNTHETIC_PREFIXES = [
   "<turn_aborted>",
   "<subagent_notification>",
   "<user_shell_command>",
-  "<developer>",
   "<heartbeat>",
   "<codex_delegation>",
   "<skill>",
@@ -543,16 +551,13 @@ export function isSyntheticUserMessage(item: ResponseInputItem): boolean {
   );
   return (
     texts.length > 0 &&
-    texts.every(
-      (text) =>
-        text !== null && (SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)) || AGENT_TAG.test(text)),
-    )
+    texts.every((text) => text !== null && SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)))
   );
 }
 
 /**
  * A message no part of which is marked as written by an agent or a relay: no
- * synthetic wrapper, agent tag or dthread markup in any part. Stricter than
+ * synthetic wrapper or dthread markup in any part. Stricter than
  * `!isSyntheticUserMessage`, so an envelope with an extra part, or relay
  * markup outside its envelope, never reads as Alex in an agent-started turn.
  */
@@ -565,23 +570,12 @@ export function isBareUserMessage(item: ResponseInputItem): boolean {
       const text = part.text.trimStart().replace(SENT_AT_STAMP, "");
       return (
         !SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)) &&
-        !AGENT_TAG.test(text) &&
         !text.includes("<dthread_message>") &&
         !text.includes("<codex_delegation>")
       );
     })
   );
 }
-
-/**
- * Tags agents and scripts open their messages with when Today delivers them
- * bare (no delegation envelope, no turn trigger): "[agent] Shipped...",
- * "[from coordinator 01a1370e, ...]", "[ship-arch.sh, 06:32 PDT] ...". Alex asked
- * (Oct 23) that chat-to-chat traffic never be gated, so overnight work goes on.
- * Timers are not here: a tag is text Alex can type. They send with
- * `today-daemon send --from NAME`, which Today wraps in the `script:NAME` envelope.
- */
-const AGENT_TAG = /^\[(?:agent\]|from [^\]\n]*\]|[\w.-]+\.(?:sh|ts|py)\b[^\]\n]*\])/;
 
 /**
  * Today summaries (/summary and automatic ones) are short-lived no-tools side
