@@ -465,3 +465,22 @@ test("runClaude saves with the generation it read: a mid-turn A -> C -> A surviv
   expect(threadAccount(thread)).toBe("nocreds");
   expect(sharedThreadsInFlight().has(thread)).toBe(false);
 }, 30_000);
+
+test("runClaude balances a start mark that was queued under contention", async () => {
+  const thread = `eng-${crypto.randomUUID()}`;
+  sharedThreadsInFlight();
+  const blocker = new Database(inFlightPath());
+  blocker.exec("BEGIN IMMEDIATE");
+  let locked = true;
+  try {
+    await turn(thread, async () => {
+      blocker.exec("ROLLBACK");
+      locked = false;
+      expect(sharedThreadsInFlight().get(thread)).toEqual([process.pid]);
+    });
+    expect(sharedThreadsInFlight().has(thread)).toBe(false);
+  } finally {
+    if (locked) blocker.exec("ROLLBACK");
+    blocker.close();
+  }
+}, 30_000);

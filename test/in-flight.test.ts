@@ -48,3 +48,36 @@ test("an unsuccessful delete rolls back the decrement before retry", () => {
   observer.exec("DROP TRIGGER fail_delete");
   expect(sharedThreadsInFlight().has("thread")).toBe(false);
 });
+
+for (const pendingEnd of [false, true]) test(`a failed start survives contention${pendingEnd ? " with an owed end" : ""}`, () => {
+  if (pendingEnd) markThreadInFlight("old", 1);
+  observer.exec("BEGIN IMMEDIATE");
+  try {
+    if (pendingEnd) expect(() => markThreadInFlight("old", -1)).toThrow();
+    expect(() => markThreadInFlight("new", 1)).toThrow();
+  } finally { observer.exec("ROLLBACK"); }
+  expect(sharedThreadsInFlight().get("new")).toEqual([process.pid]);
+  expect(sharedThreadsInFlight().has("old")).toBe(false);
+  markThreadInFlight("new", -1);
+  expect(sharedThreadsInFlight().size).toBe(0);
+});
+
+test("reads apply pending starts and ends while the writer remains locked", () => {
+  markThreadInFlight("finished", 1);
+  markThreadInFlight("overlapping", 1);
+  markThreadInFlight("overlapping", 1);
+  observer.exec("BEGIN IMMEDIATE");
+  try {
+    expect(() => markThreadInFlight("finished", -1)).toThrow();
+    expect(() => markThreadInFlight("overlapping", -1)).toThrow();
+    expect(() => markThreadInFlight("new", 1)).toThrow();
+    const busy = sharedThreadsInFlight();
+    expect(busy.has("finished")).toBe(false);
+    expect(busy.get("overlapping")).toEqual([process.pid]);
+    expect(busy.get("new")).toEqual([process.pid]);
+  } finally { observer.exec("ROLLBACK"); }
+  expect(sharedThreadsInFlight().size).toBe(2);
+  markThreadInFlight("overlapping", -1);
+  markThreadInFlight("new", -1);
+  expect(sharedThreadsInFlight().size).toBe(0);
+});

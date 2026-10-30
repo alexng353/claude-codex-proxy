@@ -271,6 +271,7 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         }
         // Even if the durable write fails, this process must not resend on every tick.
         delivered.add(incident.id);
+        deliveryFailureLogged.delete(incident.id);
         const delivery = { at: Date.now(), credentials: version, ...(expiry !== undefined ? { expiresAt: expiry } : {}) };
         lastSent.set(`${path()}:${accountKey}:${kind}`, { ...delivery, generation: health.generation });
         safely(() => update((state) => {

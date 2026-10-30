@@ -18,7 +18,7 @@ import { stateDir } from "./sessions";
 let db: Database | undefined;
 let dbPath = "";
 // Counts, not a set: several overlapping turns can finish while SQLite is busy.
-const unmarksOwed = new Map<string, Map<string, number>>();
+const marksOwed = new Map<string, Map<string, number>>();
 
 export function inFlightPath(): string {
   return join(stateDir(), "in-flight.sqlite");
@@ -55,37 +55,38 @@ function selfStart(): string | null {
 /**
  * Count a turn starting (+1) or ending (-1) on `threadId` in this process.
  * Only this process writes its own rows. Rows of a copy that died mid-turn
- * stay until a reader finds that process gone.
+ * stay until a reader finds that process gone. Failed writes remain queued even
+ * when this throws; callers must still balance every start with an end.
  */
 export function markThreadInFlight(threadId: string, delta: 1 | -1): void {
-  if (delta < 0) {
-    const path = inFlightPath();
-    let owed = unmarksOwed.get(path);
-    if (!owed) unmarksOwed.set(path, owed = new Map());
-    owed.set(threadId, (owed.get(threadId) ?? 0) + 1);
-  }
-  const database = open();
-  flushUnmarks(database);
-  if (delta > 0) {
-    database.query(`INSERT INTO threads_in_flight (thread_id, pid, start, count) VALUES (?, ?, ?, 1)
-      ON CONFLICT(thread_id, pid) DO UPDATE SET count = count + 1, start = excluded.start`)
-      .run(threadId, process.pid, selfStart());
-  }
+  const path = inFlightPath();
+  let owed = marksOwed.get(path);
+  if (!owed) marksOwed.set(path, owed = new Map());
+  const pending = (owed.get(threadId) ?? 0) + delta;
+  if (pending === 0) owed.delete(threadId);
+  else owed.set(threadId, pending);
+  if (owed.size === 0) marksOwed.delete(path);
+  flushMarks(open());
 }
 
-/** Retain failed decrements until a later mark or idle check can commit them. */
-function flushUnmarks(database: Database): void {
-  const owed = unmarksOwed.get(dbPath);
+/** Retain failed deltas until a later mark or idle check can commit them. */
+function flushMarks(database: Database): void {
+  const owed = marksOwed.get(dbPath);
   if (!owed) return;
   database.transaction(() => {
-    const decrement = database.query("UPDATE threads_in_flight SET count = count - ? WHERE thread_id = ? AND pid = ?");
+    const increment = database.query(`INSERT INTO threads_in_flight (thread_id, pid, start, count) VALUES (?, ?, ?, ?)
+      ON CONFLICT(thread_id, pid) DO UPDATE SET count = count + excluded.count, start = excluded.start`);
+    const decrement = database.query("UPDATE threads_in_flight SET count = count + ? WHERE thread_id = ? AND pid = ?");
     const prune = database.query("DELETE FROM threads_in_flight WHERE thread_id = ? AND pid = ? AND count <= 0");
-    for (const [threadId, count] of owed) {
-      decrement.run(count, threadId, process.pid);
-      prune.run(threadId, process.pid);
+    for (const [threadId, delta] of owed) {
+      if (delta > 0) increment.run(threadId, process.pid, selfStart(), delta);
+      else {
+        decrement.run(delta, threadId, process.pid);
+        prune.run(threadId, process.pid);
+      }
     }
   })();
-  unmarksOwed.delete(dbPath);
+  marksOwed.delete(dbPath);
 }
 
 function processAlive(pid: number, start: string | null): boolean {
@@ -101,17 +102,24 @@ function processAlive(pid: number, start: string | null): boolean {
 /**
  * Threads with a turn running in any live proxy copy, each with the pids that
  * run it. Rows a dead copy left are skipped and pruned. Throws when the table
- * is unreadable or pending unmarks cannot commit, so idle checks fail closed.
+ * is unreadable, so idle checks fail closed. Pending local deltas are reflected
+ * in reads even when write contention prevents committing them.
  */
 export function sharedThreadsInFlight(): Map<string, number[]> {
   const database = open();
-  flushUnmarks(database);
-  const rows = database.query("SELECT thread_id, pid, start FROM threads_in_flight WHERE count > 0 ORDER BY pid")
-    .all() as Array<{ thread_id: string; pid: number; start: string | null }>;
+  try { flushMarks(database); } catch { /* Pending deltas are overlaid below. */ }
+  const rows = database.query("SELECT thread_id, pid, start, count FROM threads_in_flight WHERE count > 0 ORDER BY pid")
+    .all() as Array<{ thread_id: string; pid: number; start: string | null; count: number }>;
+  for (const [threadId, delta] of marksOwed.get(dbPath) ?? []) {
+    const row = rows.find(row => row.thread_id === threadId && row.pid === process.pid);
+    if (row) row.count += delta;
+    else if (delta > 0) rows.push({ thread_id: threadId, pid: process.pid, start: selfStart(), count: delta });
+  }
   const result = new Map<string, number[]>();
   const verdicts = new Map<string, boolean>();
   const dead: Array<{ pid: number; start: string | null }> = [];
   for (const row of rows) {
+    if (row.count <= 0) continue;
     const key = `${row.pid}:${row.start}`;
     let live = verdicts.get(key);
     if (live === undefined) {
