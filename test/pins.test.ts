@@ -46,6 +46,11 @@ beforeAll(async () => {
     if (name === "loose") await mkdir(join(dir, "projects", SLUG));
     else await symlink(shared, join(dir, "projects", SLUG));
   }
+  // whole: its entire projects folder links to the base one (linkSharedEntries' layout).
+  const whole = join(state, "accounts", "whole");
+  await mkdir(whole, { recursive: true });
+  await writeFile(join(whole, ".credentials.json"), "{}");
+  await symlink(join(base, "projects"), join(whole, "projects"));
   const mock = join(directory, "claude-bin");
   // Each turn waits for the test's go-ahead, so the test can edit pins mid-turn.
   await writeFile(mock, `#!/bin/sh
@@ -118,7 +123,7 @@ const backups = async () => existsSync(backupDir()) ? (await readdir(backupDir()
 test("lists pins with last use and the Today chat", async () => {
   const { status, body } = await call("/pins");
   expect(status).toBe(200);
-  expect(body.accounts.sort()).toEqual(["default", "loose", "nocreds", "spare"]);
+  expect(body.accounts.sort()).toEqual(["default", "loose", "nocreds", "spare", "whole"]);
   expect(body.counts).toEqual({ default: 2, spare: 1 });
   const a = body.pins.find((pin: any) => pin.threadId === "eng-a");
   expect(a).toMatchObject({ account: "default", lastUsedAccount: "default", todayThreadId: "today-a", title: "Chat A", archived: false });
@@ -234,6 +239,8 @@ test("bulk move honours thread and idle filters", async () => {
   expect(threadAccount("eng-a")).toBe("spare");
   const only = await call("/pins/move", { from: "default", to: "spare", threadIds: ["eng-b", "eng-missing"] });
   expect(only.body.changes).toEqual([{ threadId: "eng-b", from: "default", to: "spare" }]);
+  expect(only.body.warnings.join("\n")).toContain("eng-missing");
+  expect(only.body.warnings.join("\n")).not.toContain("eng-b");
   const all = await call("/pins/move", { from: "spare", to: "default" });
   expect(all.body.changes.map((change: any) => change.threadId).sort()).toEqual(["eng-a", "eng-b"]);
   expect((await call("/pins")).body.counts).toEqual({ default: 4 });
@@ -318,6 +325,15 @@ test("refuses moves onto or off an account whose transcripts are not shared", as
   pinThreadAccount("eng-loose", "loose");
   expect((await call("/pins/move", { from: "loose", to: "default" })).status).toBe(409);
   expect(threadAccount("eng-loose")).toBe("loose");
+  expect(threadAccount("eng-a")).toBe("default");
+});
+
+test("accepts an account whose whole projects folder is linked", async () => {
+  const onto = await call("/pins", { pins: [{ threadId: "eng-a", account: "whole" }] });
+  expect(onto.status).toBe(200);
+  expect(threadAccount("eng-a")).toBe("whole");
+  const off = await call("/pins/move", { from: "whole", to: "default", threadIds: ["eng-a"] });
+  expect(off.status).toBe(200);
   expect(threadAccount("eng-a")).toBe("default");
 });
 

@@ -6,7 +6,6 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
-  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -259,14 +258,17 @@ function projectSlug(): string {
   return (process.env.CLAUDE_CWD || process.cwd()).replace(/[^a-zA-Z0-9]/g, "-");
 }
 
-/** True when the account resumes from the shared transcript folder (claude-account-move step 1). */
+/**
+ * True when the account resumes from the shared transcript folder (claude-account-move
+ * step 1), whichever link does it: the slug folder itself (older accounts) or the whole
+ * `projects` folder (linkSharedEntries' layout). A missing folder is not shared.
+ */
 function sharesTranscripts(target: Account): boolean {
   if (target.isDefault) return true;
   const slug = projectSlug();
-  const link = join(target.dir, "projects", slug);
   try {
-    return lstatSync(link).isSymbolicLink() &&
-      realpathSync(link) === realpathSync(join(baseConfigDir(), "projects", slug));
+    return realpathSync(join(target.dir, "projects", slug)) ===
+      realpathSync(join(baseConfigDir(), "projects", slug));
   } catch {
     return false;
   }
@@ -339,6 +341,13 @@ function saveBackup(reason: string, snapshot: PinSnapshot): string {
         JSON.stringify([snapshot.threadAccounts, snapshot.generations]))
       throw new Error(`Pin backup ${name} did not read back intact`);
     renameSync(tmp, path);
+    // Make the rename itself durable before the pins change.
+    const dirFd = openSync(directory, "r");
+    try {
+      fsyncSync(dirFd);
+    } finally {
+      closeSync(dirFd);
+    }
   } catch (cause) {
     rmSync(tmp, { force: true });
     throw cause;
@@ -397,6 +406,15 @@ function apply(write: Write): PinResult {
   return { dryRun: false, backup: result.backup, changed: result.changes.length, changes: result.changes, warnings };
 }
 
+/** A warning for each id with no turns and no Today chat: likely a Today id or a typo. */
+function unknownIds(ids: Iterable<string>): string[] {
+  const turns = lastTurns();
+  const today = todayThreads();
+  return [...ids]
+    .filter((id) => !turns.has(id) && !today.has(id))
+    .map((id) => `${id}: no turns and no Today chat; is this the Codex (engine) thread id?`);
+}
+
 export function setPins(input: unknown): PinResult {
   const fields = body(input, ["pins", "reason", "dryRun", "force"]);
   const names = accountNames();
@@ -409,12 +427,7 @@ export function setPins(input: unknown): PinResult {
   });
   if (new Set(edits.map((edit) => edit.threadId)).size !== edits.length)
     throw new PinError("pins lists a thread more than once");
-  const warnings: string[] = [];
-  const turns = lastTurns();
-  const today = todayThreads();
-  for (const edit of edits)
-    if (!turns.has(edit.threadId) && !today.has(edit.threadId))
-      warnings.push(`${edit.threadId}: no turns and no Today chat; is this the Codex (engine) thread id?`);
+  const warnings = unknownIds(edits.map((edit) => edit.threadId));
   return apply({
     dryRun: flag(fields.dryRun, "dryRun"),
     force: flag(fields.force, "force"),
@@ -446,7 +459,7 @@ export function movePins(input: unknown): PinResult {
   const turns = idleSince === undefined ? undefined : lastTurns(true);
   // Only this copy's requests are visible; during a handoff the other slot's are not.
   const running = idleSince === undefined ? undefined : threadsInFlight();
-  const warnings: string[] = [];
+  const warnings = only ? unknownIds(only) : [];
   return apply({
     dryRun,
     force,
