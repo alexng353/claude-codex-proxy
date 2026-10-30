@@ -232,6 +232,7 @@ function warningText(machine: string, account: Account, incident: FailureInciden
 }
 const sending = new Set<string>();
 const delivered = new Set<string>();
+const deliveryFailureLogged = new Set<string>();
 const lastSent = new Map<string, Delivery & { generation: string }>();
 /** Sender accepts the incident ID so a future idempotent Today CLI can use it directly. */
 export async function flushAuthWarnings(send: WarningSender, machine = hostname()): Promise<void> {
@@ -261,7 +262,13 @@ export async function flushAuthWarnings(send: WarningSender, machine = hostname(
         if (previous && previous.credentials === version && (previous.expiresAt === undefined || previous.expiresAt === expiry) && Date.now() - previous.at < SIX_HOURS) continue;
         let sent = false;
         try { sent = await send(warningText(machine, account, incident), incident.id); } catch {}
-        if (!sent) continue;
+        if (!sent) {
+          if (!deliveryFailureLogged.has(incident.id)) {
+            deliveryFailureLogged.add(incident.id);
+            console.error(`Unable to deliver account authentication warning for ${account.name} (incident ${incident.id}); will retry`);
+          }
+          continue;
+        }
         // Even if the durable write fails, this process must not resend on every tick.
         delivered.add(incident.id);
         const delivery = { at: Date.now(), credentials: version, ...(expiry !== undefined ? { expiresAt: expiry } : {}) };

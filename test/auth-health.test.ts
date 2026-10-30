@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -56,7 +56,7 @@ test('warnings dedupe across repeated failures and retry failed delivery; recove
   expect(messages[0]).toContain('/login');
   // `--from claude-codex-proxy`: Today delivers it in the script envelope, which the
   // hygiene gate exempts; the bare `[from ...]` tag alone no longer would.
-  const enveloped = `<codex_delegation>\n  <source_thread_id>script:claude-codex-proxy</source_thread_id>\n  <input>${messages[0].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</input>\n</codex_delegation>`;
+  const enveloped = `<codex_delegation>\n  <source_thread_id>script:claude-codex-proxy</source_thread_id>\n  <sent_at>09:37 PDT Fri Oct 30</sent_at>\n  <input>${messages[0].replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</input>\n</codex_delegation>`;
   expect(classifyTurn({model:'sonnet',input:[{role:'user',content:enveloped}]}).type).not.toBe('human');
   markAuthSucceeded(account, health.authIncidentId(account));
   writeFileSync(join(root, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "new-test-token" } }));
@@ -247,4 +247,31 @@ test('expiry delivery rechecks a deadline that passed after observation', async 
   try { await health.flushAuthWarnings(async () => { sent++; return true; }); }
   finally { Date.now = now; }
   expect(sent).toBe(0);
+});
+
+for (const mode of ["false", "throw"] as const) test(`failed warning delivery (${mode}) logs once per incident and keeps retrying`, async () => {
+  const account = setup();
+  const log = spyOn(console, "error").mockImplementation(() => {});
+  let attempts = 0;
+  const fail = async () => {
+    attempts++;
+    if (mode === "throw") throw new Error("sensitive sender error");
+    return false;
+  };
+  try {
+    health.recordAuthFailure(account);
+    await health.flushAuthWarnings(fail, "forge");
+    await health.flushAuthWarnings(fail, "forge");
+    expect(attempts).toBe(2);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log.mock.calls.flat().join(" ")).toContain("Unable to deliver account authentication warning");
+    expect(log.mock.calls.flat().join(" ")).not.toContain("sensitive sender error");
+    markAuthSucceeded(account, health.authIncidentId(account));
+    health.recordAuthFailure(account);
+    await health.flushAuthWarnings(fail, "forge");
+    expect(log).toHaveBeenCalledTimes(2);
+    await health.flushAuthWarnings(async () => true, "forge");
+    await health.flushAuthWarnings(fail, "forge");
+    expect(attempts).toBe(3);
+  } finally { log.mockRestore(); }
 });

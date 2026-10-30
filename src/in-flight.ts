@@ -17,6 +17,8 @@ import { stateDir } from "./sessions";
 
 let db: Database | undefined;
 let dbPath = "";
+// Counts, not a set: several overlapping turns can finish while SQLite is busy.
+const unmarksOwed = new Map<string, Map<string, number>>();
 
 export function inFlightPath(): string {
   return join(stateDir(), "in-flight.sqlite");
@@ -24,6 +26,7 @@ export function inFlightPath(): string {
 
 function open(): Database {
   const path = inFlightPath();
+  // Production keeps one stateDir for the process lifetime; tests can switch it.
   if (db && dbPath === path) return db;
   db?.close();
   mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
@@ -31,7 +34,7 @@ function open(): Database {
   dbPath = path;
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = OFF");
-  db.exec("PRAGMA busy_timeout = 2000");
+  db.exec("PRAGMA busy_timeout = 200");
   db.exec(`CREATE TABLE IF NOT EXISTS threads_in_flight (
     thread_id TEXT NOT NULL,
     pid INTEGER NOT NULL,
@@ -55,17 +58,34 @@ function selfStart(): string | null {
  * stay until a reader finds that process gone.
  */
 export function markThreadInFlight(threadId: string, delta: 1 | -1): void {
+  if (delta < 0) {
+    const path = inFlightPath();
+    let owed = unmarksOwed.get(path);
+    if (!owed) unmarksOwed.set(path, owed = new Map());
+    owed.set(threadId, (owed.get(threadId) ?? 0) + 1);
+  }
   const database = open();
+  flushUnmarks(database);
   if (delta > 0) {
     database.query(`INSERT INTO threads_in_flight (thread_id, pid, start, count) VALUES (?, ?, ?, 1)
       ON CONFLICT(thread_id, pid) DO UPDATE SET count = count + 1, start = excluded.start`)
       .run(threadId, process.pid, selfStart());
-    return;
   }
-  database.query("UPDATE threads_in_flight SET count = count - 1 WHERE thread_id = ? AND pid = ?")
-    .run(threadId, process.pid);
-  database.query("DELETE FROM threads_in_flight WHERE thread_id = ? AND pid = ? AND count <= 0")
-    .run(threadId, process.pid);
+}
+
+/** Retain failed decrements until a later mark or idle check can commit them. */
+function flushUnmarks(database: Database): void {
+  const owed = unmarksOwed.get(dbPath);
+  if (!owed) return;
+  database.transaction(() => {
+    const decrement = database.query("UPDATE threads_in_flight SET count = count - ? WHERE thread_id = ? AND pid = ?");
+    const prune = database.query("DELETE FROM threads_in_flight WHERE thread_id = ? AND pid = ? AND count <= 0");
+    for (const [threadId, count] of owed) {
+      decrement.run(count, threadId, process.pid);
+      prune.run(threadId, process.pid);
+    }
+  })();
+  unmarksOwed.delete(dbPath);
 }
 
 function processAlive(pid: number, start: string | null): boolean {
@@ -81,10 +101,11 @@ function processAlive(pid: number, start: string | null): boolean {
 /**
  * Threads with a turn running in any live proxy copy, each with the pids that
  * run it. Rows a dead copy left are skipped and pruned. Throws when the table
- * is unreadable, so a caller deciding idleness can fail closed.
+ * is unreadable or pending unmarks cannot commit, so idle checks fail closed.
  */
 export function sharedThreadsInFlight(): Map<string, number[]> {
   const database = open();
+  flushUnmarks(database);
   const rows = database.query("SELECT thread_id, pid, start FROM threads_in_flight WHERE count > 0 ORDER BY pid")
     .all() as Array<{ thread_id: string; pid: number; start: string | null }>;
   const result = new Map<string, number[]>();

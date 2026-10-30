@@ -483,7 +483,7 @@ const EXEMPT_THREAD_SOURCES = new Set(["subagent", "memory_consolidation"]);
  * the `<codex_delegation>` envelope (`script:NAME` for `today-daemon send
  * --from NAME`); the proxy cannot see the Today client, so the envelope is
  * how their turns are recognised. Bare tags such as `[agent]`, `[from ...]`
- * or `[ship-arch.sh]` are not exempt: no sender has used them since
+ * or `[ship-arch.sh]` are not exempt: no sender has used bare (unenveloped) tags since
  * 2026-10-23. `<developer>` was dropped on 2026-10-30: neither Codex nor
  * Today writes it in a user message.
  */
