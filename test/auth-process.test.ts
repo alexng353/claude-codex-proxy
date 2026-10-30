@@ -399,8 +399,10 @@ test('no Today thread falls back over SSH and persists delivery once', async () 
   await flushRealSender();
   await flushRealSender();
   expect(calls()).toHaveLength(1);
-  expect(calls()[0].args.slice(0, 4)).toEqual(['-o', 'BatchMode=yes', '--', 'forge']);
-  expect(calls()[0].args[4]).toContain('--from claude-codex-proxy today -');
+  expect(calls()[0].args.slice(0, 6)).toEqual(['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '--', 'forge']);
+  expect(calls()[0].args[6]).toContain('--from claude-codex-proxy today -');
+  expect(calls()[0].args[6]).toContain('env -u CODEX_THREAD_ID');
+  expect(calls()[0].args[6]).toContain('--socket "/run/user/$(id -u)/today/daemon.sock"');
   expect(calls()[0].thread).toBeUndefined();
   expect(calls()[0].message).toContain('authentication failed since');
   const state = JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!, 'account-auth.json'), 'utf8'));
@@ -442,4 +444,34 @@ test('no Today thread without a configured fallback stays undelivered', async ()
   expect(calls()).toHaveLength(0);
   const state = JSON.parse(readFileSync(join(process.env.PROXY_STATE_DIR!, 'account-auth.json'), 'utf8'));
   expect(state[JSON.stringify([account.name, account.dir])].failure.delivered).toBeUndefined();
+});
+
+
+test('warning deadline bounds stderr held open by a grandchild', async () => {
+  const account = setup(); markAuthFailed(account);
+  warningTransport();
+  writeFileSync(process.env.TODAY_DAEMON_BIN!, '#!/bin/sh\nsleep 30 &\necho $! > "$WARNING_TEST_ROOT/grandchild"\nexit 1\n', { mode: 0o700 });
+  const started = performance.now();
+  const pending = flushRealSender();
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      pending.then(() => 'returned'),
+      new Promise<string>(resolve => { watchdog = setTimeout(() => resolve('stalled'), 11_000); }),
+    ]);
+    expect(result).toBe('returned');
+    expect(performance.now() - started).toBeLessThan(11_000);
+  } finally {
+    clearTimeout(watchdog);
+    const pid = Number(readFileSync(join(root, 'grandchild'), 'utf8').trim());
+    process.kill(pid, 'SIGKILL');
+    await pending;
+  }
+}, 15_000);
+
+test('warning stderr retains only the first 64 KiB', async () => {
+  const account = setup(); markAuthFailed(account);
+  const calls = warningTransport('x'.repeat(64 * 1024) + 'this daemon has no Today thread');
+  await flushRealSender();
+  expect(calls()).toHaveLength(0);
 });

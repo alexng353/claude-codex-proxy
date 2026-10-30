@@ -124,12 +124,14 @@ The existing 12-minute usage probe also renews due OAuth access tokens on every 
 On a machine whose daemon runs with `--no-today`, set `TODAY_WARNING_SSH=forge`
 (or another SSH destination hosting Today) in the proxy service environment.
 Only the local “this daemon has no Today thread” error triggers this fallback.
-It uses `ssh -o BatchMode=yes`, runs `$HOME/.local/bin/today-daemon` on the
+It uses `ssh -o BatchMode=yes -o ConnectTimeout=5`, runs `$HOME/.local/bin/today-daemon` on the
 remote host with that user's runtime socket, and sends the warning on stdin
 with `--from claude-codex-proxy`. The service user needs working noninteractive
 SSH authentication and a trusted host key. Local and remote attempts share a
 10-second deadline. Failed delivery is logged once per incident and retried;
-success retains the existing persistent incident deduplication. Unset the
+success retains the existing persistent incident deduplication. If Today accepts
+a remote warning but SSH fails before confirming delivery, a retry can produce
+a duplicate warning. Stderr capture is limited to the first 64 KiB. Unset the
 variable to disable the fallback. `TODAY_DAEMON_BIN` overrides only the local
 executable.
 

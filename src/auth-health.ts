@@ -296,11 +296,37 @@ async function sendTodayWarning(message: string, _incidentId: string): Promise<b
     const child = Bun.spawn(args, {
       env, stdin: new TextEncoder().encode(message), stdout: "ignore", stderr: "pipe",
     });
-    const timer = setTimeout(() => child.kill("SIGKILL"), remaining);
+    const reader = child.stderr?.getReader();
+    const stderr = new Uint8Array(64 * 1024);
+    let length = 0;
+    const readError = (async () => {
+      while (reader) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const kept = value.subarray(0, stderr.length - length);
+        stderr.set(kept, length);
+        length += kept.length;
+      }
+      return new TextDecoder().decode(stderr.subarray(0, length));
+    })();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<{ ok: boolean; error: string }>(resolve => {
+      timer = setTimeout(() => {
+        // Killing the sender does not close a pipe inherited by its descendants.
+        resolve({ ok: false, error: "" });
+        child.kill("SIGKILL");
+      }, remaining);
+    });
     try {
-      const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-      return { ok: code === 0, error };
-    } finally { clearTimeout(timer); }
+      return await Promise.race([
+        Promise.all([child.exited, readError]).then(([code, error]) => ({ ok: code === 0, error })),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      // Cancellation must not delay the deadline either.
+      void reader?.cancel().catch(() => {});
+    }
   }
   const local = await run([process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"), "send", "--socket",
     `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "claude-codex-proxy", "today", "-"]);
@@ -310,7 +336,7 @@ async function sendTodayWarning(message: string, _incidentId: string): Promise<b
   // duplicate a locally accepted warning. Other failures may have lost a receipt.
   if (!host || !local.error.includes("this daemon has no Today thread")) return false;
   // Resolve home and uid on the destination; no warning text enters its shell.
-  return (await run(["ssh", "-o", "BatchMode=yes", "--", host,
+  return (await run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host,
     'exec env -u CODEX_THREAD_ID "$HOME/.local/bin/today-daemon" send --socket "/run/user/$(id -u)/today/daemon.sock" --from claude-codex-proxy today -',
   ])).ok;
 }
