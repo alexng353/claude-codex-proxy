@@ -129,3 +129,18 @@ export function cairnWeightClient(configPath: string): WeightClient {
     },
   };
 }
+
+/** Pure preview: earlier proposed writes form the baseline for later photos, just
+ * as they will during delivery. The supplied live snapshot is never mutated. */
+export async function previewWeights(records: ImageRecord[], settings: WeightSettings): Promise<WeightRow[]> {
+  const unique = new Map(records.filter(r => r.kind === "weight" && r.verdict === "accepted").map(r => [r.sha256, r]));
+  const proofs: WeightProof[] = [];
+  for (const record of unique.values()) proofs.push(await prepareWeight(record));
+  proofs.sort((a, b) => a.at.localeCompare(b.at) || a.sha256.localeCompare(b.sha256));
+  const projected = structuredClone(settings);
+  return proofs.map(proof => {
+    const outcome = decideWeight(proof, projected);
+    if (outcome.result === "written") projected[`weight.${proof.day}`] = { lb: proof.lb, at: proof.at };
+    return { ...proof, ...outcome };
+  });
+}

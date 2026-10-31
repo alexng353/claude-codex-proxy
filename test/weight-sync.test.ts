@@ -55,3 +55,11 @@ test("relay conflicts are retained for review and transport failure retries", as
   await queue.run(client); expect(queue.list()[0].result).toBe("pending");
   down = false; await queue.run(client); expect(queue.list()[0]).toMatchObject({ result: "needs-review", reason: "concurrent hand entry" }); queue.close();
 });
+
+test("backfill preview sorts by capture time, deduplicates photos, and uses projected earlier entries", async () => {
+  const { previewWeights } = await import("../src/weight-sync");
+  const first = record({ at: "2026-10-30T20:00:00Z", reading: "227 lb" });
+  const jump = record({ sha256: "b".repeat(64), reading: "112.2 lb" });
+  const rows = await previewWeights([jump, first, first], {});
+  expect(rows.map(r => [r.day, r.result])).toEqual([["2026-10-30", "written"], ["2026-10-31", "needs-review"]]);
+});
