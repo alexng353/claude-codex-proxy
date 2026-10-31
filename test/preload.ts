@@ -15,6 +15,8 @@ process.env.CLAUDE_CONFIG_DIR = join(root, "claude");
 for (const path of [process.env.PROXY_STATE_DIR, process.env.XDG_STATE_HOME, process.env.CLAUDE_CONFIG_DIR])
   mkdirSync(path, { recursive: true });
 delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+// A spawned test server must never deliver weigh-ins using a live agent token.
+delete process.env.HYGIENE_CAIRN_AGENT_CONFIG;
 // Shared scrubbers must not discover real credentials during fake CLI tests.
 process.env.SECRET_SCRUB_FILES = "";
 process.on("exit", () => rmSync(root, { recursive: true, force: true }));

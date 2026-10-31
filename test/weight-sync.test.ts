@@ -89,3 +89,38 @@ test("backfill CLI backs up all weights and leaves the source and journal untouc
   expect(output).toContain("DRY RUN");
   expect(output).toContain('| 2026-10-31 | 226.9 lb | 226.9 | written |');
 });
+
+test("worker recovers accepted intent on startup and uses the configured Cairn HTTP path", async () => {
+  const { writeFileSync, readFileSync } = await import("node:fs");
+  const { startWeightWorker, weightReviews } = await import("../src/weight-worker");
+  const { resetGateCache } = await import("../src/hygiene-gate");
+  const dir = mkdtempSync(join(tmpdir(), "weight-worker-")); dirs.push(dir);
+  const state = join(dir, "gate.json"), config = join(dir, "agent.json");
+  const original = JSON.stringify({ startsAt: "2026-10-01T12:00:00Z", images: [record({ capturedAt: null, cairnWeightPending: true })] });
+  writeFileSync(state, original);
+  const requests: unknown[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    expect(req.headers.get("authorization")).toBe("Bearer scratch-only");
+    if (new URL(req.url).pathname === "/v1/weights") return Response.json({ settings: {} });
+    expect(new URL(req.url).pathname).toBe("/v1/weight-proofs");
+    requests.push(await req.json());
+    return Response.json({ result: "written" });
+  } });
+  writeFileSync(config, JSON.stringify({ token: "scratch-only", endpoints: [{ url: server.url.toString() }] }));
+  const keys = ["HYGIENE_GATE_STATE", "HYGIENE_CAIRN_AGENT_CONFIG", "HYGIENE_GATE_REMOTE"];
+  const previous = keys.map(key => process.env[key]);
+  try {
+    process.env.HYGIENE_GATE_STATE = state; process.env.HYGIENE_CAIRN_AGENT_CONFIG = config; delete process.env.HYGIENE_GATE_REMOTE;
+    resetGateCache();
+    await startWeightWorker()();
+    expect(requests).toEqual([{ sha256: "a".repeat(64), day: "2026-10-31", at: record().at, lb: 226.9 }]);
+    expect(weightReviews()).toEqual({ reviews: [], pending: 0 });
+    expect(readFileSync(state, "utf8")).toBe(original);
+    await startWeightWorker()();
+    expect(requests).toHaveLength(1);
+  } finally {
+    server.stop(true);
+    keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+    resetGateCache();
+  }
+});
