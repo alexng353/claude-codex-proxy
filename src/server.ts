@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { startWeightWorker } from "./weight-worker";
 import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
 import { remoteGate, startPhotoRetries } from "./hygiene-remote";
@@ -46,6 +47,7 @@ const own = healthPort
 const stopProbe = startUsageProbe();
 const stopWarnings = startAuthWarnings();
 const stopPhotoRetries = startPhotoRetries(remoteGate() ?? `http://127.0.0.1:${port}`);
+const stopWeights = startWeightWorker();
 
 /**
  * Hand over (alex-0230): stop accepting, start no new work (the usage probe, idle
@@ -61,12 +63,14 @@ async function drain(signal: string): Promise<void> {
   void stopProbe().finally(() => (probeDone = true));
   const warningsDone = stopWarnings();
   const photosDone = stopPhotoRetries();
+  let weightsDone = false;
+  void stopWeights().finally(() => (weightsDone = true));
   closeIdleWorkers();
   let memoryDone = false;
   void drainPerpetual().finally(() => (memoryDone = true));
   server.stop(false);
   let warnAt = Date.now() + DRAIN_WARN_MS;
-  while (server.pendingRequests > 0 || perpetualBusy() > 0 || !memoryDone || !probeDone) {
+  while (server.pendingRequests > 0 || perpetualBusy() > 0 || !memoryDone || !probeDone || !weightsDone) {
     await Bun.sleep(1000);
     closeIdleWorkers();
     if (Date.now() >= warnAt) {

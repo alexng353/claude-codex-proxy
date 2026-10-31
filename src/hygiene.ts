@@ -75,6 +75,10 @@ export type ImageRecord = {
   file?: string;
   /** The gate was locked (and not bypassed) when this photo was checked. */
   locked?: boolean;
+  /** Original capture time; null means EXIF was absent at acceptance. */
+  capturedAt?: string | null;
+  /** New accepted weigh-ins are durable input for the Cairn delivery worker. */
+  cairnWeightPending?: boolean;
   /** Weigh-ins: the scale reading as shown, e.g. "72.4 kg". */
   reading?: string;
 };

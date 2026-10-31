@@ -367,7 +367,17 @@ async function checkImage(
     console.error("hygiene-gate: could not save the photo:", (error as Error).message);
   }
   const reading = verdict.kind === "weight" ? verdict.reading : undefined;
-  state.images.push({ ...record, verdict: "accepted", slot: target, ...(file ? { file } : {}), ...(reading ? { reading } : {}) });
+  state.images.push({
+    ...record,
+    verdict: "accepted",
+    slot: target,
+    ...(file ? { file } : {}),
+    ...(reading ? { reading } : {}),
+    ...(verdict.kind === "weight" ? {
+      capturedAt: taken !== null && Number.isFinite(taken) ? new Date(taken).toISOString() : null,
+      cairnWeightPending: true,
+    } : {}),
+  });
   return { line: `✅ ${slotLabel(target, state)} photo accepted${reading ? ` (${reading})` : ""}.` };
 }
 
