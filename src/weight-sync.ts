@@ -1,7 +1,7 @@
 /** Accepted proofs are the durable input; this journal records delivery independently
  * of the gate verdict. Both the worker and backfill use the same checks. */
 import { Database } from "bun:sqlite";
-import { mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { addDays, localTime, type ImageRecord } from "./hygiene";
 import { captureTime, parseWeightReading, sha256 } from "./hygiene-proof";
@@ -66,6 +66,7 @@ export class WeightQueue {
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new Database(path, { create: true });
+    if (path !== ":memory:") chmodSync(path, 0o600);
     this.db.exec(`PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS weights (
       sha256 TEXT PRIMARY KEY, proof TEXT NOT NULL, result TEXT NOT NULL, reason TEXT
     )`);
@@ -89,7 +90,8 @@ export class WeightQueue {
       let outcome: WeightResult;
       try {
         // Re-read before every write. The relay rechecks atomically, including jumps.
-        outcome = decideWeight(proof, await client.list());
+        outcome = decideWeight(proof, {});
+        if (outcome.result !== "needs-review") outcome = decideWeight(proof, await client.list());
         if (outcome.result === "written") outcome = await client.insert(proof);
       } catch { outcome = { result: "pending", reason: "Cairn unavailable or write not acknowledged; retry pending" }; }
       this.db.query("UPDATE weights SET result = ?, reason = ? WHERE sha256 = ?").run(outcome.result, outcome.reason ?? null, proof.sha256);

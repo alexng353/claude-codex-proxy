@@ -119,3 +119,15 @@ Accepted proofs grouped by day, newest day first. This feeds the "photo a day" v
 ## GET /photos/{sha256}
 
 Returns the original stored bytes, with EXIF intact, under the matching `content-type`. Send the same bearer auth. The response is `cache-control: private, immutable`, so cache it by hash.
+
+## GET /weight-reviews
+
+Returns `{reviews, pending}` with the same device authentication as `/status`.
+Each review contains `sha256`, `day`, `at`, `reading`, `lb`, `file`, `result`, and
+`reason`. `file` is the archived photo path on the gate machine; the same photo
+is available through `/photos/{sha256}`. `pending` counts undelivered accepted
+weigh-ins, including those not yet scanned by the delivery worker.
+
+A passing proof can still need review before its number reaches Cairn. The gate
+verdict is independent of delivery. See [Weigh-in delivery](weight-sync.md) for
+rules, deployment, and backfill.

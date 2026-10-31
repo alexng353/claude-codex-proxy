@@ -63,3 +63,29 @@ test("backfill preview sorts by capture time, deduplicates photos, and uses proj
   const rows = await previewWeights([jump, first, first], {});
   expect(rows.map(r => [r.day, r.result])).toEqual([["2026-10-30", "written"], ["2026-10-31", "needs-review"]]);
 });
+
+test("ambiguous readings are flagged even while Cairn is offline", async () => {
+  const queue = new WeightQueue(database());
+  await queue.add([record({ reading: "226.9" })]);
+  await queue.run({ list: async () => { throw new Error("offline"); }, insert: async () => { throw new Error("must not write"); } });
+  expect(queue.list()[0].result).toBe("needs-review");
+  queue.close();
+});
+
+test("backfill CLI backs up all weights and leaves the source and journal untouched in dry-run", async () => {
+  const { readFileSync, writeFileSync, existsSync } = await import("node:fs");
+  const dir = mkdtempSync(join(tmpdir(), "weight-backfill-")); dirs.push(dir);
+  const state = join(dir, "gate.json"), settings = join(dir, "settings.json");
+  const original = JSON.stringify({ images: [record()] });
+  writeFileSync(state, original);
+  writeFileSync(settings, JSON.stringify({ "weight.2026-10-30": { lb: 227, at: "yesterday" } }));
+  const run = Bun.spawn([process.execPath, "scripts/backfill-weights.ts", "--dry-run", "--state", state, "--settings", settings, "--backup-dir", dir], { stdout: "pipe", stderr: "pipe" });
+  const output = await new Response(run.stdout).text();
+  expect(await run.exited).toBe(0);
+  expect(readFileSync(state, "utf8")).toBe(original);
+  expect(existsSync(state + ".weights.sqlite")).toBe(false);
+  const backup = output.match(/^Backup: (.+)$/m)![1];
+  expect(JSON.parse(readFileSync(backup, "utf8"))).toEqual(JSON.parse(readFileSync(settings, "utf8")));
+  expect(output).toContain("DRY RUN");
+  expect(output).toContain('| 2026-10-31 | 226.9 lb | 226.9 | written |');
+});
