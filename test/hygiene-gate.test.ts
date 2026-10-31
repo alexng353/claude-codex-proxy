@@ -664,6 +664,23 @@ describe("Cairn API", () => {
   const submit = (kind: string, name: string, token = "phone") =>
     api("/proofs", { method: "POST", token, body: JSON.stringify({ kind, image: Buffer.from(name).toString("base64") }) });
 
+  test("accepted weight stores durable sync intent and EXIF without a Cairn connection", async () => {
+    verdicts.push({ kind: "weight", confidence: 0.99, reason: "scale", reading: "226.9 lb" });
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...raw, weighInStartsAt: new Date(at(DAY, "05:00")).toISOString() }));
+    resetGateCache();
+    exif["weight-sync"] = clock - 60_000;
+    const reply = await submit("weight_morning", "weight-sync");
+    expect((await reply.json() as any).result).toBe("pass");
+    const state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    expect(state.images.at(-1)).toMatchObject({ verdict: "accepted", cairnWeightPending: true, capturedAt: new Date(clock - 60_000).toISOString() });
+    expect((await api("/weight-reviews")).status).toBe(401);
+    const reviews = await api("/weight-reviews", { token: "phone" });
+    expect(reviews.status).toBe(200);
+    expect(await reviews.json()).toMatchObject({ reviews: [], pending: 1 });
+  });
+
   test("auth: no token, unknown token and agent devices are refused; a down relay is 503", async () => {
     expect((await api("/status")).status).toBe(401);
     expect((await api("/status", { token: "nope" })).status).toBe(401);
