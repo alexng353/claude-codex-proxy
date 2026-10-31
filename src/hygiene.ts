@@ -58,6 +58,8 @@ export type ImageRecord = {
   /** 256-bit difference hash as hex, or null when the image could not be decoded. */
   dhash: string | null;
   at: string;
+  /** Recent follower receipt, metadata only; never used for proof credit or EXIF age. */
+  receivedAt?: string;
   /** The message the image arrived in; a replay of that message reuses this record. */
   source: { thread: string; key: string };
   kind: ClassifiedKind | null;

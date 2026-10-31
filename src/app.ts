@@ -81,9 +81,11 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
     return json(
       decision.action === "respond"
         ? { action: "respond", text: decision.text }
-        : decision.request === body
-          ? { action: "forward" }
-          : { action: "forward", request: decision.request },
+        : {
+            action: "forward",
+            ...(decision.request === body ? {} : { request: decision.request }),
+            ...(decision.gateUnavailable ? { gateUnavailable: true } : {}),
+          },
     );
   if (decision.action === "respond")
     return json({ action: "respond", response: responseObject(body, syntheticOutput(decision.text)) });

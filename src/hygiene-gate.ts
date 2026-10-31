@@ -14,8 +14,11 @@ import {
   passThrough,
   remoteGate,
   remoteGateRequest,
-  withholdForOutage,
-  withholdUnchecked,
+  deliverForOutage,
+  preserveDelivered,
+  wasDelivered,
+  fetchRemoteState,
+  rememberVerdicts,
 } from "./hygiene-remote";
 import {
   BYPASS_MS,
@@ -218,7 +221,7 @@ export function reapply(request: ResponsesRequest, state: GateState): ResponsesR
         if (part.type !== "input_image" || typeof part.image_url !== "string") return;
         const decoded = decodeDataUrl(part.image_url);
         const record = decoded && withheld.get(sha256(decoded.bytes));
-        if (!record) return;
+        if (!record || wasDelivered(part.image_url)) return;
         const target = edit(index);
         (target.content as ReturnType<typeof partsOf>)[partIndex] = {
           type: "input_text",
@@ -242,10 +245,11 @@ export function reapply(request: ResponsesRequest, state: GateState): ResponsesR
 // ---- Decisions ----
 
 export type GateDecision =
-  | { action: "forward"; request: ResponsesRequest }
+  | { action: "forward"; request: ResponsesRequest; gateUnavailable?: boolean }
   | { action: "respond"; text: string };
 
-const forward = (request: ResponsesRequest): GateDecision => ({ action: "forward", request });
+const forward = (request: ResponsesRequest, gateUnavailable = false): GateDecision =>
+  ({ action: "forward", request, ...(gateUnavailable ? { gateUnavailable: true } : {}) });
 
 type ImageOutcome = { line: string | null; record?: ImageRecord };
 
@@ -410,35 +414,43 @@ function delayReply(state: GateState, now: number): string {
  * not take down inference, so failures forward the request untouched.
  */
 export async function gateRequest(request: ResponsesRequest): Promise<GateDecision> {
-  // Photos sent while a followed gate was unreachable stay withheld in every mode.
-  if (gateDisabled()) return forward(withholdUnchecked(request));
+  if (gateDisabled()) return forward(request);
   const remote = remoteGate();
   if (remote) {
     try {
       return await followRemote(remote, request);
     } catch (error) {
-      // A bug here may let the turn through, but never a photo nobody checked.
-      console.error("hygiene-gate: follower failed open without photos:", (error as Error).message);
-      return forward(withholdForOutage(request));
+      // Unknown photos must not block delivery.
+      console.error("hygiene-gate: follower failed open:", (error as Error).message);
+      return forward(deliverForOutage(request, deps.now()), true);
     }
   }
   try {
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
-    if (turn.type !== "human") return forward(withholdUnchecked(reapply(request, state)));
+    if (turn.type !== "human") return forward(reapply(request, state));
     return await serialized(() => decideHumanTurn(request, turn));
   } catch (error) {
     console.error("hygiene-gate: failed open:", (error as Error).message);
-    return forward(withholdUnchecked(request));
+    return forward(deliverForOutage(request, deps.now()), true);
   }
 }
 
 /** This proxy follows another machine's gate (hygiene-remote.ts). */
 async function followRemote(remote: string, request: ResponsesRequest): Promise<GateDecision> {
   const decision = await remoteGateRequest(remote, request);
-  if (decision) return decision.action === "forward" ? forward(withholdUnchecked(decision.request)) : decision;
-  // Unreachable: the turn goes on, without any of its photos.
-  return forward(withholdForOutage(request));
+  if (decision) {
+    if (decision.action === "forward") {
+      // The authority itself may have failed to read its gate state.
+      if (decision.gateUnavailable)
+        return forward(deliverForOutage(request, deps.now()), true);
+      return forward(preserveDelivered(request, decision.request));
+    }
+    const state = await fetchRemoteState(remote, 2000);
+    if (state) rememberVerdicts(state);
+    return decision;
+  }
+  return forward(deliverForOutage(request, deps.now()), true);
 }
 
 async function decideHumanTurn(
@@ -498,7 +510,7 @@ async function decideHumanTurn(
     }
   }
   if (dirty) saveState(state);
-  return forward(withholdUnchecked(reapply(request, state)));
+  return forward(reapply(request, state));
 }
 
 // ---- Status and ruling ----
@@ -566,6 +578,29 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
   if (url.pathname === "/hygiene/status" && request.method === "GET") return Response.json(gateStatus());
   // The whole state, for proxies that follow this gate (hygiene-remote.ts). Local callers only.
   if (url.pathname === "/hygiene/state" && request.method === "GET") return Response.json(loadState());
+  // Local-only like /state; retries use a stable source so a lost ACK cannot spend a proof twice.
+  if (url.pathname === "/hygiene/recheck" && request.method === "POST") {
+    let body: { url?: unknown; at?: unknown };
+    try { body = await request.json(); } catch { return Response.json({ error: "invalid JSON" }, { status: 400 }); }
+    if (typeof body?.url !== "string" || typeof body.at !== "number" || !Number.isFinite(body.at) || body.at < 0 || body.at > deps.now() + EXIF_FUTURE_SLACK_MS)
+      return Response.json({ error: "invalid queued photo" }, { status: 400 });
+    const photoUrl = body.url;
+    const sentAt = body.at;
+    return serialized(async () => {
+      const state = structuredClone(loadState());
+      const decoded = decodeDataUrl(photoUrl);
+      // URL photos are not classified by the existing gate either.
+      if (!decoded) return Response.json({ checked: true });
+      const hash = sha256(decoded.bytes);
+      // A follower timestamp is not evidence of freshness or entitlement to a past slot.
+      const now = deps.now();
+      const outcome = await checkImageRecorded(state, photoUrl, { thread: "outage", key: hash }, now);
+      if (outcome.record && outcome.record.receivedAt === undefined && Math.abs(now - sentAt) <= 5 * 60_000)
+        outcome.record.receivedAt = new Date(sentAt).toISOString();
+      if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
+      return Response.json({ checked: !outcome.line?.startsWith("⚠") });
+    });
+  }
   const ruling = /^\/hygiene\/debt\/([A-Za-z0-9-]+)\/resolve$/.exec(url.pathname);
   if (ruling && request.method === "POST") {
     let body: Record<string, unknown> = {};

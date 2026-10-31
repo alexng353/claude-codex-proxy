@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
+import { remoteGate, startPhotoRetries } from "./hygiene-remote";
 import { pinsToken } from "./pins";
 import { closeIdleWorkers } from "./claude";
 import { healthInfo, isDraining, runningCommit, setDraining } from "./handoff";
@@ -44,6 +45,7 @@ const own = healthPort
 // Idle accounts have no turn headers; /usage fills their meters for routing and caps.
 const stopProbe = startUsageProbe();
 const stopWarnings = startAuthWarnings();
+const stopPhotoRetries = startPhotoRetries(remoteGate() ?? `http://127.0.0.1:${port}`);
 
 /**
  * Hand over (alex-0230): stop accepting, start no new work (the usage probe, idle
@@ -58,6 +60,7 @@ async function drain(signal: string): Promise<void> {
   let probeDone = false;
   void stopProbe().finally(() => (probeDone = true));
   const warningsDone = stopWarnings();
+  const photosDone = stopPhotoRetries();
   closeIdleWorkers();
   let memoryDone = false;
   void drainPerpetual().finally(() => (memoryDone = true));
@@ -75,6 +78,7 @@ async function drain(signal: string): Promise<void> {
   }
   closeIdleWorkers();
   await warningsDone;
+  await photosDone;
   console.log("Drained: every request finished");
   own?.stop(true);
   process.exit(0);
