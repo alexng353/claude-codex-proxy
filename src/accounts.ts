@@ -143,6 +143,17 @@ export function accountsDir(): string {
   return join(stateDir(), "accounts");
 }
 
+/**
+ * An account is a directory with a plain name. Anything with a dot is not one:
+ * `claude /login` with CLAUDE_CONFIG_DIR=accounts/<name> takes its lock as the
+ * directory `accounts/<name>.lock`, and listing that as an account made the usage
+ * probe run claude inside it (so the lock was never removed) and asked Alex to log
+ * in to "stanford.lock" (Oct 30). Backups and hidden entries are skipped the same way.
+ */
+export function isAccountName(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name);
+}
+
 export function listAccounts(): Account[] {
   const accounts: Account[] = [
     { name: "default", dir: baseConfigDir(), isDefault: true },
@@ -150,6 +161,7 @@ export function listAccounts(): Account[] {
   const root = accountsDir();
   if (!existsSync(root)) return orderAccounts(accounts);
   for (const name of readdirSync(root).sort()) {
+    if (!isAccountName(name)) continue;
     const dir = join(root, name);
     try {
       if (statSync(dir).isDirectory()) accounts.push({ name, dir, isDefault: false });
