@@ -7,6 +7,7 @@
  * admin and plate devices are allowed; agent devices are not, so no agent
  * can submit proofs. Results are cached by token hash for five minutes.
  */
+import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, type ProofKind } from "./hygiene";
@@ -122,6 +123,8 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
   const who = await device(request);
   if (who instanceof Response) return who;
   const path = url.pathname.slice(API_PREFIX.length);
+
+  if (path === "/weight-reviews" && request.method === "GET") return json(weightReviews());
 
   if (path === "/status" && request.method === "GET") return json(status());
 
