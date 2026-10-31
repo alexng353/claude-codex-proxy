@@ -15,7 +15,7 @@ export function weightReviews() {
   if (existsSync(path)) {
     const db = new Database(path, { readonly: true });
     try {
-      rows = db.query<{ proof: string; result: string; reason: string | null }, []>("SELECT proof, result, reason FROM weights").all()
+      if (db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'weights'").get()) rows = db.query<{ proof: string; result: string; reason: string | null }, []>("SELECT proof, result, reason FROM weights").all()
         .map(row => ({ ...JSON.parse(row.proof), result: row.result, reason: row.reason }));
     } finally { db.close(); }
   }

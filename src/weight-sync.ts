@@ -48,28 +48,31 @@ export function decideWeight(proof: WeightProof, settings: WeightSettings): Weig
       ? { result: "skipped-existing", reason: "same daily weight" }
       : { result: "needs-review", reason: "different existing daily entry" };
   }
-  const recent = Object.entries(settings).flatMap(([key, value]) => {
+  const entries = Object.entries(settings).flatMap(([key, value]) => {
     const day = key.slice(7), lb = (value as { lb?: unknown } | null)?.lb;
-    return /^weight\.\d{4}-\d{2}-\d{2}$/.test(key) && day >= addDays(proof.day, -7) && day < proof.day &&
-      typeof lb === "number" && Number.isFinite(lb) && lb >= 60 && lb <= 600 ? [lb] : [];
-  });
-  if (recent.length) {
-    const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
-    if (Math.abs(proof.lb - mean) > 5 || Math.abs(proof.lb - mean) / mean > 0.03)
-      return { result: "needs-review", reason: "more than 5 lb or 3% from preceding 7-day mean" };
-  }
+    return /^weight\.\d{4}-\d{2}-\d{2}$/.test(key) && day >= addDays(proof.day, -30) && day < proof.day &&
+      typeof lb === "number" && Number.isFinite(lb) && lb >= 60 && lb <= 600 ? [{ day, lb }] : [];
+  }).sort((a, b) => b.day.localeCompare(a.day));
+  const recent = entries.filter(e => e.day >= addDays(proof.day, -7));
+  const baseline = recent.length ? recent : entries.slice(0, 1);
+  if (!baseline.length) return { result: "needs-review", reason: "no prior weight within 30 days" };
+  const mean = baseline.reduce((sum, e) => sum + e.lb, 0) / baseline.length;
+  if (Math.abs(proof.lb - mean) > 5 || Math.abs(proof.lb - mean) / mean > 0.03)
+    return { result: "needs-review", reason: "more than 5 lb or 3% from 7-day mean or last weight within 30 days" };
   return { result: "written" };
 }
 
 export class WeightQueue {
   readonly db: Database;
-  constructor(path: string) {
+  constructor(path: string, private readonly log: (message: string) => void = console.error) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new Database(path, { create: true });
     if (path !== ":memory:") chmodSync(path, 0o600);
     this.db.exec(`PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS weights (
-      sha256 TEXT PRIMARY KEY, proof TEXT NOT NULL, result TEXT NOT NULL, reason TEXT
+      sha256 TEXT PRIMARY KEY, proof TEXT NOT NULL, result TEXT NOT NULL, reason TEXT, failure_logged INTEGER NOT NULL DEFAULT 0
     )`);
+    if (!this.db.query<{ name: string }, []>("PRAGMA table_info(weights)").all().some(c => c.name === "failure_logged"))
+      this.db.exec("ALTER TABLE weights ADD COLUMN failure_logged INTEGER NOT NULL DEFAULT 0");
   }
   close() { this.db.close(); }
   async add(records: ImageRecord[]) {
@@ -77,7 +80,7 @@ export class WeightQueue {
       if (record.kind !== "weight" || record.verdict !== "accepted") continue;
       if (this.db.query("SELECT 1 FROM weights WHERE sha256 = ?").get(record.sha256)) continue;
       const proof = await prepareWeight(record);
-      this.db.query("INSERT OR IGNORE INTO weights VALUES (?, ?, 'pending', NULL)").run(record.sha256, JSON.stringify(proof));
+      this.db.query("INSERT OR IGNORE INTO weights (sha256, proof, result, reason) VALUES (?, ?, 'pending', NULL)").run(record.sha256, JSON.stringify(proof));
     }
   }
   list(): WeightRow[] {
@@ -90,13 +93,26 @@ export class WeightQueue {
       let outcome: WeightResult;
       try {
         // Re-read before every write. The relay rechecks atomically, including jumps.
-        outcome = decideWeight(proof, {});
-        if (outcome.result !== "needs-review") outcome = decideWeight(proof, await client.list());
+        outcome = proof.problem || proof.lb === null
+          ? decideWeight(proof, {}) : decideWeight(proof, await client.list());
         if (outcome.result === "written") outcome = await client.insert(proof);
-      } catch { outcome = { result: "pending", reason: "Cairn unavailable or write not acknowledged; retry pending" }; }
-      this.db.query("UPDATE weights SET result = ?, reason = ? WHERE sha256 = ?").run(outcome.result, outcome.reason ?? null, proof.sha256);
+      } catch (error) {
+        outcome = error instanceof CairnHttpError
+          ? { result: error.status >= 400 && error.status < 500 && error.status !== 423 ? "needs-review" : "pending", reason: error.message }
+          : { result: "pending", reason: "Cairn unavailable or write not acknowledged; retry pending" };
+      }
+      const failed = outcome.result === "pending" || outcome.result === "needs-review";
+      const shouldLog = this.db.transaction(() => {
+        this.db.query("UPDATE weights SET result = ?, reason = ? WHERE sha256 = ?").run(outcome.result, outcome.reason ?? null, proof.sha256);
+        return failed && this.db.query("UPDATE weights SET failure_logged = 1 WHERE sha256 = ? AND failure_logged = 0").run(proof.sha256).changes > 0;
+      })();
+      if (shouldLog) this.log(`weigh-in ${proof.sha256} (${proof.day}): ${outcome.reason ?? outcome.result}`);
     }
   }
+}
+
+class CairnHttpError extends Error {
+  constructor(readonly status: number) { super(`Cairn HTTP ${status}`); }
 }
 
 /** Existing Cairn agent config: credentials stay in the consuming process. */
@@ -105,6 +121,7 @@ export function cairnWeightClient(configPath: string): WeightClient {
     token: string; endpoints: { url: string; headers?: Record<string, string> }[];
   };
   async function request(path: string, body?: unknown): Promise<any> {
+    let lastStatus: number | undefined;
     for (const endpoint of config.endpoints) {
       try {
         const res = await fetch(new URL(path, endpoint.url), {
@@ -112,10 +129,15 @@ export function cairnWeightClient(configPath: string): WeightClient {
           headers: { ...endpoint.headers, authorization: `Bearer ${config.token}`, "content-type": "application/json" },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(8000),
         });
-        if (!res.ok) continue;
+        if (res.status >= 400 && res.status < 500) throw new CairnHttpError(res.status);
+        if (!res.ok) { lastStatus = res.status; continue; }
         return await res.json();
-      } catch { /* Try the next configured relay route without exposing credentials. */ }
+      } catch (error) {
+        if (error instanceof CairnHttpError) throw error;
+        // Network failures may use another route to the same relay.
+      }
     }
+    if (lastStatus !== undefined) throw new CairnHttpError(lastStatus);
     throw new Error("Cairn weight endpoint unavailable");
   }
   return {
