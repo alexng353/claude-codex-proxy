@@ -1058,7 +1058,7 @@ describe("following another machine's gate", () => {
     expect(Object.keys(JSON.parse(await readFile(path, "utf8")).pending)).toHaveLength(1);
     classifierDown = false;
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
-    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!, path, Date.now() + 30_001);
     expect(JSON.parse(await readFile(path, "utf8")).pending).toEqual({});
   });
 
@@ -1107,6 +1107,62 @@ describe("following another machine's gate", () => {
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
     await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
     expect(classified).toBe(1);
+  });
+
+  test("backdated receipts cannot credit an obsolete slot or make stale EXIF fresh", async () => {
+    clock = at("2026-10-11", "06:00");
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    exif["backdated"] = at(DAY, "06:00");
+    const response = await asAuthority(() => handleRequest(new Request("http://localhost/hygiene/recheck", {
+      method: "POST", body: JSON.stringify({ url: photo("backdated"), at: at(DAY, "06:00") }),
+    })));
+    expect(response.ok).toBe(true);
+    const state = JSON.parse(await readFile(authorityState, "utf8"));
+    expect(Object.keys(state.filled)).toHaveLength(0);
+    expect(state.images[0].verdict).toBe("stale");
+    expect(state.images[0].at).toBe(new Date(clock).toISOString());
+  });
+
+  test("history photos remain delivered but only trailing user photos are rechecked", async () => {
+    stop();
+    const decision = await decide(request([env, user({ photo: "old-history" }), assistant("seen"), user({ photo: "fresh-outage" })]));
+    expect(JSON.stringify(decision)).toContain(photo("old-history"));
+    const store = JSON.parse(await readFile(join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json"), "utf8"));
+    expect(Object.values(store.pending).map((p: any) => p.url)).toEqual([photo("fresh-outage")]);
+  });
+
+  test("configured proxy auth is sent on queued checks and gate decisions", async () => {
+    stop();
+    await decide(request([env, user({ photo: "authenticated" })]));
+    serve();
+    const previous = process.env.PROXY_API_KEY;
+    process.env.PROXY_API_KEY = "test-only-proxy-key";
+    try {
+      const unauthenticated = await asAuthority(() => handleRequest(new Request("http://localhost/hygiene/recheck", {
+        method: "POST", body: JSON.stringify({ url: photo("authenticated"), at: clock }),
+      })));
+      expect(unauthenticated.status).toBe(401);
+      expect((await decide(request([env, user("still locked")]))).action).toBe("respond");
+      verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+      await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+      expect(classified).toBe(1);
+      expect((await decide(request([env, user("now answer")]))).action).toBe("forward");
+    } finally {
+      if (previous === undefined) delete process.env.PROXY_API_KEY;
+      else process.env.PROXY_API_KEY = previous;
+    }
+  });
+
+  test("a forged receipt cannot choose a past slot even without EXIF", async () => {
+    clock = at("2026-10-11", "06:00");
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    await asAuthority(() => handleRequest(new Request("http://localhost/hygiene/recheck", {
+      method: "POST", body: JSON.stringify({ url: photo("forged-receipt"), at: at(DAY, "06:00") }),
+    })));
+    const state = JSON.parse(await readFile(authorityState, "utf8"));
+    expect(state.images[0].at).toBe(new Date(clock).toISOString());
+    expect(state.images[0].slot).not.toContain(DAY);
+    expect(state.images[0].receivedAt).toBeUndefined();
   });
 
 });

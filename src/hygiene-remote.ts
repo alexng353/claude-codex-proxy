@@ -10,7 +10,8 @@
  * bytes for a later authority check and remember that they were delivered, so
  * recovery never removes them from the model's conversation history.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { imageMarker, isWithheld, partsOf, type GateState } from "./hygiene";
 import type { GateDecision } from "./hygiene-gate";
@@ -41,6 +42,12 @@ export function remoteGate(): string | null {
 export const loopResponse = () =>
   Response.json({ error: "hygiene gate loop: HYGIENE_GATE_REMOTE points at a follower" }, { status: 508 });
 
+/** Internal gate traffic uses the same configured bearer credential as local routes. */
+function authorityHeaders(): Record<string, string> {
+  const key = process.env.PROXY_API_KEY;
+  return { [HOP_HEADER]: "1", ...(key ? { authorization: `Bearer ${key}` } : {}) };
+}
+
 /**
  * The authority's decision for one Responses request, or null when it can't be
  * reached, including a timeout: an unknown decision must not block delivery.
@@ -49,7 +56,7 @@ export async function remoteGateRequest(base: string, request: ResponsesRequest)
   try {
     const reply = await fetch(`${base}/hygiene/gate`, {
       method: "POST",
-      headers: { "content-type": "application/json", [GATE_ONLY_HEADER]: "1", [HOP_HEADER]: "1" },
+      headers: { "content-type": "application/json", [GATE_ONLY_HEADER]: "1", ...authorityHeaders() },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(DECISION_TIMEOUT_MS),
     });
@@ -73,7 +80,7 @@ export async function remoteGateRequest(base: string, request: ResponsesRequest)
  */
 export async function passThrough(base: string, request: Request, url: URL): Promise<Response> {
   if (request.headers.has(HOP_HEADER)) return loopResponse();
-  const headers: Record<string, string> = { [HOP_HEADER]: "1" };
+  const headers: Record<string, string> = url.pathname.startsWith("/hygiene/api/") ? { [HOP_HEADER]: "1" } : authorityHeaders();
   for (const name of ["authorization", "content-type"]) {
     const value = request.headers.get(name);
     if (value) headers[name] = value;
@@ -99,7 +106,7 @@ export async function passThrough(base: string, request: Request, url: URL): Pro
 export async function fetchRemoteState(base: string, timeoutMs: number): Promise<GateState | null> {
   try {
     const reply = await fetch(`${base}/hygiene/state`, {
-      headers: { [HOP_HEADER]: "1" },
+      headers: authorityHeaders(),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!reply.ok) throw new Error(`answered ${reply.status}`);
@@ -123,20 +130,40 @@ function imageKey(url: string): string {
   return decoded ? sha256(decoded.bytes) : `url:${sha256(Buffer.from(url))}`;
 }
 
-type PendingPhoto = { url: string; at: number };
-type PhotoStore = { keys: string[]; checked: string[]; pending: Record<string, PendingPhoto>; withheld: Record<string, string> };
+type PendingPhoto = { url: string; at: number; attempts?: number; nextAttemptAt?: number };
+type PhotoStore = { keys: Set<string>; checked: Set<string>; dropped: Set<string>; pending: Record<string, PendingPhoto>; withheld: Record<string, string> };
 const memory = new Map<string, PhotoStore>();
 const unsaved = new Set<string>();
-const emptyStore = (): PhotoStore => ({ keys: [], checked: [], pending: {}, withheld: {} });
+const fingerprints = new Map<string, string>();
+const corrupt = new Set<string>();
+const MAX_PENDING_ENTRIES = 64;
+const MAX_PENDING_BYTES = 64 * 1024 * 1024;
+
+const fingerprint = (path: string) => {
+  const stat = statSync(path);
+  return `${stat.ino}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+};
+const privateDirectory = (path: string) => {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  chmodSync(dirname(path), 0o700);
+};
+const emptyStore = (): PhotoStore => ({ keys: new Set(), checked: new Set(), dropped: new Set(), pending: {}, withheld: {} });
 
 function readStore(path: string): PhotoStore {
+  let stamp: string | undefined;
   try {
     if (!existsSync(path)) return memory.get(path) ?? emptyStore();
+    stamp = fingerprint(path);
+    if (fingerprints.get(path) === stamp && memory.has(path)) return memory.get(path)!;
     const value = JSON.parse(readFileSync(path, "utf8"));
     const keys = value.keys ?? value.sha256;
     if (!Array.isArray(keys) || !keys.every((key) => typeof key === "string")) throw new Error("invalid key list");
-    const store: PhotoStore = { keys, checked: value.checked ?? [], pending: value.pending ?? {}, withheld: value.withheld ?? {} };
-    if (!Array.isArray(store.checked) || !store.checked.every((key) => typeof key === "string") ||
+    const checked = value.checked ?? [];
+    if (!Array.isArray(checked) || !checked.every((key) => typeof key === "string")) throw new Error("invalid checked list");
+    const dropped = value.dropped ?? [];
+    if (!Array.isArray(dropped) || !dropped.every((key) => typeof key === "string")) throw new Error("invalid dropped list");
+    const store: PhotoStore = { keys: new Set(keys), checked: new Set(checked), dropped: new Set(dropped), pending: value.pending ?? {}, withheld: value.withheld ?? {} };
+    if (
         !store.pending || typeof store.pending !== "object" || Array.isArray(store.pending) ||
         !Object.values(store.pending).every((photo) => photo && typeof photo.url === "string" && Number.isFinite(photo.at)) ||
         !store.withheld || typeof store.withheld !== "object" || Array.isArray(store.withheld) ||
@@ -144,16 +171,42 @@ function readStore(path: string): PhotoStore {
       throw new Error("invalid photo store");
     const held = unsaved.has(path) ? memory.get(path) : undefined;
     if (held) {
-      store.keys = [...new Set([...store.keys, ...held.keys])];
-      store.checked = [...new Set([...store.checked, ...held.checked])];
+      store.keys = new Set([...store.keys, ...held.keys]);
+      store.checked = new Set([...store.checked, ...held.checked]);
+      store.dropped = new Set([...store.dropped, ...held.dropped]);
       store.pending = { ...store.pending, ...held.pending };
-      for (const key of store.checked) delete store.pending[key];
+      for (const key of [...store.checked, ...store.dropped]) delete store.pending[key];
       store.withheld = { ...store.withheld, ...held.withheld };
     }
+    memory.set(path, store);
+    fingerprints.set(path, stamp);
+    corrupt.delete(path);
     return store;
   } catch (error) {
+    // Preserve unreadable bytes before any subsequent replacement, under the write lock.
+    if (existsSync(path)) corrupt.add(path);
     console.error("hygiene-gate: unchecked photo store unreadable; allowing images:", (error as Error).message);
-    return memory.get(path) ?? emptyStore();
+    const store = memory.get(path) ?? emptyStore();
+    if (stamp !== undefined) {
+      memory.set(path, store);
+      fingerprints.set(path, stamp);
+    }
+    return store;
+  }
+}
+
+function capPending(store: PhotoStore): void {
+  const entries = Object.entries(store.pending).sort(([, a], [, b]) => a.at - b.at);
+  let bytes = entries.reduce((sum, [, photo]) => sum + Buffer.byteLength(photo.url), 0);
+  let count = entries.length;
+  for (const [key, photo] of entries) {
+    if (count <= MAX_PENDING_ENTRIES && bytes <= MAX_PENDING_BYTES) break;
+    delete store.pending[key];
+    // Do not requeue an evicted image when history is replayed.
+    store.dropped.add(key);
+    count--;
+    bytes -= Buffer.byteLength(photo.url);
+    console.error(`hygiene-gate: dropped oldest pending photo ${key} (queue cap)`);
   }
 }
 
@@ -161,15 +214,23 @@ function readStore(path: string): PhotoStore {
 function updateStore(path: string, edit: (store: PhotoStore) => void): PhotoStore {
   let updated: PhotoStore | undefined;
   try {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    privateDirectory(path);
     return withLock(`${path}.lock`, () => {
       const store = readStore(path);
       edit(store);
+      capPending(store);
       updated = store;
       memory.set(path, store);
       const temporary = `${path}.${process.pid}.tmp`;
-      writeFileSync(temporary, JSON.stringify(store), { mode: 0o600 });
+      writeFileSync(temporary, JSON.stringify({ ...store, keys: [...store.keys], checked: [...store.checked], dropped: [...store.dropped] }), { mode: 0o600 });
+      if (corrupt.has(path) && existsSync(path)) {
+        const backup = `${path}.corrupt.${randomUUID()}`;
+        renameSync(path, backup);
+        console.error(`hygiene-gate: preserved unreadable photo store at ${backup}`);
+        corrupt.delete(path);
+      }
       renameSync(temporary, path);
+      fingerprints.set(path, fingerprint(path));
       unsaved.delete(path);
       return store;
     });
@@ -177,6 +238,7 @@ function updateStore(path: string, edit: (store: PhotoStore) => void): PhotoStor
     console.error("hygiene-gate: could not save unchecked photos:", (error as Error).message);
     const store = updated ?? memory.get(path) ?? readStore(path);
     if (!updated) edit(store);
+    capPending(store);
     memory.set(path, store);
     unsaved.add(path);
     return store;
@@ -184,31 +246,34 @@ function updateStore(path: string, edit: (store: PhotoStore) => void): PhotoStor
 }
 
 export function wasDelivered(url: string): boolean {
-  return readStore(uncheckedPath()).keys.includes(imageKey(url));
+  return readStore(uncheckedPath()).keys.has(imageKey(url));
 }
 
 /** Unknown photos pass through unchanged; known authority verdicts still apply. */
 export function deliverForOutage(request: ResponsesRequest, now = Date.now()): ResponsesRequest {
   if (!Array.isArray(request.input)) return request;
+  const input = request.input as ResponseInputItem[];
+  let freshStart = input.length;
+  while (freshStart > 0 && input[freshStart - 1]?.role === "user") freshStart--;
   const store = updateStore(uncheckedPath(), (store) => {
-    for (const item of request.input as ResponseInputItem[]) {
-      if (item.role !== "user") continue;
+    for (const [index, item] of input.entries()) {
+      if (item?.role !== "user") continue;
       for (const part of partsOf(item)) {
         if (part.type !== "input_image" || typeof part.image_url !== "string") continue;
         const key = imageKey(part.image_url);
-        if (store.withheld[key] && !store.keys.includes(key)) continue;
-        if (!store.keys.includes(key)) store.keys.push(key);
-        if (!store.checked.includes(key) && !store.pending[key])
+        if (store.withheld[key] && !store.keys.has(key)) continue;
+        if (!store.keys.has(key)) store.keys.add(key);
+        if (index >= freshStart && !store.checked.has(key) && !store.dropped.has(key) && !store.pending[key])
           store.pending[key] = { url: part.image_url, at: now };
       }
     }
   });
   return { ...request, input: request.input.map((item) => {
-    if (item.role !== "user" || !Array.isArray(item.content)) return item;
+    if (item?.role !== "user" || !Array.isArray(item?.content)) return item;
     const content = partsOf(item).flatMap((part) => {
       if (part.type !== "input_image" || typeof part.image_url !== "string") return [part];
       const key = imageKey(part.image_url);
-      if (store.withheld[key] && !store.keys.includes(key))
+      if (store.withheld[key] && !store.keys.has(key))
         return [{ type: "input_text", text: store.withheld[key] }];
       return [part, { type: "input_text", text: UNCHECKED_MARKER }];
     });
@@ -222,7 +287,7 @@ export function preserveDelivered(original: ResponsesRequest, rewritten: Respons
   const input = rewritten.input as ResponseInputItem[];
   const store = updateStore(uncheckedPath(), (store) => {
     (original.input as ResponseInputItem[]).forEach((item, index) => {
-      if (item.role !== "user") return;
+      if (item?.role !== "user") return;
       partsOf(item).forEach((part, offset) => {
         if (part.type !== "input_image" || typeof part.image_url !== "string") return;
         const replacement = partsOf(input[index])[offset];
@@ -233,10 +298,10 @@ export function preserveDelivered(original: ResponsesRequest, rewritten: Respons
   });
   return { ...rewritten, input: input.map((item, index) => {
     const source = (original.input as ResponseInputItem[])[index];
-    if (source?.role !== "user" || !Array.isArray(item.content)) return item;
+    if (source?.role !== "user" || !Array.isArray(item?.content)) return item;
     const content = [...partsOf(item)];
     partsOf(source).forEach((part, offset) => {
-      if (part.type === "input_image" && typeof part.image_url === "string" && store.keys.includes(imageKey(part.image_url)))
+      if (part.type === "input_image" && typeof part.image_url === "string" && store.keys.has(imageKey(part.image_url)))
         content[offset] = part;
     });
     return { ...item, content } as ResponseInputItem;
@@ -251,8 +316,9 @@ export function rememberVerdicts(state: GateState): void {
 }
 
 const retries = new Map<string, Promise<void>>();
+const missingEndpointLogged = new Set<string>();
 /** Acknowledged entries lose their bytes; delivered hashes remain for history. */
-export function retryUnchecked(base: string, path = uncheckedPath()): Promise<void> {
+export function retryUnchecked(base: string, path = uncheckedPath(), now = Date.now()): Promise<void> {
   const current = retries.get(path);
   if (current) return current;
   const work = (async () => {
@@ -260,22 +326,44 @@ export function retryUnchecked(base: string, path = uncheckedPath()): Promise<vo
     const lock = `${path}.retry.lock`;
     let held = false;
     try {
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      privateDirectory(path);
       held = tryLock(lock).held;
       if (!held) return;
-      for (const [key, photo] of Object.entries(readStore(path).pending)) {
-        const reply = await fetch(`${base}/hygiene/recheck`, {
-          method: "POST",
-          headers: { "content-type": "application/json", [HOP_HEADER]: "1" },
-          body: JSON.stringify(photo),
-          signal: AbortSignal.timeout(DECISION_TIMEOUT_MS),
-        });
-        if (!reply.ok) break;
-        const body = await reply.json() as { checked?: boolean };
-        if (body.checked !== true) break;
+      // Existing stores from older versions also need their limits applied before submission.
+      const store = updateStore(path, () => {});
+      for (const [key, photo] of Object.entries(store.pending)) {
+        if ((photo.nextAttemptAt ?? 0) > now) continue;
+        try {
+          const reply = await fetch(`${base}/hygiene/recheck`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...authorityHeaders() },
+            body: JSON.stringify({ url: photo.url, at: photo.at }),
+            signal: AbortSignal.timeout(DECISION_TIMEOUT_MS),
+          });
+          if (!reply.ok) {
+            if (reply.status !== 404 || !missingEndpointLogged.has(base))
+              console.error(`hygiene-gate: queued photo check HTTP ${reply.status} (${key}); backing off`);
+            if (reply.status === 404) missingEndpointLogged.add(base);
+            await reply.body?.cancel();
+          } else {
+            const body = await reply.json() as { checked?: boolean };
+            if (body.checked === true) {
+              updateStore(path, (store) => {
+                delete store.pending[key];
+                store.checked.add(key);
+              });
+              continue;
+            }
+            console.error(`hygiene-gate: queued photo ${key} not checked; backing off`);
+          }
+        } catch (error) {
+          console.error(`hygiene-gate: queued photo ${key} deferred:`, (error as Error).message);
+        }
         updateStore(path, (store) => {
-          delete store.pending[key];
-          if (!store.checked.includes(key)) store.checked.push(key);
+          const pending = store.pending[key];
+          if (!pending) return;
+          pending.attempts = Math.min((pending.attempts ?? 0) + 1, 7);
+          pending.nextAttemptAt = Math.max(now, Date.now()) + Math.min(30_000 * 2 ** (pending.attempts - 1), 30 * 60_000);
         });
       }
     } catch (error) {

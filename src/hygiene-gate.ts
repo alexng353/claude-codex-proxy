@@ -582,7 +582,7 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
   if (url.pathname === "/hygiene/recheck" && request.method === "POST") {
     let body: { url?: unknown; at?: unknown };
     try { body = await request.json(); } catch { return Response.json({ error: "invalid JSON" }, { status: 400 }); }
-    if (typeof body?.url !== "string" || typeof body.at !== "number" || !Number.isFinite(body.at) || body.at > deps.now() + EXIF_FUTURE_SLACK_MS)
+    if (typeof body?.url !== "string" || typeof body.at !== "number" || !Number.isFinite(body.at) || body.at < 0 || body.at > deps.now() + EXIF_FUTURE_SLACK_MS)
       return Response.json({ error: "invalid queued photo" }, { status: 400 });
     const photoUrl = body.url;
     const sentAt = body.at;
@@ -592,7 +592,11 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
       // URL photos are not classified by the existing gate either.
       if (!decoded) return Response.json({ checked: true });
       const hash = sha256(decoded.bytes);
-      const outcome = await checkImageRecorded(state, photoUrl, { thread: "outage", key: hash }, sentAt);
+      // A follower timestamp is not evidence of freshness or entitlement to a past slot.
+      const now = deps.now();
+      const outcome = await checkImageRecorded(state, photoUrl, { thread: "outage", key: hash }, now);
+      if (outcome.record && outcome.record.receivedAt === undefined && Math.abs(now - sentAt) <= 5 * 60_000)
+        outcome.record.receivedAt = new Date(sentAt).toISOString();
       if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
       return Response.json({ checked: !outcome.line?.startsWith("⚠") });
     });

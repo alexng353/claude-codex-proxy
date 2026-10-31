@@ -18,6 +18,8 @@ Forge now holds the only gate. Any other proxy follows it:
 - **Routes pass through.** `/hygiene/*` (status and debt rulings) and Cairn's
   `/hygiene/api/v1` are passed to the authority, which checks the Cairn token. The
   bearer token and content type go along, but proxy-hop headers do not.
+  Internal gate decisions, state reads and retries send `PROXY_API_KEY` as a
+  bearer token when configured; the authority applies its normal route auth.
 - **Plate activity** reads the authority's state from `GET /hygiene/state` (local
   callers only; 403 through Tailscale Serve), cached for 30 s.
 - **Authority unreachable or state unreadable.** Turns and unknown photos still
@@ -26,14 +28,21 @@ Forge now holds the only gate. Any other proxy follows it:
   non-success responses and decision timeouts all use this behavior. Status
   calls still answer 502. The follower waits at most 85 s for a decision, below
   the model router's 90 s.
-- **Recovery.** `hygiene-unchecked.json` retains each delivered photo's hash,
-  image URL/data URL and receipt time. The file is private (0600), atomically
-  replaced and locked across proxy copies. A background worker retries on startup
+- **Recovery.** `hygiene-unchecked.json` retains each delivered photo's hash.
+  Only images in the trailing user messages enter the pending queue, with their
+  image URL/data URL and receipt time. Older history images remain delivered
+  without being submitted for proof credit. The file is private (0600), in a
+  0700 directory, atomically replaced and locked across proxy copies. A background worker retries on startup
   and every 30 s, independently of chat requests. The authority's local-only
-  `POST /hygiene/recheck` uses its normal serialized proof checks, with the
-  original receipt time for slots and EXIF age. A stable hash-based source makes
-  retries after a lost acknowledgement idempotent. Classifier errors keep the
-  entry pending. Acknowledged entries lose their image data; delivered hashes
+  `POST /hygiene/recheck` uses its normal serialized proof checks and the
+  authority's current time for open slots and EXIF age. A follower timestamp
+  never establishes freshness or selects a past slot. Receipts within five
+  minutes of the authority's current time are retained as metadata only; older
+  receipts are ignored. A stable hash-based source makes retries after a lost
+  acknowledgement idempotent. Classifier and HTTP failures keep that entry
+  pending while later entries proceed. Each failed entry backs off from 30 s
+  to 30 minutes. HTTP status codes are logged; an old authority's 404 is logged
+  once per authority per process. Acknowledged entries lose their image data; delivered hashes
   remain so history never loses an image already shown to the model. URL images
   remain unclassified, matching the existing gate's inline-image-only checker.
 - **Existing verdicts.** Photos the authority already withheld still get their
@@ -45,6 +54,11 @@ Forge now holds the only gate. Any other proxy follows it:
   delivered during an outage remain visible even if their later check identifies
   a hygiene proof. A reachable authority can still lock a turn for missing proofs.
 - **Storage failures and upgrades.** An unreadable queue cannot block images.
+  Before replacement, a corrupt file is renamed to a `.corrupt.<uuid>` sibling.
+  Pending data is capped at 64 entries and 64 MiB of stored URL/data-URL bytes;
+  the oldest entries are dropped with a log. Their delivered hashes remain, and
+  dropped entries are not requeued by history replay. Store reads cache the
+  parsed data by file identity, mtime, ctime and size, with Sets for hash lookups.
   Failed writes retain pending photos in memory and are logged; a process crash
   before storage recovers can lose those unsaved photos. Legacy hash-only files
   release their old withheld images; their bytes can be queued when those images
