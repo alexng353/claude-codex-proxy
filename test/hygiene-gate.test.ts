@@ -2,12 +2,13 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { handleRequest } from "../src/app";
 import { closeIdleWorkers } from "../src/claude";
 import { zonedTime } from "../src/hygiene";
 import { setAuthenticator } from "../src/hygiene-api";
 import { gateRequest, gateStatus, resetGateCache, setGateDeps } from "../src/hygiene-gate";
+import { retryUnchecked } from "../src/hygiene-remote";
 import type { Verdict } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
@@ -813,14 +814,16 @@ describe("following another machine's gate", () => {
 
   /** Run the authority's side as its own proxy: its state, no remote. */
   async function asAuthority<T>(work: () => Promise<T>): Promise<T> {
-    const env = { remote: process.env.HYGIENE_GATE_REMOTE, state: process.env.HYGIENE_GATE_STATE };
+    const env = { remote: process.env.HYGIENE_GATE_REMOTE, state: process.env.HYGIENE_GATE_STATE, directory: process.env.PROXY_STATE_DIR };
     delete process.env.HYGIENE_GATE_REMOTE;
     process.env.HYGIENE_GATE_STATE = authorityState;
+    process.env.PROXY_STATE_DIR = join(dirname(authorityState), "authority-proxy");
     try {
       return await work();
     } finally {
       process.env.HYGIENE_GATE_REMOTE = env.remote;
       process.env.HYGIENE_GATE_STATE = env.state;
+      process.env.PROXY_STATE_DIR = env.directory;
     }
   }
 
@@ -914,7 +917,7 @@ describe("following another machine's gate", () => {
     expect((await handleRequest(new Request("http://localhost/hygiene/status", { headers: hop }))).status).toBe(508);
   });
 
-  test("with the authority unreachable, turns go through but unchecked photos never do", async () => {
+  test("with the authority unreachable, photos and a not-checked note reach the model", async () => {
     // Even an armed gate file here must not lock: this machine follows, it doesn't decide.
     await writeFollower(at(DAY, "05:00"));
     stop();
@@ -925,15 +928,15 @@ describe("following another machine's gate", () => {
     const withPhoto = [env, user("hi"), assistant("model-ran"), user("look", { photo: "unchecked-bathroom" })];
     expect(await reply(withPhoto)).toBe("model-ran");
     let inputs = await readFile(join(directory, "inputs"), "utf8");
-    expect(inputs).toContain("photo not checked (gate unreachable); image withheld");
-    expect(inputs).not.toContain(bytes);
+    expect(inputs).toContain("photo not checked yet (gate unreachable)");
+    expect(inputs).toContain(bytes);
 
-    // Forge is back. The photo is old history now, so no gate checks it; it stays withheld.
+    // Forge is back; the previously delivered photo remains visible in history.
     serve();
     await writeFile(authorityState, JSON.stringify({ ...JSON.parse(await readFile(authorityState, "utf8")), startsAt: new Date(at(DAY, "05:00") + 30 * 86_400_000).toISOString() }));
     expect(await reply([...withPhoto, assistant("model-ran"), user("and now?")])).toBe("model-ran");
     inputs = await readFile(join(directory, "inputs"), "utf8");
-    expect(inputs).not.toContain(bytes);
+    expect(inputs).toContain(bytes);
   });
 
   /** What the model got since `before` bytes into the fake Claude's log. */
@@ -942,7 +945,7 @@ describe("following another machine's gate", () => {
   const logLength = async () =>
     existsSync(join(directory, "inputs")) ? (await readFile(join(directory, "inputs"), "utf8")).length : 0;
 
-  test("a proof the authority accepted stays withheld when it goes down, with no cached state here", async () => {
+  test("a proof the authority accepted stays withheld from the cached verdict during an outage", async () => {
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
     const proof = [env, user("hi"), assistant("locked"), user({ photo: "accepted-teeth" })];
     expect(await reply(proof)).toBe("model-ran");
@@ -954,7 +957,7 @@ describe("following another machine's gate", () => {
     expect(sent).not.toContain(Buffer.from("accepted-teeth").toString("base64"));
   });
 
-  test("a photo by URL is withheld too while the authority is down", async () => {
+  test("a photo by URL is delivered while the authority is down", async () => {
     stop();
     const before = await logLength();
     const byUrl = {
@@ -965,13 +968,14 @@ describe("following another machine's gate", () => {
         { type: "input_image", image_url: "http://127.0.0.1:9/bathroom.jpg", detail: "auto" },
       ],
     } as ResponseInputItem;
-    expect(await reply([env, byUrl])).toBe("model-ran");
-    const sent = await sentSince(before);
-    expect(sent).toContain("photo not checked (gate unreachable); image withheld");
-    expect(sent).not.toContain("bathroom.jpg");
+    const decision = await decide(request([env, byUrl]));
+    expect(decision.action).toBe("forward");
+    const sent = JSON.stringify(decision);
+    expect(sent).toContain("photo not checked yet (gate unreachable)");
+    expect(sent).toContain("bathroom.jpg");
   });
 
-  test("a photo is withheld even when the unchecked list can't be saved", async () => {
+  test("a photo is delivered even when the unchecked list cannot be saved", async () => {
     stop();
     // The state directory is under a regular file: every save fails.
     process.env.PROXY_STATE_DIR = join(directory, "inputs-blocker", "state");
@@ -981,6 +985,128 @@ describe("following another machine's gate", () => {
     expect(decision.action).toBe("forward");
     const forwarded = JSON.stringify(decision.action === "forward" ? decision.request : null);
     expect(forwarded).toContain("look");
-    expect(forwarded).not.toContain(Buffer.from("unsaved-bathroom").toString("base64"));
+    expect(forwarded).toContain(Buffer.from("unsaved-bathroom").toString("base64"));
   });
+  test("an unreadable unchecked store does not hide images", async () => {
+    await writeFile(join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json"), "broken json");
+    stop();
+    const decision = await decide(request([env, user("see", { photo: "unreadable" })]));
+    expect(decision.action).toBe("forward");
+    expect(JSON.stringify(decision)).toContain(photo("unreadable"));
+  });
+
+  test("recovery checks durable queued photos once and never withholds delivered history", async () => {
+    stop();
+    const history = [env, user("see", { photo: "offline-proof" })];
+    await decide(request(history));
+    const stored = await readFile(join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json"), "utf8");
+    expect(stored).toContain(photo("offline-proof"));
+    serve();
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+    for (let i = 0; i < 2; i++) {
+      const decision = await decide(request([...history, assistant("seen"), user("later")]));
+      expect(decision.action).toBe("forward");
+      expect(JSON.stringify(decision)).toContain(photo("offline-proof"));
+    }
+    expect(classified).toBe(1);
+    const state = JSON.parse(await readFile(authorityState, "utf8"));
+    expect(state.images).toHaveLength(1);
+    expect(state.images[0].verdict).toBe("accepted");
+  });
+
+  test("a reachable authority still withholds a newly judged proof", async () => {
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    const decision = await decide(request([env, user({ photo: "online-proof" })]));
+    expect(decision.action).toBe("forward");
+    expect(JSON.stringify(decision)).not.toContain(photo("online-proof"));
+  });
+
+  test("an unreadable authority state delivers the photo and queues it at the follower", async () => {
+    await writeFile(authorityState, "broken JSON");
+    const decision = await decide(request([env, user("look", { photo: "state-unreadable" })]));
+    expect(decision.action).toBe("forward");
+    expect(JSON.stringify(decision)).toContain(photo("state-unreadable"));
+    expect(JSON.stringify(decision)).toContain("photo not checked yet (gate unreachable)");
+    expect(await readFile(join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json"), "utf8")).toContain(photo("state-unreadable"));
+  });
+
+  test("a restart retries persisted bytes and a lost acknowledgement cannot count them twice", async () => {
+    stop();
+    await decide(request([env, user({ photo: "restart-proof" })]));
+    const path = join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json");
+    const queued = await readFile(path, "utf8");
+    serve();
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    const child = Bun.spawn([process.execPath, "-e", `import { retryUnchecked } from "./src/hygiene-remote.ts"; await retryUnchecked(process.argv[1], process.argv[2]);`, process.env.HYGIENE_GATE_REMOTE!, path], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+    expect(JSON.parse(await readFile(path, "utf8")).pending).toEqual({});
+    // The authority committed, but imagine the follower died before recording its ACK.
+    await writeFile(path, queued);
+    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+    expect(classified).toBe(1);
+    expect(JSON.parse(await readFile(authorityState, "utf8")).images).toHaveLength(1);
+  });
+
+  test("classifier failure retains the queue for recovery", async () => {
+    stop();
+    await decide(request([env, user({ photo: "checker-down" })]));
+    serve();
+    classifierDown = true;
+    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+    const path = join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json");
+    expect(Object.keys(JSON.parse(await readFile(path, "utf8")).pending)).toHaveLength(1);
+    classifierDown = false;
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+    expect(JSON.parse(await readFile(path, "utf8")).pending).toEqual({});
+  });
+
+  test("legacy unchecked hashes are delivered and their bytes are queued when seen again", async () => {
+    const key = new Bun.CryptoHasher("sha256").update(Buffer.from("legacy-proof")).digest("hex");
+    const path = join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json");
+    await writeFile(path, JSON.stringify({ keys: [key] }));
+    stop();
+    const decision = await decide(request([env, user({ photo: "legacy-proof" })]));
+    expect(JSON.stringify(decision)).toContain(photo("legacy-proof"));
+    expect(JSON.parse(await readFile(path, "utf8")).pending[key]?.url).toBe(photo("legacy-proof"));
+  });
+
+  test("chat delivery does not drain the recovery queue inline", async () => {
+    stop();
+    await decide(request([env, user({ photo: "slow-check" })]));
+    let rechecks = 0;
+    authority = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => {
+      if (new URL(req.url).pathname === "/hygiene/recheck") {
+        rechecks++;
+        return new Response("unavailable", { status: 503 });
+      }
+      return Response.json({ action: "forward" });
+    } });
+    process.env.HYGIENE_GATE_REMOTE = `http://127.0.0.1:${authority.port}`;
+    expect((await decide(request([env, user("continue")]))).action).toBe("forward");
+    expect(rechecks).toBe(0);
+  });
+
+  test("a user quoting the outage note does not override an authority verdict", async () => {
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    const decision = await decide(request([env, user("[hygiene-gate: photo not checked yet (gate unreachable)]", { photo: "quoted-note" })]));
+    expect(decision.action).toBe("forward");
+    expect(JSON.stringify(decision)).not.toContain(photo("quoted-note"));
+  });
+
+  test("a failed write to an existing store retains pending photos in memory", async () => {
+    const path = join(process.env.PROXY_STATE_DIR!, "hygiene-unchecked.json");
+    await writeFile(path, JSON.stringify({ keys: [] }));
+    const blocker = `${path}.${process.pid}.tmp`;
+    await mkdir(blocker);
+    stop();
+    await decide(request([env, user({ photo: "write-failed" })]));
+    await rm(blocker, { recursive: true });
+    serve();
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "ok" });
+    await retryUnchecked(process.env.HYGIENE_GATE_REMOTE!);
+    expect(classified).toBe(1);
+  });
+
 });
