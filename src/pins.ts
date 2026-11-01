@@ -22,6 +22,7 @@ import { baseConfigDir, isUnavailable, listAccounts, type Account } from "./acco
 import { threadsInFlight } from "./claude";
 import {
   listThreadAccounts,
+  threadAccountSnapshot,
   stateDir,
   writeThreadAccounts,
   type PinChange,
@@ -38,7 +39,7 @@ import { openUsageDb } from "./usage";
  *
  *   GET  /pins[?account=NAME]                             list
  *   POST /pins       {pins:[{threadId,account}], force?}  set one or many
- *   POST /pins       {op:"init",pins:[{threadId,account}]} initialize absent pins
+ *   POST /pins       {op:"init",pins:[{threadId,account}]} initialize never-pinned threads
  *   POST /pins/move  {from,to,threadIds?,idleForMs?,force?}  bulk move
  *   POST /pins/clear {threadIds}                          clear
  * Writes take `reason` (backup label) and `dryRun`.
@@ -381,7 +382,7 @@ type Write = {
   force: boolean;
   reason: string;
   warnings: string[];
-  plan: (current: ReadonlyMap<string, string>) => PinWrite[];
+  plan: (current: ReadonlyMap<string, string>, history: ReadonlySet<string>) => PinWrite[];
 };
 
 export type PinResult = {
@@ -402,14 +403,16 @@ function diff(current: ReadonlyMap<string, string>, writes: PinWrite[]): PinChan
 function apply(write: Write): PinResult {
   const { warnings } = write;
   if (write.dryRun) {
-    const current = new Map(listThreadAccounts().map((pin) => [pin.threadId, pin.account]));
-    const changes = diff(current, write.plan(current));
+    const snapshot = threadAccountSnapshot();
+    const current = new Map(snapshot.threadAccounts.map((pin) => [pin.threadId, pin.account]));
+    const history = new Set(snapshot.generations.map((row) => row.threadId));
+    const changes = diff(current, write.plan(current, history));
     checkChanges(changes, write.force, warnings);
     return { dryRun: true, backup: null, changed: changes.length, changes, warnings };
   }
   const result = writeThreadAccounts(
-    (current) => {
-      const writes = write.plan(current);
+    (current, history) => {
+      const writes = write.plan(current, history);
       checkChanges(diff(current, writes), write.force, warnings);
       return writes;
     },
@@ -452,10 +455,13 @@ export function setPins(input: unknown): PinResult {
     reason: label(fields.reason),
     warnings,
     // writeThreadAccounts calls this under its BEGIN IMMEDIATE transaction.
-    plan: (current) => {
+    plan: (current, history) => {
       if (!initialize) return edits;
-      pins = edits.map(edit => ({ ...edit, account: current.get(edit.threadId) ?? edit.account }));
-      return edits.filter(edit => !current.has(edit.threadId));
+      pins = edits.map(edit => ({
+        ...edit,
+        account: current.get(edit.threadId) ?? (history.has(edit.threadId) ? null : edit.account),
+      }));
+      return edits.filter(edit => !current.has(edit.threadId) && !history.has(edit.threadId));
     },
   });
   return initialize ? { ...result, pins } : result;
