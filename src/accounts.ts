@@ -390,6 +390,7 @@ export function accountStatus() {
     const served = lastTurn.get(account.name);
     return {
       name: account.name,
+      weeklyCap: weeklyCap(account.name) ?? 100,
       dir: account.dir,
       active: account.name === active,
       lastTurnAt: served ? new Date(served).toISOString() : null,

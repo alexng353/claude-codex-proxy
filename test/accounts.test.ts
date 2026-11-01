@@ -264,3 +264,17 @@ test("an initial pin write failure blocks inference", async () => {
     db.close();
   }
 });
+
+test("accounts exposes effective weekly caps without process environment", async () => {
+  const previous = process.env.CLAUDE_ACCOUNT_WEEKLY_CAP;
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "default=80";
+  try {
+    const response = await handleRequest(new Request("http://localhost/accounts"));
+    const body = await response.json() as { accounts: { name: string; weeklyCap: number }[] };
+    expect(body.accounts.find(a => a.name === "default")?.weeklyCap).toBe(80);
+    expect(body.accounts.find(a => a.name === "spare")?.weeklyCap).toBe(100);
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_ACCOUNT_WEEKLY_CAP;
+    else process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = previous;
+  }
+});
