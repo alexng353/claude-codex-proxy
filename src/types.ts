@@ -34,6 +34,9 @@ export type ResponseInputItem = {
   namespace?: string;
   /** Opaque on OpenAI compaction items; see request.ts for the proxy's own. */
   encrypted_content?: string;
+  /** Multi-agent v2 `agent_message` items: the agent paths of sender and recipient. */
+  author?: string;
+  recipient?: string;
   proxy_image_paths?: string[];
 };
 

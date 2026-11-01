@@ -1,3 +1,6 @@
+import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   ResponseContentPart,
   ResponseInputItem,
@@ -173,7 +176,97 @@ export const textFromContent = (
     .join("\n");
 };
 
+/**
+ * Multi-agent v2 (Codex 0.163; the catalog's `multi_agent_version: v2`, every
+ * GPT-6 model) hands a child its task as an `agent_message`: a plaintext header
+ * ("Message Type ... Task name ... Payload:") and then the parent's message as
+ * `encrypted_content`. A GPT parent's message is encrypted by OpenAI, for
+ * OpenAI models; nothing on this machine can read it. Dropping that part, as the
+ * generic path does with every non-text part, gave a Claude child an empty task
+ * (comb reviewers from Oct 31 on: some asked again, one guessed a target and ran
+ * tests under a no-tests prompt).
+ *
+ * So an encrypted part becomes either the orchestrator's task file or a plain
+ * statement that the task cannot be read. The task file is the one plaintext
+ * channel: the canonical task name rides in the header, so an orchestrator that
+ * names a task `<label>__<nonce>` and writes `<AGENT_TASKS_DIR>/<label>__<nonce>.md`
+ * gets its task through. The nonce keeps a stale file from another run with a
+ * generic name (`correctness_claude`) from ever being read as this task.
+ */
+const AGENT_TASK_NAME = /^[a-z0-9_]{1,64}__[a-z0-9]{8,32}$/;
+const AGENT_TASK_MAX_BYTES = 512 * 1024;
+const AGENT_TASK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export const agentTasksDir = (): string =>
+  process.env.AGENT_TASKS_DIR || join(homedir(), ".cache", "agent-tasks");
+
+type TaskFile = { path: string; text?: string; refused?: string };
+
+/** The task file for a canonical task name, read only if it is this user's own, fresh, regular file. */
+export function readAgentTaskFile(taskName: string): TaskFile | undefined {
+  const leaf = taskName.split("/").filter(Boolean).at(-1) ?? "";
+  if (!AGENT_TASK_NAME.test(leaf)) return undefined;
+  const path = join(agentTasksDir(), `${leaf}.md`);
+  let fd: number;
+  try {
+    // O_NOFOLLOW: a symlink planted at the path is refused, not followed.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    return { path, refused: code === "ENOENT" ? "it does not exist" : `it cannot be opened (${code})` };
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return { path, refused: "it is not a regular file" };
+    if (typeof process.getuid === "function" && stat.uid !== process.getuid())
+      return { path, refused: "another user owns it" };
+    if (stat.mode & 0o022) return { path, refused: "others can write to it" };
+    if (stat.size > AGENT_TASK_MAX_BYTES) return { path, refused: "it is larger than 512 KiB" };
+    if (Date.now() - stat.mtimeMs > AGENT_TASK_MAX_AGE_MS)
+      return { path, refused: "it is more than a day old" };
+    const text = readFileSync(fd, "utf8");
+    return text.trim() ? { path, text } : { path, refused: "it is empty" };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+const agentMessageHeaderName = (text: string): string | undefined =>
+  /^Task name: (\S+)$/m.exec(text)?.[1];
+
+function serializeAgentMessage(item: ResponseInputItem): string {
+  const parts = typeof item.content === "string" ? [{ type: "input_text", text: item.content }] : (item.content ?? []);
+  const plain = parts
+    .filter((part) => ["input_text", "output_text", "text"].includes(part.type ?? ""))
+    .map((part) => part.text ?? "")
+    .join("");
+  const encrypted = parts.some((part) => part.type === "encrypted_content");
+  const from = typeof item.author === "string" ? item.author : "another agent";
+  const to = typeof item.recipient === "string" ? item.recipient : undefined;
+  const lines = [`<agent_message from=${JSON.stringify(from)}${to ? ` to=${JSON.stringify(to)}` : ""}>`, plain.replace(/\n+$/, "")];
+  if (encrypted) {
+    const taskName = to ?? agentMessageHeaderName(plain) ?? "";
+    const file = readAgentTaskFile(taskName);
+    if (file?.text !== undefined) {
+      lines.push(
+        `[The sender's payload was encrypted for OpenAI models, so the proxy read the sender's task file ${file.path} in its place. Its text follows and is your task.]`,
+        file.text.replace(/\n+$/, ""),
+      );
+    } else {
+      const where = file
+        ? ` The task file ${file.path} was not used: ${file.refused}.`
+        : ` No task file was looked up: the task name has no "__<nonce>" suffix.`;
+      lines.push(
+        `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${where} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${taskName || "unnamed task"})."]`,
+      );
+    }
+  }
+  lines.push("</agent_message>");
+  return lines.join("\n");
+}
+
 export const serializeItem = (item: ResponseInputItem): string => {
+  if (item.type === "agent_message") return serializeAgentMessage(item);
   if (item.type === "compaction_trigger") {
     return `<user>\n${SUMMARIZATION_PROMPT}\n\nPut the whole summary in text and leave tool_calls empty.\n</user>`;
   }
