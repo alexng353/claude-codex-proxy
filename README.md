@@ -185,7 +185,7 @@ Edits take effect on each thread's next turn, with no restart. A turn reads its 
 
 ### Per-chat agent names
 
-A chat can have its own name. Then each turn tells the model `You are NAME, powered by MODEL (VENDOR).`, for example `You are Bubble, Alex's coordinator, powered by Claude Opus 5.5 (Anthropic).` The model and vendor come from the model that serves the request (`src/agent-identity.ts`). If the proxy cannot name the model, it adds no line. Chats without a name do not change.
+A chat can have its own name. Then each turn tells the model `You are NAME, powered by MODEL (VENDOR).`, for example `You are Bubble, Alex's coordinator, powered by Claude Opus 5.5 (Anthropic).` The model and vendor come from the model that serves the request (`src/agent-identity.ts`). If the model ID does not name exactly one model, the proxy adds no line. Examples are an alias without a version (`opus`), a dated snapshot, or a `-latest` pointer. Chats without a name do not change.
 
 - **Claude:** the line starts the system prompt file. Claude Code still sends its own fixed first line (`You are a Claude agent, built on Anthropic's Claude Agent SDK.`) before it. The subscription accepts only a few such prefixes, so the proxy cannot replace that line. A name change starts a new worker on the next turn.
 - **GPT (through the model router):** the router already sends each GPT turn to `/hygiene/gate`. There the line replaces the first sentence of Codex's instructions (`You are Codex, an agent based on GPT-6.`), or goes in front if that sentence is missing. The router needs no change.
@@ -199,9 +199,9 @@ curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":"Bubble,
 curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":null}'   # clear
 ```
 
-A name has 1 to 80 characters on one line, with no `<` or `>` and no spaces at the ends. Today exposes the same API as the MCP tools `get_agent_name` and `set_agent_name`, and as `today-daemon get-agent-name '{"threadId":"T"}'` and `today-daemon set-agent-name '{"threadId":"T","name":"Bubble"}'`. These accept a Today or Codex thread id.
+A name has 1 to 80 code points. It starts with a letter or digit and holds only letters, digits, spaces and `' , & -`. It cannot end with a space. Because `.`, `:`, `(` and `)` are refused, a name cannot end the sentence and start an instruction, and it cannot claim a model. Today's `agent_identity.rs` checks the same rule.
 
-A name is stored under the Codex thread that the chat drives at the time it is set. If Today replaces that engine thread, set the name again.
+Today owns the names. It keeps each name under its own thread id and writes it here through the MCP tools `get_agent_name` and `set_agent_name`. The CLI `today-daemon get-agent-name` can read a name, but only Alex's windows, Today's own chat tools and the engine's own MCP process of a full-access chat can set one. A chat cannot rename itself. When Today replaces a chat's engine thread, it posts the name for the new Codex thread and clears the old one.
 
 ### Live usage dashboard
 

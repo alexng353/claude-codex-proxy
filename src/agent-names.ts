@@ -44,7 +44,7 @@ export async function handleAgentNamesRoute(request: Request, url: URL, peer?: s
       return fail(`Invalid thread id ${JSON.stringify(body.threadId)}`, 400);
     if (!("name" in body)) return fail("name is required (null clears it)", 400);
     if (body.name !== null && !validAgentName(body.name))
-      return fail("name must be 1 to 80 characters on one line, without < or > or surrounding spaces", 400);
+      return fail("name must be 1 to 80 letters, digits, spaces and ' , & -, starting with a letter or digit and not ending in a space", 400);
     const name = body.name === null ? undefined : (body.name as string);
     const previous = setThreadAgentName(body.threadId, name);
     return Response.json({ threadId: body.threadId, name: name ?? null, previous: previous ?? null });

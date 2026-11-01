@@ -22,27 +22,33 @@ import type { ResponsesRequest } from "./types";
 
 export type ModelIdentity = { name: string; vendor: string };
 
-const NAME = /^[^\u0000-\u001f\u007f<>]{1,80}$/;
+// Letters, digits, spaces and ' , & - only, starting with a letter or digit, at most
+// 80 code points. No '.', ':', '(' or ')': a name can't end the sentence and start
+// an instruction, or claim a model of its own. Today's agent_identity.rs uses the
+// same rule and counts the same way.
+const NAME = /^[\p{L}\p{N}][\p{L}\p{N} ',&-]{0,79}$/u;
 
-/** A name fits on one line, has no markup, and no padding. */
+/** See NAME; a trailing space is refused too. */
 export function validAgentName(name: unknown): name is string {
-  return typeof name === "string" && NAME.test(name) && name.trim() === name;
+  return typeof name === "string" && NAME.test(name) && !name.endsWith(" ");
 }
 
 const capital = (word: string) => (word ? word[0].toUpperCase() + word.slice(1) : word);
 
-/** The display name and vendor of an exact model id, or undefined when unknown. */
+/**
+ * The display name and vendor of an exact model id. Undefined for anything that
+ * does not name one model: unknown ids, versionless aliases (opus), dated
+ * snapshots (claude-opus-4-20250514) and pointers (gpt-...-latest).
+ */
 export function modelIdentity(model: string): ModelIdentity | undefined {
   if (!/^[a-z0-9.-]+$/.test(model)) return undefined;
-  if (["opus", "sonnet", "haiku"].includes(model))
-    return { name: `Claude ${capital(model)}`, vendor: "Anthropic" };
-  const claude = /^claude-([a-z]+)-(\d+)(?:-(\d+))?$/.exec(model);
+  const claude = /^claude-([a-z]+)-(\d{1,2})(?:-(\d{1,2}))?$/.exec(model);
   if (claude) {
     const version = claude[3] === undefined ? claude[2] : `${claude[2]}.${claude[3]}`;
     return { name: `Claude ${capital(claude[1])} ${version}`, vendor: "Anthropic" };
   }
-  // OpenAI's own spelling: gpt-6.1-sol is GPT-6.1-Sol.
-  if (/^gpt-[a-z0-9]/.test(model))
+  // OpenAI's own spelling: gpt-6.1-sol is GPT-6.1-Sol. A version, then words only.
+  if (/^gpt-\d{1,2}(?:\.\d{1,2})?(?:-[a-z]+)*$/.test(model) && !model.endsWith("-latest"))
     return { name: `GPT-${model.slice(4).split("-").map(capital).join("-")}`, vendor: "OpenAI" };
   if (/^abliterated-model(?:-[a-z0-9-]+)?$/.test(model))
     return { name: model, vendor: "abliteration.ai" };
@@ -83,7 +89,8 @@ export function withAgentIdentity(request: ResponsesRequest): ResponsesRequest {
   return line ? { ...clean, agentIdentity: line } : clean;
 }
 
-const CODEX_SENTENCE = /^You are Codex\b[^.\n]*\./;
+// To the first period that ends the sentence: "based on GPT-6.1. You" keeps "6.1".
+const CODEX_SENTENCE = /^You are Codex\b[^\n]*?\.(?=\s|$)/;
 
 /** GPT route: the line goes into the instructions OpenAI receives. */
 export function withAgentInstructions(request: ResponsesRequest): ResponsesRequest {

@@ -670,7 +670,8 @@ function inputItems(request: ResponsesRequest): ResponseInputItem[] {
 const sha256 = (value: string) =>
   new Bun.CryptoHasher("sha256").update(value).digest("hex");
 
-function sessionKey(request: ResponsesRequest): SessionKey {
+/** Exported for tests: the key stored sessions are found by. */
+export function sessionKey(request: ResponsesRequest): SessionKey {
   const instructions = request.instructions ?? "";
   return {
     model: request.model,
