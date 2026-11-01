@@ -157,6 +157,8 @@ curl -s "${j[@]}" 127.0.0.1:3456/pins/move -d '{"from":"hinson","to":"default","
 curl -s "${j[@]}" 127.0.0.1:3456/pins/clear -d '{"threadIds":["T"]}'
 ```
 
+Automatic callers can send `POST /pins` with `{"op":"init","pins":[{"threadId":"T","account":"default"}]}`. This initializes only threads with neither a current pin nor any retained pin generation, checking both and writing inside the same immediate transaction. The response's `pins` array reports the resulting accounts, including unchanged existing pins and `account: null` for a previously cleared pin. Concurrent or delayed initialization cannot overwrite a newer routing or failover pin or resurrect an explicit clear. Omitting `op` retains the existing unconditional set behavior; old proxies reject the unknown `op` field before writing, so callers must never downgrade a rejected init to a set.
+
 A write is refused (409) in these cases:
 
 - An account it moves threads onto or off does not share transcripts. Its `projects/<cwd slug>` must be a link to the default account's folder; otherwise the next resume fails with "No conversation found with session ID". Run step 1 of the claude-account-move skill first.

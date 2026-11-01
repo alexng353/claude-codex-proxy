@@ -143,6 +143,16 @@ export type PinSnapshot = {
   generations: Array<{ threadId: string; generation: number }>;
 };
 
+/** Current pins and durable edit history, including generations retained after clear. */
+export function threadAccountSnapshot(): PinSnapshot {
+  return {
+    threadAccounts: listThreadAccounts(),
+    generations: (open().query("SELECT thread_id, generation FROM thread_account_generations ORDER BY thread_id")
+      .all() as Array<{ thread_id: string; generation: number }>)
+      .map((row) => ({ threadId: row.thread_id, generation: row.generation })),
+  };
+}
+
 /**
  * Apply pin edits in one IMMEDIATE transaction. `plan` runs inside it, so a
  * bulk move selects from the same snapshot it writes. When anything changes,
@@ -151,16 +161,17 @@ export type PinSnapshot = {
  * every edit. Each edit bumps the thread's generation.
  */
 export function writeThreadAccounts(
-  plan: (current: ReadonlyMap<string, string>) => PinWrite[],
+  plan: (current: ReadonlyMap<string, string>, history: ReadonlySet<string>) => PinWrite[],
   backup: (snapshot: PinSnapshot) => string,
 ): { changes: PinChange[]; backup: string | null } {
   const database = open();
   const run = database.transaction(() => {
-    const before = listThreadAccounts();
-    const current = new Map(before.map((row) => [row.threadId, row.account]));
+    const snapshot = threadAccountSnapshot();
+    const current = new Map(snapshot.threadAccounts.map((row) => [row.threadId, row.account]));
+    const history = new Set(snapshot.generations.map((row) => row.threadId));
     const working = new Map(current);
     const changes: PinChange[] = [];
-    for (const write of plan(current)) {
+    for (const write of plan(current, history)) {
       const from = working.get(write.threadId) ?? null;
       if (from === write.account) continue;
       if (write.account === null) working.delete(write.threadId);
@@ -168,10 +179,7 @@ export function writeThreadAccounts(
       changes.push({ threadId: write.threadId, from, to: write.account });
     }
     if (!changes.length) return { changes, backup: null };
-    const generations = (database.query("SELECT thread_id, generation FROM thread_account_generations ORDER BY thread_id")
-      .all() as Array<{ thread_id: string; generation: number }>)
-      .map((row) => ({ threadId: row.thread_id, generation: row.generation }));
-    const saved = backup({ threadAccounts: before, generations });
+    const saved = backup(snapshot);
     const upsert = database.query(`INSERT INTO thread_accounts (thread_id, account) VALUES (?, ?)
       ON CONFLICT(thread_id) DO UPDATE SET account = excluded.account`);
     const remove = database.query("DELETE FROM thread_accounts WHERE thread_id = ?");
