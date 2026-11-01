@@ -199,9 +199,11 @@ curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":"Bubble,
 curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":null}'   # clear
 ```
 
-A name has 1 to 80 code points. It starts with a letter or digit and holds only letters, digits, spaces and `' , & -`. It cannot end with a space. Because `.`, `:`, `(` and `)` are refused, a name cannot end the sentence and start an instruction, and it cannot claim a model. Today's `agent_identity.rs` checks the same rule.
+A name has 1 to 40 code points. It starts with a letter or digit and holds only letters, digits, spaces and `' , & -`. It cannot end with a space. Because `.`, `:`, `(` and `)` are refused, a name cannot end the sentence and start an instruction. The whole words `powered`, `model`, `GPT`, `Claude`, `OpenAI` and `Anthropic` are refused in any case, so a name cannot say which model or vendor it runs on; only the line itself says that. Today's `agent_identity.rs` checks the same rule.
 
-Today owns the names. It keeps each name under its own thread id and writes it here through the MCP tools `get_agent_name` and `set_agent_name`. The CLI `today-daemon get-agent-name` can read a name, but only Alex's windows, Today's own chat tools and the engine's own MCP process of a full-access chat can set one. A chat cannot rename itself. When Today replaces a chat's engine thread, it posts the name for the new Codex thread and clears the old one.
+Today owns the names. It keeps each name under its own thread id and writes it here through the MCP tools `get_agent_name` and `set_agent_name`. The CLI `today-daemon get-agent-name` can read a name. Today's tools let only Today's own chat tools and the engine's own MCP process of a full-access chat set a name, and never for the calling chat itself. Today keeps a name only after this API has accepted it. When Today replaces a chat's engine thread, it posts the name for the new Codex thread and clears the old one.
+
+This is a guard in Today's tools, not a security boundary. A process that can read this machine's `pins.token` can write `/agent-names` directly, and a full-access chat can read it. Today's `machine_read_file` refuses that file, but a shell can still read it.
 
 ### Live usage dashboard
 

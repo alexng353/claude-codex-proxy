@@ -23,14 +23,21 @@ import type { ResponsesRequest } from "./types";
 export type ModelIdentity = { name: string; vendor: string };
 
 // Letters, digits, spaces and ' , & - only, starting with a letter or digit, at most
-// 80 code points. No '.', ':', '(' or ')': a name can't end the sentence and start
-// an instruction, or claim a model of its own. Today's agent_identity.rs uses the
-// same rule and counts the same way.
-const NAME = /^[\p{L}\p{N}][\p{L}\p{N} ',&-]{0,79}$/u;
+// 40 code points. No '.', ':', '(' or ')', so a name can't end the sentence and
+// start an instruction. The whole words in MODEL_WORDS are refused too, so a name
+// can't say which model or vendor it runs on: only the line itself says that.
+// Today's agent_identity.rs uses the same rule and counts the same way.
+const NAME = /^[\p{L}\p{N}][\p{L}\p{N} ',&-]{0,39}$/u;
+const MODEL_WORDS = new Set(["powered", "model", "gpt", "claude", "openai", "anthropic"]);
 
-/** See NAME; a trailing space is refused too. */
+/** See NAME and MODEL_WORDS (case-insensitive, whole words); no trailing space. */
 export function validAgentName(name: unknown): name is string {
-  return typeof name === "string" && NAME.test(name) && !name.endsWith(" ");
+  return (
+    typeof name === "string" &&
+    NAME.test(name) &&
+    !name.endsWith(" ") &&
+    !name.split(/[^\p{L}\p{N}]+/u).some((word) => MODEL_WORDS.has(word.toLowerCase()))
+  );
 }
 
 const capital = (word: string) => (word ? word[0].toUpperCase() + word.slice(1) : word);
