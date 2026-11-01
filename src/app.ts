@@ -1,3 +1,4 @@
+import { handlePredictionRoute } from "./prediction-route";
 import { accountStatus, usageHeaders } from "./accounts";
 import { withAgentInstructions } from "./agent-identity";
 import { handleAgentNamesRoute } from "./agent-names";
@@ -121,6 +122,8 @@ export async function handleRequest(request: Request, peer?: string): Promise<Re
   if (pins) return pins;
   const agentNames = await handleAgentNamesRoute(request, url, peer);
   if (agentNames) return agentNames;
+  const prediction = await handlePredictionRoute(request, url, peer);
+  if (prediction) return prediction;
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });

@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the private Today composer prediction corpus
+ConditionHost=forge
+[Service]
+Type=oneshot
+UMask=0077
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/today
+ExecStart=/usr/bin/flock --nonblock --no-fork %h/.local/state/today/prediction-refresh.lock %h/.bun/bin/bun %h/.local/share/claude-codex-proxy/scripts/prediction-refresh.ts
+TimeoutStartSec=90

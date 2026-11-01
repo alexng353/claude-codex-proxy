@@ -1,0 +1,8 @@
+[Unit]
+Description=Incrementally copy Alex's safe replies into the local prediction index
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
