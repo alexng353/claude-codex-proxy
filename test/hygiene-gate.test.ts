@@ -7,7 +7,7 @@ import { handleRequest } from "../src/app";
 import { closeIdleWorkers } from "../src/claude";
 import { zonedTime } from "../src/hygiene";
 import { setAuthenticator } from "../src/hygiene-api";
-import { gateRequest, gateStatus, resetGateCache, setGateDeps } from "../src/hygiene-gate";
+import { flushWakes, gateRequest, gateStatus, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
 import { retryUnchecked } from "../src/hygiene-remote";
 import type { Verdict } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
@@ -25,6 +25,9 @@ let clock = at(DAY, "06:00");
 let verdicts: Verdict[] = [];
 let classified = 0;
 let classifierDown = false;
+let classifyBlock: Promise<void> | null = null;
+let wakes: Array<{ id: string; thread: string; text: string }> = [];
+let wakeResults: Array<"sent" | "retry" | "failed"> = [];
 let exif: Record<string, number | null> = {};
 let hashes: Record<string, string> = {};
 const saved: Record<string, string | undefined> = {};
@@ -72,13 +75,21 @@ beforeEach(async () => {
   verdicts = [];
   classified = 0;
   classifierDown = false;
+  classifyBlock = null;
+  wakes = [];
+  wakeResults = [];
   exif = {};
   hashes = {};
   setGateDeps({
     now: () => clock,
     baseUrl: "http://127.0.0.1:3456",
+    wake: async (wake) => {
+      wakes.push(wake);
+      return wakeResults.shift() ?? "sent";
+    },
     classify: async () => {
       classified++;
+      if (classifyBlock) await classifyBlock;
       if (classifierDown) throw new Error("down");
       return verdicts.shift() ?? { kind: "none", confidence: 0.9, reason: "no person" };
     },
@@ -524,6 +535,99 @@ describe("dthread messages", () => {
     expect((await decide(sent(delegation("[jarvis] BYPASS")))).action).toBe("forward");
     expect((await decide(sent(delegation("[jarvis] pause the music")))).action).toBe("forward");
     expect(gateStatus().bypass.count).toBe(0);
+  });
+});
+
+describe("held messages wake their chat when the gate unlocks", () => {
+  const OTHER = "01a15cc2-0000-7000-8000-000000000001";
+  const teeth = { kind: "teeth", confidence: 0.95, reason: "brushing" } as Verdict;
+  const cairnTeeth = (name: string) =>
+    submitProof({ mediaType: "image/jpeg", bytes: Buffer.from(name) }, { kind: "teeth", slot: (s) => s.endsWith("/morning-teeth") });
+
+  test("an unlock with held messages wakes each chat once, listing them", async () => {
+    clock = at(DAY, "06:20");
+    const held = await decide(request([env, user("what is this? https://x.com/a/status/1")], "composer", { prompt_cache_key: OTHER }));
+    expect(text(held)).toContain("gate armed");
+    clock = at(DAY, "06:40");
+    verdicts.push(teeth);
+    expect((await cairnTeeth("cairn-teeth")).result).toBe("pass");
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].thread).toBe(OTHER);
+    expect(wakes[0].text).toContain("06:20");
+    expect(wakes[0].text).toContain("what is this? https://x.com/a/status/1");
+    expect(wakes[0].id).toMatch(/^hygiene-unlock-/);
+    // A later flush or a retry of the same submission sends nothing more.
+    await flushWakes();
+    expect((await cairnTeeth("cairn-teeth")).result).toBe("pass");
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+  });
+
+  test("an unlock with nothing held posts nothing", async () => {
+    verdicts.push(teeth);
+    expect((await cairnTeeth("cairn-teeth")).result).toBe("pass");
+    await flushWakes();
+    expect(wakes).toHaveLength(0);
+  });
+
+  test("a message while a photo is being checked gets 'photo received, checking', not a re-arm", async () => {
+    let release!: () => void;
+    classifyBlock = new Promise((resolve) => (release = resolve));
+    verdicts.push(teeth);
+    const pending = cairnTeeth("cairn-teeth");
+    while (classified === 0) await Bun.sleep(5);
+    // Bounded: without the fast reply this message waits behind the check forever.
+    const during = await Promise.race([decide(request([env, user("still there?")])), Bun.sleep(1000).then(() => null)]);
+    release();
+    expect(during).not.toBeNull();
+    expect(text(during!)).toContain("photo received, checking");
+    expect(text(during!)).not.toContain("gate armed");
+    expect((await pending).result).toBe("pass");
+    expect(classified).toBe(1);
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].thread).toBe(THREAD);
+    expect(wakes[0].text).toContain("still there?");
+    // Once the check is done, the next message is gated normally (here: clear).
+    expect((await decide(request([env, user("still there?"), assistant("ok"), user("next")]))).action).toBe("forward");
+  });
+
+  test("a duplicate unlock never wakes twice, and a retried send reuses its id", async () => {
+    expect(text(await decide(request([env, user("fix the bug")])))).toContain("gate armed");
+    wakeResults = ["retry", "sent"];
+    expect(text(await decide(request([env, user("fix the bug"), assistant("locked"), user("BYPASS")])))).toContain("bypass #1");
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    // A second BYPASS while open, and a proof after it, are not new unlocks of held messages.
+    expect(
+      text(await decide(request([env, user("fix the bug"), assistant("locked"), user("BYPASS"), assistant("open"), user("BYPASS")]))),
+    ).toContain("already open");
+    verdicts.push(teeth);
+    await cairnTeeth("cairn-teeth");
+    clock += 31_000;
+    await flushWakes();
+    expect(wakes).toHaveLength(2);
+    expect(wakes[1].id).toBe(wakes[0].id);
+    expect(wakes[1].text).toBe(wakes[0].text);
+    clock += 3_600_000;
+    await flushWakes();
+    expect(wakes).toHaveLength(2);
+  });
+
+  test("an unlocking photo in the same chat carries the held messages in a note instead of a wake", async () => {
+    clock = at(DAY, "06:20");
+    expect(text(await decide(request([env, user("look at this link")])))).toContain("gate armed");
+    clock = at(DAY, "06:30");
+    verdicts.push(teeth);
+    const decision = await decide(request([env, user("look at this link"), assistant("locked"), user({ photo: "teeth-1" })]));
+    expect(decision.action).toBe("forward");
+    const forwarded = JSON.stringify(decision.action === "forward" && decision.request);
+    expect(forwarded).toContain("hygiene-gate-note");
+    expect(forwarded).toContain("06:20");
+    expect(forwarded).toContain("look at this link");
+    await flushWakes();
+    expect(wakes).toHaveLength(0);
   });
 });
 

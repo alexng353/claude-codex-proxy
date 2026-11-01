@@ -3,6 +3,7 @@ import { startWeightWorker } from "./weight-worker";
 import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
 import { remoteGate, startPhotoRetries } from "./hygiene-remote";
+import { startWakeRetries } from "./hygiene-gate";
 import { pinsToken } from "./pins";
 import { closeIdleWorkers } from "./claude";
 import { healthInfo, isDraining, runningCommit, setDraining } from "./handoff";
@@ -47,6 +48,7 @@ const own = healthPort
 const stopProbe = startUsageProbe();
 const stopWarnings = startAuthWarnings();
 const stopPhotoRetries = startPhotoRetries(remoteGate() ?? `http://127.0.0.1:${port}`);
+const stopWakeRetries = startWakeRetries();
 const stopWeights = startWeightWorker();
 
 /**
@@ -63,6 +65,7 @@ async function drain(signal: string): Promise<void> {
   void stopProbe().finally(() => (probeDone = true));
   const warningsDone = stopWarnings();
   const photosDone = stopPhotoRetries();
+  const wakesDone = stopWakeRetries();
   let weightsDone = false;
   void stopWeights().finally(() => (weightsDone = true));
   closeIdleWorkers();
@@ -83,6 +86,7 @@ async function drain(signal: string): Promise<void> {
   closeIdleWorkers();
   await warningsDone;
   await photosDone;
+  await wakesDone;
   console.log("Drained: every request finished");
   own?.stop(true);
   process.exit(0);

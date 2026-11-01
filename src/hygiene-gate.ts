@@ -69,6 +69,17 @@ import {
   type Classifier,
 } from "./hygiene-proof";
 import { tryLock, unlock } from "./filelock";
+import {
+  flushWakes as flushWakeQueue,
+  heldNoteText,
+  holdMessage,
+  photoChecking,
+  releaseHeld,
+  todayWake,
+  wakesIdle,
+  whileChecking,
+  type WakeSender,
+} from "./hygiene-wake";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -81,6 +92,8 @@ export type GateDeps = {
   archive: typeof archivePhoto;
   /** Base URL the model uses for the ruling endpoint. */
   baseUrl: string;
+  /** Starts a turn in a chat whose messages the gate held (hygiene-wake.ts). */
+  wake: WakeSender;
 };
 
 const defaults: GateDeps = {
@@ -90,6 +103,7 @@ const defaults: GateDeps = {
   captureTime,
   archive: archivePhoto,
   baseUrl: `http://127.0.0.1:${process.env.PORT ?? 3456}`,
+  wake: todayWake,
 };
 let deps: GateDeps = { ...defaults };
 
@@ -248,8 +262,45 @@ export type GateDecision =
   | { action: "forward"; request: ResponsesRequest; gateUnavailable?: boolean }
   | { action: "respond"; text: string };
 
+export const CHECKING_TEXT =
+  "📸 photo received, checking. This message is held; the chat wakes on its own once the gate unlocks.";
+
 const forward = (request: ResponsesRequest, gateUnavailable = false): GateDecision =>
   ({ action: "forward", request, ...(gateUnavailable ? { gateUnavailable: true } : {}) });
+
+const armed = (state: GateState, now: number) => outstanding(state, now).length > 0 && !bypassActive(state, now);
+
+/** Sends queued wakes now; the server's timer retries any that fail. */
+export function flushWakes(): Promise<void> {
+  return flushWakeQueue(statePath(), deps.wake, deps.now);
+}
+
+function kickWakes(): void {
+  void flushWakes().catch((error) => console.error("hygiene-gate: wake flush failed:", (error as Error).message));
+}
+
+/** Retry wakes that could not be sent (Today down, daemon restarting). */
+export function startWakeRetries(intervalMs = 30_000): () => Promise<void> {
+  const timer = setInterval(() => {
+    if (!gateDisabled() && !remoteGate()) kickWakes();
+  }, intervalMs);
+  timer.unref();
+  return async () => {
+    clearInterval(timer);
+    await wakesIdle();
+  };
+}
+
+/**
+ * After a decision that leaves the gate open, release what it held: other
+ * chats get a wake, `current` gets the list back for a note on its own turn.
+ */
+function release(state: GateState, now: number, reason: string, current?: string) {
+  if (armed(state, now)) return null;
+  const released = releaseHeld(statePath(), now, reason, current);
+  if (released?.woke) kickWakes();
+  return released;
+}
 
 type ImageOutcome = { line: string | null; record?: ImageRecord };
 
@@ -264,7 +315,7 @@ async function checkImageRecorded(
   only?: ProofTarget,
 ): Promise<ImageOutcome> {
   const before = state.images.length;
-  const outcome = await checkImage(state, url, source, now, only);
+  const outcome = await whileChecking(statePath(), () => checkImage(state, url, source, now, only));
   return outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
 }
 
@@ -439,6 +490,8 @@ export async function gateRequest(request: ResponsesRequest): Promise<GateDecisi
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
     if (turn.type !== "human") return forward(reapply(request, state));
+    const checking = checkingReply(request, turn, state);
+    if (checking) return checking;
     return await serialized(() => decideHumanTurn(request, turn));
   } catch (error) {
     console.error("hygiene-gate: failed open:", (error as Error).message);
@@ -463,6 +516,31 @@ async function followRemote(remote: string, request: ResponsesRequest): Promise<
   return forward(deliverForOutage(request, deps.now()), true);
 }
 
+/**
+ * A photo is being checked and the gate is armed: answer at once instead of
+ * queueing behind the check and locking again (Alex, 2026-11-01). The message
+ * is held, so it is picked up when the photo unlocks the gate. A turn with its
+ * own photo, BYPASS or DELAY still waits for the gate's lock.
+ */
+function checkingReply(
+  request: ResponsesRequest,
+  turn: Extract<ReturnType<typeof classifyTurn>, { type: "human" }>,
+  state: GateState,
+): GateDecision | null {
+  if (turn.images.length || turn.text === "BYPASS" || isDelayText(turn.text)) return null;
+  const now = deps.now();
+  if (!armed(state, now) || !photoChecking(statePath())) return null;
+  const key = messageKeys(request.input as ResponseInputItem[]).get(turn.newest) ?? "";
+  holdMessage(statePath(), {
+    thread: request.prompt_cache_key ?? "",
+    key,
+    at: new Date(now).toISOString(),
+    text: turn.text,
+    attachments: 0,
+  });
+  return { action: "respond", text: CHECKING_TEXT };
+}
+
 async function decideHumanTurn(
   request: ResponsesRequest,
   turn: Extract<ReturnType<typeof classifyTurn>, { type: "human" }>,
@@ -477,30 +555,53 @@ async function decideHumanTurn(
   if (turn.text === "BYPASS" && !turn.images.length) {
     const text = bypassReply(state, now);
     saveState(state);
+    release(state, now, "BYPASS");
     return { action: "respond", text };
   }
   if (isDelayText(turn.text) && !turn.images.length) {
     const text = delayReply(state, now);
     saveState(state);
+    release(state, now, "DELAY");
     return { action: "respond", text };
   }
 
   const lines: string[] = [];
+  let attachments = 0;
   for (const image of turn.images) {
     const before = state.images.length;
     const outcome = await checkImageRecorded(state, image.url, { thread, key: keys.get(image.item) ?? "" }, now);
     if (outcome.line) lines.push(outcome.line);
+    if (!outcome.record || !isWithheld(outcome.record)) attachments++;
     if (state.images.length !== before) dirty = true;
   }
 
   const due = outstanding(state, now);
   if (due.length && !bypassActive(state, now)) {
     if (dirty) saveState(state);
+    holdMessage(statePath(), {
+      thread,
+      key: keys.get(turn.newest) ?? "",
+      at: new Date(now).toISOString(),
+      text: turn.text,
+      attachments,
+    });
     return { action: "respond", text: lockedText(due, lines) };
   }
 
   // Let the turn through, once per thread telling the model about open debts.
   const newestKey = keys.get(turn.newest);
+  // The gate can also open without a photo here (an overdue slot ages out).
+  const reason = lines.some((line) => line.startsWith("✅")) ? "photo accepted" : "gate clear";
+  const released = release(state, now, reason, thread || undefined);
+  if (released?.note.length && newestKey && thread) {
+    state.notes.push({
+      thread,
+      key: newestKey,
+      debtId: `held:${now}`,
+      text: heldNoteText(released.note),
+    });
+    dirty = true;
+  }
   if (newestKey && thread) {
     const noted = (id: string) => state.notes.some((n) => n.thread === thread && n.key === newestKey && n.debtId === id);
     if (delayActive(state, now) && !noted(`delay:${state.delay.day}`)) {
@@ -608,6 +709,7 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
       if (outcome.record && outcome.record.receivedAt === undefined && Math.abs(now - sentAt) <= 5 * 60_000)
         outcome.record.receivedAt = new Date(sentAt).toISOString();
       if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
+      if (outcome.record?.verdict === "accepted") release(state, now, "photo accepted");
       return Response.json({ checked: !outcome.line?.startsWith("⚠") });
     });
   }
@@ -654,6 +756,7 @@ export async function submitProof(image: { mediaType: string; bytes: Buffer }, t
     if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
     const record = outcome.record;
     const pass = record?.verdict === "accepted";
+    if (pass) release(state, now, "photo accepted");
     const weighIn = pass && record?.kind === "weight";
     return {
       result: pass ? "pass" : "fail",
