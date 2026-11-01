@@ -551,15 +551,34 @@ const isContextMessage = (item: ResponseInputItem) =>
   (item?.role === "developer" || item?.role === "system") &&
   (item.type === undefined || item.type === "message");
 
+/**
+ * Written by Codex, an agent, a script or a timer: every text part opens with
+ * a synthetic wrapper. Attachments Codex adds to such a message (images and
+ * their `<image>` wrappers) belong to it, so a delegation carrying
+ * screenshots stays synthetic and its images are never taken for proof photos.
+ * At least one wrapper is required: an image Alex pastes alone is his.
+ * Before 2026-11-01 any image part made the message read as Alex's.
+ */
 export function isSyntheticUserMessage(item: ResponseInputItem): boolean {
-  const texts = partsOf(item).map((part) =>
-    typeof part.text === "string" ? part.text.trimStart().replace(SENT_AT_STAMP, "") : null,
-  );
+  const own = partsOf(item).filter((part) => !isAttachmentPart(part));
   return (
-    texts.length > 0 &&
-    texts.every((text) => text !== null && SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix)))
+    own.length > 0 &&
+    own.every((part) => {
+      if (typeof part.text !== "string") return false;
+      const text = part.text.trimStart().replace(SENT_AT_STAMP, "");
+      return SYNTHETIC_PREFIXES.some((prefix) => text.startsWith(prefix));
+    })
   );
 }
+
+/** An attachment Codex places in whatever message it was sent with, not text anyone typed. */
+function isAttachmentPart(part: ResponseContentPart): boolean {
+  if (part.type === "input_image") return true;
+  return typeof part.text === "string" && isAttachmentWrapper(part.text.trim());
+}
+
+const isAttachmentWrapper = (text: string) =>
+  /^<image\b[^>]*>$/s.test(text) || text === "</image>" || text.startsWith("# Files mentioned by the user");
 
 /**
  * A message no part of which is marked as written by an agent or a relay: no
@@ -653,8 +672,7 @@ export type TurnClass =
 /** Text Codex wraps around attachments or ambient UI state, not typed by Alex. */
 function typedText(part: string): string {
   const text = part.trim();
-  if (text.startsWith("# Files mentioned by the user")) return "";
-  if (/^<image\b[^>]*>$/s.test(text) || text === "</image>") return "";
+  if (isAttachmentWrapper(text)) return "";
   return text
     .replace(/<(in-app-browser-context|plate-activity|hygiene-gate-note)\b[\s\S]*?<\/\1>/g, "")
     .trim()

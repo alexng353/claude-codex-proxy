@@ -166,6 +166,43 @@ describe("gate decisions", () => {
     expect((await decide(request([env, user("x"), { type: "compaction_trigger" } as ResponseInputItem]))).action).toBe("forward");
   });
 
+  // 2026-11-01 06:02 MST: a worker's delegation with 5 QA screenshots was
+  // steered into the build chat's goal turn. The image parts made the envelope
+  // read as Alex, so the gate classified all 5 and answered for the agent.
+  test("envelopes carrying images are never classified, held or answered", async () => {
+    const shot = (n: number) => [`<image name=[Image #${n}] path="/tmp/qa-${n}.png">`, { photo: `qa-${n}` }, "</image>"];
+    const envelope = (source: string, input: string) =>
+      user(
+        `<codex_delegation>\n  <source_thread_id>${source}</source_thread_id>\n  <sent_at>06:02 MST Sun Nov 1</sent_at>\n  <input>${input}</input>\n</codex_delegation>`,
+        ...[1, 2, 3, 4, 5].flatMap(shot),
+      );
+    const senders = [
+      envelope("01a196af-1416-7283-a34e-e52835ae9bec", "Round-two fix receipt complete."),
+      envelope("script:ship-arch", "[ship-arch.sh] installed"),
+      user("[06:02 MST Sun Nov 1] " + (envelope("script:today-self-improve", "[timer daily 06:00] review").content as Array<{ text?: string }>)[0].text, ...shot(1)),
+    ];
+    for (const message of senders)
+      for (const trigger of ["goal", "app_tool_send_message", "composer"]) {
+        const turn = request([env, user("started at 04:50"), assistant("working"), message], trigger);
+        const decision = await decide(turn);
+        expect(decision.action).toBe("forward");
+        // The screenshots reach the model untouched.
+        expect(JSON.stringify(decision.action === "forward" && decision.request)).toContain(photo("qa-1"));
+      }
+    expect(classified).toBe(0);
+    expect(JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8")).images).toEqual([]);
+    expect(existsSync(join(dirname(process.env.HYGIENE_GATE_STATE!), "hygiene-held.json"))).toBe(false);
+    expect(gateStatus()).toMatchObject({ armed: true });
+
+    // Alex's own screenshot, alone or steered into that turn, is still his.
+    expect(text(await decide(request([env, user(...shot(1))], "goal")))).toContain("gate armed");
+    expect(classified).toBe(1);
+    expect(text(await decide(request([env, senders[0], user("[06:03 MST Sun Nov 1] look", ...shot(6))], "goal")))).toContain(
+      "gate armed",
+    );
+    expect(classified).toBe(2);
+  });
+
   test("a valid photo unlocks immediately and the image never reaches the model", async () => {
     const locked = [env, user("fix the bug"), assistant("🪥 gate armed: morning teeth photo")];
     expect((await decide(request([env, user("fix the bug")]))).action).toBe("respond");
