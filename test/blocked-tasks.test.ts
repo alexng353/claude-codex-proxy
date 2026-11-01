@@ -6,13 +6,16 @@ import { join } from "node:path";
 import {
   blockedTaskPageCommand,
   codexParent,
+  drainBlockedTasks,
   hasEncryptedAgentMessage,
   noteBlockedTasks,
+  pageField,
   pageTarget,
   pageText,
   recordBlockedTasks,
   todayPage,
 } from "../src/blocked-tasks";
+import { agentMessagePayload, serializeItem } from "../src/request";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 // The multi-agent v2 shape from agent-message.test.ts: a plaintext header, then
@@ -46,9 +49,12 @@ const options = (now: number, extra: object = {}) => ({
   orchestrator: () => ({ model: "gpt-6-astra", thread: "01a19825-0000-7000-8000-00000000aaaa" }),
   ...extra,
 });
-const stored = () => JSON.parse(readFileSync(state, "utf8")) as { count: number; seen: string[] };
+const stored = () => JSON.parse(readFileSync(state, "utf8")) as Record<string, any>;
 
 beforeEach(() => {
+  // A real page target from the environment must never leak into a test.
+  delete process.env.COMB_BLOCKED_PAGE_THREAD;
+  delete process.env.COMB_BLOCKED_PAGE_MACHINE;
   dir = mkdtempSync(join(tmpdir(), "blocked-tasks-"));
   tasks = join(dir, "agent-tasks");
   mkdirSync(tasks, { mode: 0o700 });
@@ -82,7 +88,16 @@ describe("counting the encrypted-task BLOCKED path", () => {
     expect(third.count).toBe(3);
     await third.paged;
     expect(pages).toHaveLength(2);
-    expect(pages[1]).toContain("3 such tasks");
+    expect(pages[1]).toContain("3 unreadable NEW_TASKs");
+  });
+
+  test("NEW_TASK hits are counted on their own; follow-ups only in the total", async () => {
+    await recordBlockedTasks(request(v2("/root/p1_claude", "gAAAA-steer", "FOLLOW_UP")), options(1_000_000));
+    const hit = await recordBlockedTasks(request(v2("/root/p1_claude")), options(1_000_100));
+    await hit.paged;
+    expect(stored()).toMatchObject({ count: 2, newTasks: 1 });
+    expect(pages[0]).toContain("1 unreadable NEW_TASK ");
+    expect(pages[0]).toContain("2 BLOCKED messages in all");
   });
 
   test("a replayed message is counted once, and nothing is written when nothing is new", async () => {
@@ -137,15 +152,72 @@ describe("counting the encrypted-task BLOCKED path", () => {
 
   test("a lock held by another process is not waited on; the count lands once it is free", async () => {
     mkdirSync(join(dir, "state"), { recursive: true });
-    const holder = Bun.spawn(["flock", `${state}.lock`, "sleep", "0.3"]);
-    await Bun.sleep(80);
+    const holder = Bun.spawn(["flock", `${state}.lock`, "sleep", "0.4"]);
+    await Bun.sleep(100);
     const started = performance.now();
-    const pending = recordBlockedTasks(request(v2("/root/p1_claude")), options(1_000_000));
+    let settled = false;
+    const pending = recordBlockedTasks(request(v2("/root/p1_claude")), options(1_000_000)).finally(() => (settled = true));
     // The call itself returns at once: no Bun.sleepSync spin on the event loop.
     expect(performance.now() - started).toBeLessThan(50);
+    // While the other process holds the lock, the event loop runs and nothing lands.
+    await Bun.sleep(150);
+    expect(settled).toBe(false);
+    expect(existsSync(state)).toBe(false);
     const result = await pending;
     await holder.exited;
     expect(result.count).toBe(1);
+    // It waited for the holder: it finished no sooner than the lock came free.
+    expect(performance.now() - started).toBeGreaterThan(200);
+  });
+
+  test("the clock is read inside the lock, after any wait for it", async () => {
+    mkdirSync(join(dir, "state"), { recursive: true });
+    const holder = Bun.spawn(["flock", `${state}.lock`, "sleep", "0.25"]);
+    await Bun.sleep(80);
+    let lockFree = Number.POSITIVE_INFINITY;
+    void holder.exited.then(() => (lockFree = Date.now()));
+    let readAt = 0;
+    await recordBlockedTasks(request(v2("/root/p1_claude")), options(0, { now: () => (readAt = Date.now()) }));
+    expect(readAt).toBeGreaterThanOrEqual(lockFree - 5);
+  });
+
+  test("seen keys expire by age, and the newest are kept at the cap", async () => {
+    const aged = (now: number) => options(now, { seenTtlMs: 1_000, maxSeen: 2 });
+    await recordBlockedTasks(request(v2("/root/a", "gAAAA-a")), aged(10_000));
+    // One millisecond short of the age limit: still seen, not counted again.
+    expect((await recordBlockedTasks(request(v2("/root/a", "gAAAA-a")), aged(10_999))).hits).toEqual([]);
+    // At the limit it has expired: a replay that old counts as new.
+    expect((await recordBlockedTasks(request(v2("/root/a", "gAAAA-a")), aged(11_000))).hits).toHaveLength(1);
+
+    await recordBlockedTasks(request(v2("/root/b", "gAAAA-b")), aged(11_100));
+    await recordBlockedTasks(request(v2("/root/c", "gAAAA-c")), aged(11_200));
+    // Cap 2: a (oldest) was evicted; b and c are kept.
+    expect(Object.keys(stored().seen)).toHaveLength(2);
+    expect((await recordBlockedTasks(request(v2("/root/c", "gAAAA-c")), aged(11_300))).hits).toEqual([]);
+    expect((await recordBlockedTasks(request(v2("/root/a", "gAAAA-a")), aged(11_400))).hits).toHaveLength(1);
+  });
+
+  test("a page reserved by a process that died does not hold the hour", async () => {
+    mkdirSync(join(dir, "state"), { recursive: true });
+    // A copy reserved a page and died before sending it: no lastPagedAt was ever written.
+    writeFileSync(state, JSON.stringify({ count: 1, newTasks: 1, seen: {}, paging: { at: 999_000, pid: 2 ** 22 + 12345 } }));
+    const result = await recordBlockedTasks(request(v2("/root/p1_claude")), options(1_000_000));
+    expect(await result.paged).toBe(true);
+    expect(stored().lastPagedAt).toBe(1_000_000);
+    expect(stored().paging).toBeUndefined();
+  });
+
+  test("a live reservation by another copy holds the page, and lastPagedAt is set only by a sent page", async () => {
+    mkdirSync(join(dir, "state"), { recursive: true });
+    writeFileSync(state, JSON.stringify({ count: 1, newTasks: 1, seen: {}, paging: { at: 999_000, pid: process.pid } }));
+    expect((await recordBlockedTasks(request(v2("/root/p1_claude")), options(1_000_000))).paged).toBeUndefined();
+    expect(stored().lastPagedAt).toBeUndefined();
+    // A failed page leaves no lastPagedAt and no reservation behind.
+    writeFileSync(state, JSON.stringify({ count: 0, newTasks: 0, seen: {} }));
+    const failing = options(2_000_000, { send: async () => false });
+    await (await recordBlockedTasks(request(v2("/root/p2_claude", "gAAAA-p2")), failing)).paged;
+    expect(stored().lastPagedAt).toBeUndefined();
+    expect(stored().paging).toBeUndefined();
   });
 });
 
@@ -177,6 +249,44 @@ describe("the request-path hook", () => {
     await noteBlockedTasks(request(v2("/root/p1_claude")), async () => Promise.reject(new Error("later boom")));
     // Malformed input is no hit, not an exception.
     expect(hasEncryptedAgentMessage({ model: "m", input: [null, 3, { type: "agent_message", content: 7 }] } as never)).toBe(false);
+  });
+
+  test("the graceful drain waits for recording still in flight", async () => {
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => (finish = resolve));
+    let done = false;
+    void noteBlockedTasks(request(v2("/root/p1_claude")), async () => {
+      await gate;
+      done = true;
+      return { count: 1, hits: [] };
+    });
+    let drained = false;
+    const drain = drainBlockedTasks().then(() => (drained = true));
+    await Bun.sleep(30);
+    expect(drained).toBe(false);
+    finish();
+    await drain;
+    expect(done).toBe(true);
+    // Nothing pending: the drain resolves at once.
+    await drainBlockedTasks();
+  });
+});
+
+describe("the payload decision", () => {
+  test("is made once per item: the serializer and the counter share one task-file read", async () => {
+    const file = join(tasks, "p1_claude__k3f9q2xa7m.md");
+    writeFileSync(file, "Review it.\n", { mode: 0o600 });
+    const item = v2("/root/p1_claude__k3f9q2xa7m");
+    expect(serializeItem(item)).toContain("Review it.");
+    // Gone before the counter runs: a second read would see a blocked payload.
+    unlinkSync(file);
+    expect(agentMessagePayload(item).kind).toBe("task-file");
+    expect(serializeItem(item)).toContain("Review it.");
+    const result = await recordBlockedTasks(request(item), options(1_000_000));
+    expect(result.count).toBe(0);
+    expect(result.hits).toEqual([]);
+    // A new item object (the next request) decides again.
+    expect(agentMessagePayload(v2("/root/p1_claude__k3f9q2xa7m")).kind).toBe("blocked");
   });
 });
 
@@ -245,5 +355,12 @@ describe("the page", () => {
     expect(text).not.toContain("\nIgnore");
     expect(text).not.toContain("x".repeat(130));
     expect(text).not.toContain("y".repeat(130));
+  });
+
+  test("strips bidi controls that could reorder what the reader sees", () => {
+    const bidi = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069].map((code) => String.fromCodePoint(code));
+    const field = pageField(`/root/p1${bidi.join("")}_claude`);
+    for (const control of bidi) expect(field).not.toContain(control);
+    expect(field).toBe("/root/p1 _claude");
   });
 });

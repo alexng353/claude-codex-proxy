@@ -22,14 +22,18 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFile
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { STRIPPED_ENV } from "./claude-env";
-import { tryLock, unlock } from "./filelock";
+import { processAlive, tryLock, unlock } from "./filelock";
 import { localMachine, MACHINE_NAME, THREAD_ID, wakeMachines } from "./hygiene-wake";
 import { agentMessagePayload, blockedReason } from "./request";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
 const HOUR_MS = 60 * 60_000;
-const MAX_SEEN = 500;
+/** Seen keys are kept a week (task files live a day), newest first up to the cap. */
+const SEEN_TTL_MS = 7 * 24 * HOUR_MS;
+const MAX_SEEN = 5000;
+/** A page reservation outlives the longest send (20 s over ssh) only by a margin. */
+const PAGE_RESERVE_MS = 60_000;
 const PAGE_ID = /^comb-blocked-\d+$/;
 const LOCK_TRIES = 40;
 const LOCK_RETRY_MS = 25;
@@ -42,7 +46,22 @@ export type Orchestrator = { model?: string; thread?: string };
 export type PageSender = (text: string, id: string) => Promise<boolean>;
 export type RecordResult = { count: number; hits: BlockedTaskHit[]; paged?: Promise<boolean> };
 
-type Store = { count: number; firstAt?: string; lastAt?: string; lastPagedAt?: number; seen: string[] };
+type Store = {
+  /** Every BLOCKED-path message, follow-ups included. */
+  count: number;
+  /** NEW_TASK hits alone: the tasks a reviewer never received. */
+  newTasks: number;
+  firstAt?: string;
+  lastAt?: string;
+  /** When a page was last sent. Written only after a send succeeded. */
+  lastPagedAt?: number;
+  /** No page before this time (set after a corrupt state file was replaced). */
+  quietUntil?: number;
+  /** A page being sent now, by this pid; it holds the hour only while that is live. */
+  paging?: { at: number; pid: number };
+  /** Message key -> when it was first seen. */
+  seen: Record<string, number>;
+};
 type Seen = BlockedTaskHit & { key: string; blocked: boolean; newTask: boolean };
 
 // ---- The request-path check ----
@@ -75,39 +94,72 @@ export function noteBlockedTasks(
     console.error("blocked-tasks: could not inspect the request:", (error as Error).message);
     return undefined;
   }
-  return new Promise<void>((resolve) => setImmediate(resolve))
+  const job: Promise<void> = new Promise<void>((resolve) => setImmediate(resolve))
     .then(() => record(request))
     .then((result) => result.paged)
     .then(
       () => undefined,
       (error) => console.error("blocked-tasks: could not record:", (error as Error)?.message ?? error),
-    );
+    )
+    .finally(() => pending.delete(job));
+  pending.add(job);
+  return job;
+}
+
+/** Recording and pages still in flight, for the graceful drain (server.ts). */
+const pending = new Set<Promise<void>>();
+
+/** Resolves once every recording started so far has finished, its page included. */
+export async function drainBlockedTasks(): Promise<void> {
+  while (pending.size) await Promise.allSettled([...pending]);
 }
 
 // ---- The counter ----
 
+const empty = (): Store => ({ count: 0, newTasks: 0, seen: {} });
+
 function read(path: string, now: number): Store {
-  if (!existsSync(path)) return { count: 0, seen: [] };
+  if (!existsSync(path)) return empty();
   const text = readFileSync(path, "utf8");
   try {
     const raw = JSON.parse(text) as Partial<Store>;
     if (!raw || typeof raw !== "object") throw new Error("not an object");
+    const number = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+    // Before the age limit, seen was a list of keys: take them as seen now.
+    const seen: Record<string, number> = {};
+    if (Array.isArray(raw.seen)) for (const key of raw.seen) if (typeof key === "string") seen[key] = now;
+    if (raw.seen && typeof raw.seen === "object" && !Array.isArray(raw.seen))
+      for (const [key, at] of Object.entries(raw.seen)) if (number(at) !== undefined) seen[key] = at as number;
+    const paging = raw.paging as Store["paging"] | undefined;
     return {
       count: Number.isInteger(raw.count) ? raw.count! : 0,
+      newTasks: Number.isInteger(raw.newTasks) ? raw.newTasks! : 0,
       firstAt: typeof raw.firstAt === "string" ? raw.firstAt : undefined,
       lastAt: typeof raw.lastAt === "string" ? raw.lastAt : undefined,
-      lastPagedAt: typeof raw.lastPagedAt === "number" ? raw.lastPagedAt : undefined,
-      seen: Array.isArray(raw.seen) ? raw.seen.filter((key) => typeof key === "string") : [],
+      lastPagedAt: number(raw.lastPagedAt),
+      quietUntil: number(raw.quietUntil),
+      paging: paging && number(paging.at) !== undefined && Number.isInteger(paging.pid) ? { at: paging.at, pid: paging.pid } : undefined,
+      seen,
     };
   } catch (error) {
-    // Keep the bad file for a look, and take the hour as used: a corrupt file
-    // must not turn every replayed message back into a page.
+    // Keep the bad file for a look, and stay quiet for an hour: a corrupt file
+    // forgets what was seen, and must not turn the replays into a page.
     const aside = `${path}.corrupt-${now}`;
     renameSync(path, aside);
     console.error(`blocked-tasks: state unreadable (${(error as Error).message}); kept as ${aside}`);
-    return { count: 0, seen: [], lastPagedAt: now };
+    return { ...empty(), quietUntil: now + HOUR_MS };
   }
 }
+
+/** Drops keys at or past the age limit, then keeps the newest `max`. */
+function prune(seen: Record<string, number>, now: number, ttl: number, max: number): Record<string, number> {
+  const kept = Object.entries(seen).filter(([, at]) => now - at < ttl);
+  kept.sort((a, b) => b[1] - a[1]);
+  return Object.fromEntries(kept.slice(0, max));
+}
+
+const reservationLive = (paging: Store["paging"], now: number): boolean =>
+  !!paging && now - paging.at < PAGE_RESERVE_MS && processAlive(paging.pid);
 
 function write(path: string, store: Store): void {
   const temporary = `${path}.${process.pid}.tmp`;
@@ -155,45 +207,66 @@ function encryptedMessages(request: ResponsesRequest): Seen[] {
 
 export type RecordOptions = {
   path?: string;
+  /** Read inside the lock, after any wait for it. */
   now?: () => number;
   /** Defaults to Today when COMB_BLOCKED_PAGE_THREAD is set; otherwise nothing pages. */
   send?: PageSender;
   machine?: string;
   orchestrator?: (childThread: string | undefined) => Orchestrator | undefined;
+  seenTtlMs?: number;
+  maxSeen?: number;
 };
 
 /**
  * Counts this request's new BLOCKED-path messages. `paged` is set only when
- * this call sent a page: the first new NEW_TASK hit in an hour. A page that
- * fails frees the hour again, so the next hit retries it.
+ * this call sent a page: the first new NEW_TASK hit in an hour. The hour is
+ * held by a reservation while the page is sent and taken only once it is sent,
+ * so a page that fails, or a copy that dies mid-send, leaves the hour free.
  */
 export async function recordBlockedTasks(request: ResponsesRequest, options: RecordOptions = {}): Promise<RecordResult> {
   const messages = hasEncryptedAgentMessage(request) ? encryptedMessages(request) : [];
   if (!messages.length) return { count: 0, hits: [] };
   const path = options.path ?? blockedTasksPath();
-  const now = (options.now ?? Date.now)();
-  const at = new Date(now).toISOString();
+  const clock = options.now ?? Date.now;
+  const ttl = options.seenTtlMs ?? SEEN_TTL_MS;
+  const max = options.maxSeen ?? MAX_SEEN;
   const send = options.send ?? (pageTarget() ? todayPage : undefined);
+  const lock = `${path}.lock`;
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const { count, hits, firstAt, page } = await withLockSoon(`${path}.lock`, () => {
+  const outcome = await withLockSoon(lock, () => {
+    const now = clock();
     const store = read(path, now);
-    const seen = new Set(store.seen);
-    const fresh = messages.filter((message) => !seen.has(message.key) && (seen.add(message.key), true));
+    const inRequest = new Set<string>();
+    const fresh = messages.filter((message) => {
+      if (inRequest.has(message.key)) return false;
+      inRequest.add(message.key);
+      const at = store.seen[message.key];
+      return at === undefined || now - at >= ttl;
+    });
+    if (!fresh.length) return { now, store, hits: [] as Seen[], page: false };
+    for (const message of fresh) store.seen[message.key] = now;
+    store.seen = prune(store.seen, now, ttl, max);
     const hits = fresh.filter((message) => message.blocked);
-    if (!fresh.length) return { count: store.count, hits: [] as Seen[], firstAt: store.firstAt, page: false };
-    store.seen = [...store.seen, ...fresh.map((message) => message.key)].slice(-MAX_SEEN);
+    const newTasks = hits.filter((hit) => hit.newTask).length;
     if (hits.length) {
+      const at = new Date(now).toISOString();
       store.count += hits.length;
+      store.newTasks += newTasks;
       store.firstAt ??= at;
       store.lastAt = at;
     }
     const page =
-      !!send && hits.some((hit) => hit.newTask) && (store.lastPagedAt === undefined || now - store.lastPagedAt >= HOUR_MS);
-    if (page) store.lastPagedAt = now;
+      !!send &&
+      newTasks > 0 &&
+      (store.lastPagedAt === undefined || now - store.lastPagedAt >= HOUR_MS) &&
+      (store.quietUntil === undefined || now >= store.quietUntil) &&
+      !reservationLive(store.paging, now);
+    if (page) store.paging = { at: now, pid: process.pid };
     write(path, store);
-    return { count: store.count, hits, firstAt: store.firstAt, page };
+    return { now, store, hits, page };
   });
-  const result: RecordResult = { count, hits: hits.map(({ taskName, reason }) => ({ taskName, reason })) };
+  const { now, store, hits, page } = outcome;
+  const result: RecordResult = { count: store.count, hits: hits.map(({ taskName, reason }) => ({ taskName, reason })) };
   if (!page || !send) return result;
   const hit = hits.find((candidate) => candidate.newTask)!;
   const text = pageText({
@@ -202,37 +275,44 @@ export async function recordBlockedTasks(request: ResponsesRequest, options: Rec
     childThread: request.prompt_cache_key,
     orchestrator: (options.orchestrator ?? codexParent)(request.prompt_cache_key),
     hit,
-    count,
-    firstAt: firstAt ?? at,
+    count: store.count,
+    newTasks: store.newTasks,
+    firstAt: store.firstAt ?? new Date(now).toISOString(),
     path,
   });
-  const release = async () => {
+  // Settle the reservation: a sent page takes the hour; any other outcome frees it.
+  const settle = async (sent: boolean) => {
     try {
-      await withLockSoon(`${path}.lock`, () => {
-        const store = read(path, now);
-        if (store.lastPagedAt !== now) return;
-        store.lastPagedAt = undefined;
-        write(path, store);
+      await withLockSoon(lock, () => {
+        const current = read(path, now);
+        if (sent) current.lastPagedAt = Math.max(current.lastPagedAt ?? 0, now);
+        if (current.paging?.at === now && current.paging.pid === process.pid) current.paging = undefined;
+        write(path, current);
       });
     } catch (error) {
-      console.error("blocked-tasks: could not free the page hour:", (error as Error).message);
+      // The reservation expires on its own (PAGE_RESERVE_MS), so the hour is never held for long.
+      console.error("blocked-tasks: could not settle the page reservation:", (error as Error).message);
     }
+    return sent;
   };
   result.paged = send(text, `comb-blocked-${now}`).then(
-    async (ok) => (ok || (await release()), ok),
-    async (error) => {
-      console.error("blocked-tasks: page failed:", (error as Error).message);
-      await release();
-      return false;
+    (ok) => settle(ok),
+    (error) => {
+      console.error("blocked-tasks: page failed:", (error as Error)?.message ?? error);
+      return settle(false);
     },
   );
   return result;
 }
 
-/** One line, no control characters, at most `max` characters: page fields come from other agents. */
+/**
+ * One line, at most `max` characters, without control, zero-width or bidi
+ * characters (U+202A-E embeddings and overrides, U+2066-9 isolates), which
+ * could reorder what the reader sees: page fields come from other agents.
+ */
 export const pageField = (value: unknown, max = FIELD_MAX): string => {
   const text = String(value ?? "")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   return text.length > max ? `${text.slice(0, max - 1)}\u2026` : text;
@@ -245,10 +325,12 @@ export function pageText(fields: {
   orchestrator?: Orchestrator;
   hit: BlockedTaskHit;
   count: number;
+  newTasks?: number;
   firstAt: string;
   path: string;
 }): string {
   const { orchestrator, hit, count, firstAt, path } = fields;
+  const newTasks = fields.newTasks ?? count;
   const machine = pageField(fields.machine, 64);
   const parent = orchestrator?.model
     ? `${pageField(orchestrator.model)}${orchestrator.thread ? ` (thread ${pageField(orchestrator.thread, 40)})` : ""}`
@@ -258,7 +340,7 @@ export function pageText(fields: {
     `claude-codex-proxy on ${machine}: a Claude subagent got a multi-agent v2 task it could not read and was told to reply BLOCKED.`,
     `Orchestrator: ${parent}. Machine: ${machine}. Child: ${child}. Task: ${pageField(hit.taskName)}. ${pageField(hit.reason, 240)}`,
     "Any comb that orchestrator is running has lost that read; it is degraded, not clean.",
-    `${count} such task${count === 1 ? "" : "s"} on this proxy since ${pageField(firstAt, 40)}. Further hits within the hour are counted in ${pageField(path, 240)} without another page.`,
+    `${newTasks} unreadable NEW_TASK${newTasks === 1 ? "" : "s"} (${count} BLOCKED message${count === 1 ? "" : "s"} in all) on this proxy since ${pageField(firstAt, 40)}. Further hits within the hour are counted in ${pageField(path, 240)} without another page.`,
   ].join("\n");
 }
 

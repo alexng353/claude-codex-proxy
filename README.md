@@ -82,6 +82,17 @@ The model catalog gives every GPT-6 model `multi_agent_version: v2`. Under v2 a 
 - **A `NEW_TASK` whose task name ends in `__<key>`** (`<key>` is 8 to 32 of `[a-z0-9]`): the proxy reads `~/.cache/agent-tasks/<name>.md` in place of the encrypted payload. `AGENT_TASKS_DIR` overrides the directory. The file must be a regular file (not a symlink) that this user owns, with mode `0600` or stricter, at most 512 KiB, and a modification time within a day of now. The comb skill writes these files.
 - **Anything else** (no key, a missing or refused file, or an encrypted follow-up or steer): the child is told the payload is unreadable. It must not guess, and it replies `BLOCKED: ...`.
 
+Every such BLOCKED message is counted, after the request and never on it, in `blocked-tasks.json` in the state directory (`COMB_BLOCKED_STATE` overrides the path; `src/blocked-tasks.ts`). A message is keyed by its task name and encrypted blob, so a replay in a later turn counts once. A task served from its file is remembered too, so its replay after the file is deleted is not counted. The file holds the total, the `NEW_TASK` count on its own, and the first and last hit times. A new unreadable `NEW_TASK` can page a Today chat, at most once an hour:
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `COMB_BLOCKED_PAGE_THREAD` | unset: count, never page | Today or Codex thread id to page. Nothing is sent without it. |
+| `COMB_BLOCKED_PAGE_MACHINE` | this machine (`HYGIENE_GATE_MACHINE`, else the hostname) | The Today machine whose daemon has that thread. On another machine the page goes over `ssh <machine>`. |
+| `HYGIENE_GATE_MACHINES` | `arch` | Comma list of machines that may be reached over ssh, shared with the hygiene wakes. A `COMB_BLOCKED_PAGE_MACHINE` not in it is refused. |
+| `COMB_BLOCKED_PAGE` | on | `off` stops the sends and keeps counting. |
+
+The page is `today-daemon send --from claude-codex-proxy --client-message-id comb-blocked-<ms> -- <thread> -`. It names this machine, the child model and thread, the task name, and the orchestrator's model and thread from Codex's `thread_spawn_edges` (`state_*.sqlite` under `CODEX_HOME`, `~/.local/state/today/codex-home` and `~/.codex`, or `COMB_BLOCKED_CODEX_HOMES`). Each field is one line, capped at 120 characters, without control or bidi characters. The hour is taken only by a page that was sent: while a page is being sent it is reserved for up to a minute, by a live process, and a failed send frees it. For example, on Arch paging a chat on Forge: `COMB_BLOCKED_PAGE_THREAD=<thread>`, `COMB_BLOCKED_PAGE_MACHINE=forge`, `HYGIENE_GATE_MACHINES=forge`.
+
 A known limit: the file is read every time the conversation is rendered. A cold worker that re-renders the conversation after the orchestrator deleted the file (or after a day) sees the BLOCKED notice in place of the task. This was accepted: the reviewer has already acted on the task by then, and the orchestrator's nonce handshake rejects a read that never saw its prompt.
 
 ## Configuration

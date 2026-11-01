@@ -2,6 +2,7 @@
 import { startWeightWorker } from "./weight-worker";
 import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
+import { drainBlockedTasks } from "./blocked-tasks";
 import { remoteGate, startPhotoRetries } from "./hygiene-remote";
 import { startWakeRetries } from "./hygiene-gate";
 import { pinsToken } from "./pins";
@@ -87,6 +88,8 @@ async function drain(signal: string): Promise<void> {
   await warningsDone;
   await photosDone;
   await wakesDone;
+  // Requests are done, so no new recording starts; finish the ones (and pages) in flight.
+  await drainBlockedTasks();
   console.log("Drained: every request finished");
   own?.stop(true);
   process.exit(0);
