@@ -4,7 +4,7 @@ import { handleAgentNamesRoute } from "./agent-names";
 import { runClaude } from "./claude";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
-import { GATE_ONLY_HEADER, HOP_HEADER, loopResponse, remoteGate } from "./hygiene-remote";
+import { GATE_ONLY_HEADER, HOP_HEADER, MACHINE_HEADER, loopResponse, remoteGate } from "./hygiene-remote";
 import { PerpetualWaitAborted, perpetualStatus, preparePerpetualWaiting } from "./perpetual";
 import { healthInfo } from "./handoff";
 import { handlePinsRoute } from "./pins";
@@ -76,7 +76,9 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
   } catch (cause) {
     return error((cause as Error).message);
   }
-  const decision = await gateRequest(body);
+  // A follower proxy names its machine (validated where the hold is stored).
+  const machine = request.headers.has(HOP_HEADER) ? request.headers.get(MACHINE_HEADER) ?? undefined : undefined;
+  const decision = await gateRequest(body, { machine });
   // Another proxy following this gate asks for the decision alone; it preloads its own skills
   // and keeps its own copy of the request when nothing changed.
   if (request.headers.has(GATE_ONLY_HEADER))

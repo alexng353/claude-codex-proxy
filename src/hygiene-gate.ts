@@ -474,7 +474,10 @@ function delayReply(state: GateState, now: number): string {
  * The gate's answer for one Responses request. Never throws: a bug here must
  * not take down inference, so failures forward the request untouched.
  */
-export async function gateRequest(request: ResponsesRequest): Promise<GateDecision> {
+/** Who asked: a follower proxy names its machine so a held chat is woken there. */
+export type GateOrigin = { machine?: string };
+
+export async function gateRequest(request: ResponsesRequest, origin: GateOrigin = {}): Promise<GateDecision> {
   if (gateDisabled()) return forward(request);
   const remote = remoteGate();
   if (remote) {
@@ -490,9 +493,9 @@ export async function gateRequest(request: ResponsesRequest): Promise<GateDecisi
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
     if (turn.type !== "human") return forward(reapply(request, state));
-    const checking = checkingReply(request, turn, state);
+    const checking = checkingReply(request, turn, state, origin);
     if (checking) return checking;
-    return await serialized(() => decideHumanTurn(request, turn));
+    return await serialized(() => decideHumanTurn(request, turn, origin));
   } catch (error) {
     console.error("hygiene-gate: failed open:", (error as Error).message);
     return forward(deliverForOutage(request, deps.now()), true);
@@ -526,6 +529,7 @@ function checkingReply(
   request: ResponsesRequest,
   turn: Extract<ReturnType<typeof classifyTurn>, { type: "human" }>,
   state: GateState,
+  origin: GateOrigin,
 ): GateDecision | null {
   if (turn.images.length || turn.text === "BYPASS" || isDelayText(turn.text)) return null;
   const now = deps.now();
@@ -533,17 +537,25 @@ function checkingReply(
   const key = messageKeys(request.input as ResponseInputItem[]).get(turn.newest) ?? "";
   holdMessage(statePath(), {
     thread: request.prompt_cache_key ?? "",
+    machine: origin.machine,
     key,
     at: new Date(now).toISOString(),
     text: turn.text,
     attachments: 0,
   });
+  // The check may have finished, and released what was held, between the test
+  // above and the hold. Behind the gate's lock, after any check in progress,
+  // release again if the gate is open by then.
+  void serialized(async () => {
+    release(loadState(), deps.now(), "photo accepted");
+  }).catch((error) => console.error("hygiene-gate: held-message recheck failed:", (error as Error).message));
   return { action: "respond", text: CHECKING_TEXT };
 }
 
 async function decideHumanTurn(
   request: ResponsesRequest,
   turn: Extract<ReturnType<typeof classifyTurn>, { type: "human" }>,
+  origin: GateOrigin,
 ): Promise<GateDecision> {
   const state = structuredClone(loadState());
   const now = deps.now();
@@ -580,6 +592,7 @@ async function decideHumanTurn(
     if (dirty) saveState(state);
     holdMessage(statePath(), {
       thread,
+      machine: origin.machine,
       key: keys.get(turn.newest) ?? "",
       at: new Date(now).toISOString(),
       text: turn.text,

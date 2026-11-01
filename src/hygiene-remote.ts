@@ -17,6 +17,7 @@ import { imageMarker, isWithheld, partsOf, type GateState } from "./hygiene";
 import type { GateDecision } from "./hygiene-gate";
 import { decodeDataUrl, sha256 } from "./hygiene-proof";
 import { tryLock, unlock, withLock } from "./filelock";
+import { localMachine } from "./hygiene-wake";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -24,6 +25,11 @@ import type { ResponseInputItem, ResponsesRequest } from "./types";
 export const GATE_ONLY_HEADER = "x-hygiene-gate-only";
 /** Marks a request one proxy sent another, so a proxy pointed at a follower fails instead of looping. */
 export const HOP_HEADER = "x-hygiene-gate-hop";
+/**
+ * The follower's Today machine name on gate decisions, so a message the
+ * authority holds is woken on the machine whose Codex runs that chat.
+ */
+export const MACHINE_HEADER = "x-hygiene-gate-machine";
 
 /** Under the model router's 90 s wait, so this proxy, not the router, decides what happens. */
 const DECISION_TIMEOUT_MS = 85_000;
@@ -56,7 +62,7 @@ export async function remoteGateRequest(base: string, request: ResponsesRequest)
   try {
     const reply = await fetch(`${base}/hygiene/gate`, {
       method: "POST",
-      headers: { "content-type": "application/json", [GATE_ONLY_HEADER]: "1", ...authorityHeaders() },
+      headers: { "content-type": "application/json", [GATE_ONLY_HEADER]: "1", [MACHINE_HEADER]: localMachine(), ...authorityHeaders() },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(DECISION_TIMEOUT_MS),
     });

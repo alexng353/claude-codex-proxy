@@ -18,15 +18,30 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { STRIPPED_ENV } from "./claude-env";
 import { processAlive, withLock } from "./filelock";
 import { clockLabel, localTime, NOTE_TAG } from "./hygiene";
+import { scrubText } from "./scrub.mjs";
+
+/** Codex thread ids are UUIDs; anything else is not a chat Today can wake. */
+export const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** A Today machine name (forge, arch): also the ssh host that reaches it. */
+export const MACHINE_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/i;
+const WAKE_ID = /^hygiene-unlock-\d+-[0-9a-f]{12}$/;
+
+/** This proxy's Today machine name. */
+export const localMachine = () => process.env.HYGIENE_GATE_MACHINE?.trim() || hostname();
 
 export type HeldMessage = {
   /** Codex thread id (prompt_cache_key). */
   thread: string;
+  /**
+   * The machine whose Codex runs the chat, when a follower proxy asked
+   * (hygiene-remote.ts). Absent: this machine.
+   */
+  machine?: string;
   /** Message key (messageKeys), so a retried request is held once. */
   key: string;
   at: string;
@@ -39,6 +54,7 @@ export type Wake = {
   /** Today client message id: keyed by the unlock and the chat. */
   id: string;
   thread: string;
+  machine?: string;
   at: string;
   /** Dropped once sent; the id and times stay as a receipt. */
   text?: string;
@@ -51,7 +67,7 @@ export type Wake = {
 type Store = { held: HeldMessage[]; wakes: Wake[] };
 
 export type WakeResult = "sent" | "retry" | "failed";
-export type WakeSender = (wake: { id: string; thread: string; text: string }) => Promise<WakeResult>;
+export type WakeSender = (wake: { id: string; thread: string; machine?: string; text: string }) => Promise<WakeResult>;
 
 /** Held messages older than this are not worth waking a chat for. */
 const HELD_MAX_AGE_MS = 24 * 3_600_000;
@@ -88,11 +104,16 @@ function update<T>(path: string, edit: (store: Store) => T): T {
 
 /** Records a message the gate answered with its lock text instead of the model. */
 export function holdMessage(statePath: string, message: HeldMessage): void {
-  if (!message.thread || !message.key || (!message.text && !message.attachments)) return;
+  if (!THREAD_ID.test(message.thread) || !message.key || (!message.text && !message.attachments)) return;
+  const machine = message.machine && MACHINE_NAME.test(message.machine) && message.machine !== localMachine()
+    ? message.machine
+    : undefined;
   try {
     update(storePath(statePath), (store) => {
       if (store.held.some((h) => h.thread === message.thread && h.key === message.key)) return;
-      store.held.push({ ...message, text: message.text.slice(0, MAX_TEXT) });
+      // The router path reaches the gate unscrubbed; the wake must not carry a secret back out.
+      const { machine: _, ...rest } = message;
+      store.held.push({ ...rest, ...(machine ? { machine } : {}), text: scrubText(message.text).slice(0, MAX_TEXT) });
     });
   } catch (error) {
     // Losing the wake must never break the gate's reply.
@@ -122,10 +143,11 @@ function listing(messages: HeldMessage[], escape: (text: string) => string): str
   return lines;
 }
 
-export function wakeText(messages: HeldMessage[], unlockedAt: number, reason: string): string {
+export function wakeText(messages: HeldMessage[], unlockedAt: number, reason: string, dropped = 0): string {
   return [
     `Hygiene gate unlocked at ${clockLabel(unlockedAt)} (${reason}). While it was armed it held these messages from Alex in this chat and answered them only with its lock text, so nobody has acted on them yet:`,
     ...listing(messages, (t) => t),
+    ...(dropped ? [`(${dropped} older message${dropped === 1 ? "" : "s"} dropped: held more than 24 hours.)`] : []),
     "Answer them now, before anything else.",
   ].join("\n");
 }
@@ -157,20 +179,37 @@ export function releaseHeld(
   if (!read(path).held.length) return null;
   try {
     return update(path, (store) => {
-      const fresh = store.held.filter((h) => now - Date.parse(h.at) <= HELD_MAX_AGE_MS);
+      const isFresh = (h: HeldMessage) => now - Date.parse(h.at) <= HELD_MAX_AGE_MS;
+      const chat = (h: { thread: string; machine?: string }) => `${h.machine ?? ""}/${h.thread}`;
+      const dropped = new Map<string, number>();
+      for (const h of store.held.filter((h) => !isFresh(h))) dropped.set(chat(h), (dropped.get(chat(h)) ?? 0) + 1);
+      const fresh = store.held.filter(isFresh);
       store.held = [];
       store.wakes = store.wakes.filter((w) => !(w.sentAt || w.failedAt) || now - Date.parse(w.at) <= RECEIPT_KEEP_MS);
       if (!fresh.length) return null;
-      const byThread = new Map<string, HeldMessage[]>();
-      for (const h of fresh) byThread.set(h.thread, [...(byThread.get(h.thread) ?? []), h]);
-      const note = current ? byThread.get(current) ?? [] : [];
-      if (current) byThread.delete(current);
-      for (const [thread, messages] of byThread) {
-        const id = `hygiene-unlock-${now}-${createHash("sha256").update(thread).digest("hex").slice(0, 12)}`;
+      const byChat = new Map<string, HeldMessage[]>();
+      for (const h of fresh) byChat.set(chat(h), [...(byChat.get(chat(h)) ?? []), h]);
+      // Thread ids are UUIDs, so the current turn's thread names one chat on whichever machine.
+      const note: HeldMessage[] = [];
+      if (current)
+        for (const [key, messages] of byChat)
+          if (messages[0].thread === current) {
+            note.push(...messages);
+            byChat.delete(key);
+          }
+      for (const [key, messages] of byChat) {
+        const { thread, machine } = messages[0];
+        const id = `hygiene-unlock-${now}-${createHash("sha256").update(key).digest("hex").slice(0, 12)}`;
         if (store.wakes.some((w) => w.id === id)) continue;
-        store.wakes.push({ id, thread, at: new Date(now).toISOString(), text: wakeText(messages, now, reason) });
+        store.wakes.push({
+          id,
+          thread,
+          ...(machine ? { machine } : {}),
+          at: new Date(now).toISOString(),
+          text: wakeText(messages, now, reason, dropped.get(key) ?? 0),
+        });
       }
-      return { note, woke: byThread.size };
+      return { note, woke: byChat.size };
     });
   } catch (error) {
     console.error("hygiene-gate: could not release held messages:", (error as Error).message);
@@ -196,7 +235,7 @@ async function flushOnce(statePath: string, send: WakeSender, now: number): Prom
   for (const wake of due) {
     let result: WakeResult;
     try {
-      result = await send({ id: wake.id, thread: wake.thread, text: wake.text! });
+      result = await send({ id: wake.id, thread: wake.thread, ...(wake.machine ? { machine: wake.machine } : {}), text: wake.text! });
     } catch (error) {
       console.error("hygiene-gate: wake send threw:", (error as Error).message);
       result = "retry";
@@ -227,27 +266,46 @@ async function flushOnce(statePath: string, send: WakeSender, now: number): Prom
 }
 
 /**
- * Today's own send path: `today-daemon send --from hygiene-gate`, delivered in
- * the script envelope the gate exempts, with a client message id so a resend
- * is a no-op. Exit 3 (id already used differently) and an unknown thread are
- * final; anything else is retried.
+ * The command that wakes one chat: Today's own `today-daemon send --from
+ * hygiene-gate` (delivered in the script envelope the gate exempts) with a
+ * client message id, so a resend is a no-op. A chat on another machine (a
+ * follower's) is unknown to this daemon, so the same command runs on that
+ * machine's daemon over ssh. Null when an argument fails validation; every
+ * value that reaches the remote shell is checked against a strict pattern.
  */
-export const todayWake: WakeSender = async ({ id, thread, text }) => {
+export function wakeCommand(wake: { id: string; thread: string; machine?: string }, here = localMachine()): string[] | null {
+  if (!THREAD_ID.test(wake.thread) || !WAKE_ID.test(wake.id)) return null;
+  if (!wake.machine || wake.machine === here)
+    return [
+      process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"),
+      "send", "--socket", `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "hygiene-gate",
+      "--client-message-id", wake.id, "--", wake.thread, "-",
+    ];
+  if (!MACHINE_NAME.test(wake.machine)) return null;
+  return [
+    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", wake.machine,
+    `exec env -u CODEX_THREAD_ID "$HOME/.local/bin/today-daemon" send --socket "/run/user/$(id -u)/today/daemon.sock" --from hygiene-gate --client-message-id ${wake.id} -- ${wake.thread} -`,
+  ];
+}
+
+/** Exit 3 (id already used differently) and an unknown thread are final; anything else is retried. */
+export const todayWake: WakeSender = async (wake) => {
   // No test may ever message a real chat.
   if (process.env.NODE_ENV === "test" || process.env.HYGIENE_GATE_WAKE === "off") return "failed";
+  const { thread, text } = wake;
+  const argv = wakeCommand(wake);
+  if (!argv) {
+    console.error(`hygiene-gate: refused to wake an invalid chat or machine (${wake.id})`);
+    return "failed";
+  }
   const { CODEX_THREAD_ID: _thread, ...env } = process.env;
   for (const key of STRIPPED_ENV) delete env[key];
-  const bin = process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon");
-  const child = Bun.spawn(
-    [bin, "send", "--socket", `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "hygiene-gate",
-      "--client-message-id", id, thread, "-"],
-    { env, stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "pipe" },
-  );
-  const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+  const child = Bun.spawn(argv, { env, stdin: new TextEncoder().encode(text), stdout: "ignore", stderr: "pipe" });
+  const timer = setTimeout(() => child.kill("SIGKILL"), wake.machine ? 20_000 : 10_000);
   try {
     const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
     if (code === 0) return "sent";
-    console.error(`hygiene-gate: wake for ${thread.slice(0, 8)} failed (exit ${code}): ${error.trim().slice(0, 200)}`);
+    console.error(`hygiene-gate: wake for ${thread.slice(0, 8)}${wake.machine ? ` on ${wake.machine}` : ""} failed (exit ${code}): ${error.trim().slice(0, 200)}`);
     return code === 3 || /NotFound/.test(error) ? "failed" : "retry";
   } catch (error) {
     console.error("hygiene-gate: wake send failed:", (error as Error).message);

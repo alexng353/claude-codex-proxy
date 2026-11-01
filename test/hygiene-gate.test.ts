@@ -7,6 +7,7 @@ import { handleRequest } from "../src/app";
 import { closeIdleWorkers } from "../src/claude";
 import { zonedTime } from "../src/hygiene";
 import { setAuthenticator } from "../src/hygiene-api";
+import { wakeCommand } from "../src/hygiene-wake";
 import { flushWakes, gateRequest, gateStatus, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
 import { retryUnchecked } from "../src/hygiene-remote";
 import type { Verdict } from "../src/hygiene-proof";
@@ -26,7 +27,7 @@ let verdicts: Verdict[] = [];
 let classified = 0;
 let classifierDown = false;
 let classifyBlock: Promise<void> | null = null;
-let wakes: Array<{ id: string; thread: string; text: string }> = [];
+let wakes: Array<{ id: string; thread: string; machine?: string; text: string }> = [];
 let wakeResults: Array<"sent" | "retry" | "failed"> = [];
 let exif: Record<string, number | null> = {};
 let hashes: Record<string, string> = {};
@@ -629,6 +630,79 @@ describe("held messages wake their chat when the gate unlocks", () => {
     await flushWakes();
     expect(wakes).toHaveLength(0);
   });
+
+  test("a chat id that is not a Codex thread id is never held", async () => {
+    expect(text(await decide(request([env, user("hi")], "composer", { prompt_cache_key: "not-a-thread; rm -rf ~" })))).toContain("gate armed");
+    verdicts.push(teeth);
+    await cairnTeeth("cairn-teeth");
+    await flushWakes();
+    expect(wakes).toHaveLength(0);
+  });
+
+  test("held text is scrubbed before it is stored or sent", async () => {
+    const token = `ghp_${"a".repeat(36)}`;
+    expect(text(await decide(request([env, user(`use ${token} for the push`)], "composer", { prompt_cache_key: OTHER })))).toContain("gate armed");
+    expect(await readFile(join(dirname(process.env.HYGIENE_GATE_STATE!), "hygiene-held.json"), "utf8")).not.toContain(token);
+    verdicts.push(teeth);
+    await cairnTeeth("cairn-teeth");
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].text).not.toContain(token);
+    expect(wakes[0].text).toContain("[REDACTED:github-token]");
+  });
+
+  test("messages held more than 24 hours are dropped and counted in the wake", async () => {
+    clock = at(DAY, "06:00");
+    expect(text(await decide(request([env, user("old ask")], "composer", { prompt_cache_key: OTHER })))).toContain("gate armed");
+    clock = at("2026-10-09", "07:00");
+    expect(text(await decide(request([env, user("old ask"), assistant("locked"), user("new ask")], "composer", { prompt_cache_key: OTHER })))).toContain("gate armed");
+    expect(text(await decide(request([env, user("BYPASS")])))).toContain("bypass #1");
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].text).toContain("new ask");
+    expect(wakes[0].text).not.toContain("old ask");
+    expect(wakes[0].text).toContain("(1 older message dropped");
+  });
+
+  test("a hold that lands after another copy's check released is released behind the lock", async () => {
+    // Another proxy copy (a handoff) is mid-check: it holds the gate's lock and the check mark.
+    const statePath = process.env.HYGIENE_GATE_STATE!;
+    const other = Bun.spawn(["flock", "-x", "-o", `${statePath}.lock`, "sleep", "10"], { stdout: "ignore", stderr: "ignore" });
+    try {
+      for (let i = 0; i < 200 && !(await Bun.file(`${statePath}.lock`).exists()); i++) await Bun.sleep(5);
+      await Bun.sleep(100);
+      await writeFile(join(dirname(statePath), "hygiene-checking.json"), JSON.stringify({ pid: other.pid, until: Date.now() + 60_000 }));
+      expect(text(await decide(request([env, user("are you there?")], "composer", { prompt_cache_key: OTHER })))).toContain("photo received, checking");
+      // That copy's photo passed and it released before this hold was written.
+      const state = JSON.parse(await readFile(statePath, "utf8"));
+      state.filled[`${DAY}/morning-teeth`] = new Date(clock).toISOString();
+      await writeFile(statePath, JSON.stringify(state));
+      await rm(join(dirname(statePath), "hygiene-checking.json"));
+    } finally {
+      other.kill();
+      await other.exited;
+    }
+    for (let i = 0; i < 100 && !wakes.length; i++) {
+      await Bun.sleep(20);
+      await flushWakes();
+    }
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].text).toContain("are you there?");
+  });
+
+  test("the wake command validates its arguments and routes another machine's chat over ssh", () => {
+    const id = "hygiene-unlock-1793522368049-0123456789ab";
+    const local = wakeCommand({ id, thread: OTHER }, "forge")!;
+    expect(local.slice(-4)).toEqual([id, "--", OTHER, "-"]);
+    expect(local[0]).not.toBe("ssh");
+    expect(wakeCommand({ id, thread: OTHER, machine: "forge" }, "forge")![0]).not.toBe("ssh");
+    const remote = wakeCommand({ id, thread: OTHER, machine: "arch" }, "forge")!;
+    expect(remote.slice(0, 7)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", "arch"]);
+    expect(remote[7]).toContain(`--from hygiene-gate --client-message-id ${id} -- ${OTHER} -`);
+    expect(wakeCommand({ id, thread: "x; rm -rf ~" }, "forge")).toBeNull();
+    expect(wakeCommand({ id: "x;y", thread: OTHER }, "forge")).toBeNull();
+    expect(wakeCommand({ id, thread: OTHER, machine: "arch;id" }, "forge")).toBeNull();
+  });
 });
 
 describe("kill switch", () => {
@@ -935,8 +1009,9 @@ describe("following another machine's gate", () => {
 
   /** Run the authority's side as its own proxy: its state, no remote. */
   async function asAuthority<T>(work: () => Promise<T>): Promise<T> {
-    const env = { remote: process.env.HYGIENE_GATE_REMOTE, state: process.env.HYGIENE_GATE_STATE, directory: process.env.PROXY_STATE_DIR };
+    const env = { remote: process.env.HYGIENE_GATE_REMOTE, state: process.env.HYGIENE_GATE_STATE, directory: process.env.PROXY_STATE_DIR, machine: process.env.HYGIENE_GATE_MACHINE };
     delete process.env.HYGIENE_GATE_REMOTE;
+    process.env.HYGIENE_GATE_MACHINE = "forge";
     process.env.HYGIENE_GATE_STATE = authorityState;
     process.env.PROXY_STATE_DIR = join(dirname(authorityState), "authority-proxy");
     try {
@@ -945,6 +1020,8 @@ describe("following another machine's gate", () => {
       process.env.HYGIENE_GATE_REMOTE = env.remote;
       process.env.HYGIENE_GATE_STATE = env.state;
       process.env.PROXY_STATE_DIR = env.directory;
+      if (env.machine === undefined) delete process.env.HYGIENE_GATE_MACHINE;
+      else process.env.HYGIENE_GATE_MACHINE = env.machine;
     }
   }
 
@@ -993,6 +1070,27 @@ describe("following another machine's gate", () => {
     expect(JSON.parse(await readFile(followerState, "utf8")).bypass.count).toBe(0);
     // Bypassed: the turn reaches the model.
     expect(await reply([env, user("hi"), assistant("locked"), user("BYPASS"), assistant("open"), user("now answer")])).toBe("model-ran");
+  });
+
+  test("a follower chat's held message is woken on the follower's machine", async () => {
+    const machineBefore = process.env.HYGIENE_GATE_MACHINE;
+    process.env.HYGIENE_GATE_MACHINE = "arch";
+    try {
+      expect(await reply([env, user("arch link")])).toContain("gate armed");
+      await asAuthority(async () => {
+        process.env.HYGIENE_GATE_MACHINE = "forge";
+        verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+        const proof = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("cairn-teeth") }, { kind: "teeth", slot: (s) => s.endsWith("/morning-teeth") });
+        expect(proof.result).toBe("pass");
+        await flushWakes();
+      });
+    } finally {
+      if (machineBefore === undefined) delete process.env.HYGIENE_GATE_MACHINE;
+      else process.env.HYGIENE_GATE_MACHINE = machineBefore;
+    }
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ thread: THREAD, machine: "arch" });
+    expect(wakes[0].text).toContain("arch link");
   });
 
   test("status, rulings and Cairn's API are the authority's", async () => {
