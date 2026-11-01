@@ -34,6 +34,18 @@ const WAKE_ID = /^hygiene-unlock-\d+-[0-9a-f]{12}$/;
 /** This proxy's Today machine name. */
 export const localMachine = () => process.env.HYGIENE_GATE_MACHINE?.trim() || hostname();
 
+/**
+ * Machines a wake may be sent to over ssh (HYGIENE_GATE_MACHINES, comma list,
+ * default arch). Any other origin a follower names is treated as this machine,
+ * so a follower cannot point the authority's ssh at an arbitrary host.
+ */
+export const wakeMachines = () =>
+  new Set((process.env.HYGIENE_GATE_MACHINES ?? "arch").split(",").map((m) => m.trim()).filter((m) => MACHINE_NAME.test(m)));
+
+/** The machine to wake a chat on: a listed other machine, or undefined for this one. */
+const remoteMachine = (machine: string | undefined, here = localMachine()) =>
+  machine && machine !== here && MACHINE_NAME.test(machine) && wakeMachines().has(machine) ? machine : undefined;
+
 export type HeldMessage = {
   /** Codex thread id (prompt_cache_key). */
   thread: string;
@@ -105,9 +117,7 @@ function update<T>(path: string, edit: (store: Store) => T): T {
 /** Records a message the gate answered with its lock text instead of the model. */
 export function holdMessage(statePath: string, message: HeldMessage): void {
   if (!THREAD_ID.test(message.thread) || !message.key || (!message.text && !message.attachments)) return;
-  const machine = message.machine && MACHINE_NAME.test(message.machine) && message.machine !== localMachine()
-    ? message.machine
-    : undefined;
+  const machine = remoteMachine(message.machine);
   try {
     update(storePath(statePath), (store) => {
       if (store.held.some((h) => h.thread === message.thread && h.key === message.key)) return;
@@ -152,12 +162,13 @@ export function wakeText(messages: HeldMessage[], unlockedAt: number, reason: st
   ].join("\n");
 }
 
-export function heldNoteText(messages: HeldMessage[]): string {
+export function heldNoteText(messages: HeldMessage[], dropped = 0): string {
   return [
     `<${NOTE_TAG}>`,
     "Supplied automatically by Alex's hygiene gate; Alex did not type this.",
     "This message unlocked the gate. While it was armed it answered these earlier messages from Alex in this chat with its lock text, so nobody has acted on them yet:",
     ...listing(messages, (t) => t.replace(/</g, "&lt;")),
+    ...(dropped ? [`(${dropped} older message${dropped === 1 ? "" : "s"} dropped: held more than 24 hours.)`] : []),
     "Answer them first, then this message.",
     `</${NOTE_TAG}>`,
   ].join("\n");
@@ -173,7 +184,7 @@ export function releaseHeld(
   now: number,
   reason: string,
   current?: string,
-): { note: HeldMessage[]; woke: number } | null {
+): { note: HeldMessage[]; noteDropped: number; woke: number } | null {
   const path = storePath(statePath);
   // Most turns pass a clear gate with nothing held: skip the lock.
   if (!read(path).held.length) return null;
@@ -186,15 +197,21 @@ export function releaseHeld(
       const fresh = store.held.filter(isFresh);
       store.held = [];
       store.wakes = store.wakes.filter((w) => !(w.sentAt || w.failedAt) || now - Date.parse(w.at) <= RECEIPT_KEEP_MS);
+      // A chat whose held messages all aged out gets no wake; say so in the log.
+      for (const [key, count] of dropped)
+        if (!fresh.some((h) => chat(h) === key))
+          console.error(`hygiene-gate: dropped ${count} held message${count === 1 ? "" : "s"} older than 24 h for chat ${key.slice(0, key.indexOf("/") + 9)}; nothing fresh to wake it for`);
       if (!fresh.length) return null;
       const byChat = new Map<string, HeldMessage[]>();
       for (const h of fresh) byChat.set(chat(h), [...(byChat.get(chat(h)) ?? []), h]);
       // Thread ids are UUIDs, so the current turn's thread names one chat on whichever machine.
       const note: HeldMessage[] = [];
+      let noteDropped = 0;
       if (current)
         for (const [key, messages] of byChat)
           if (messages[0].thread === current) {
             note.push(...messages);
+            noteDropped += dropped.get(key) ?? 0;
             byChat.delete(key);
           }
       for (const [key, messages] of byChat) {
@@ -209,7 +226,7 @@ export function releaseHeld(
           text: wakeText(messages, now, reason, dropped.get(key) ?? 0),
         });
       }
-      return { note, woke: byChat.size };
+      return { note, noteDropped, woke: byChat.size };
     });
   } catch (error) {
     console.error("hygiene-gate: could not release held messages:", (error as Error).message);
@@ -275,15 +292,16 @@ async function flushOnce(statePath: string, send: WakeSender, now: number): Prom
  */
 export function wakeCommand(wake: { id: string; thread: string; machine?: string }, here = localMachine()): string[] | null {
   if (!THREAD_ID.test(wake.thread) || !WAKE_ID.test(wake.id)) return null;
-  if (!wake.machine || wake.machine === here)
+  if (wake.machine && !MACHINE_NAME.test(wake.machine)) return null;
+  const machine = remoteMachine(wake.machine, here);
+  if (!machine)
     return [
       process.env.TODAY_DAEMON_BIN ?? join(homedir(), ".local/bin/today-daemon"),
       "send", "--socket", `/run/user/${process.getuid!()}/today/daemon.sock`, "--from", "hygiene-gate",
       "--client-message-id", wake.id, "--", wake.thread, "-",
     ];
-  if (!MACHINE_NAME.test(wake.machine)) return null;
   return [
-    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", wake.machine,
+    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", machine,
     `exec env -u CODEX_THREAD_ID "$HOME/.local/bin/today-daemon" send --socket "/run/user/$(id -u)/today/daemon.sock" --from hygiene-gate --client-message-id ${wake.id} -- ${wake.thread} -`,
   ];
 }

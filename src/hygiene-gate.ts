@@ -611,7 +611,7 @@ async function decideHumanTurn(
       thread,
       key: newestKey,
       debtId: `held:${now}`,
-      text: heldNoteText(released.note),
+      text: heldNoteText(released.note, released.noteDropped),
     });
     dirty = true;
   }

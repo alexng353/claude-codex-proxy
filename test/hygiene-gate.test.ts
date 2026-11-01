@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -702,6 +702,61 @@ describe("held messages wake their chat when the gate unlocks", () => {
     expect(wakeCommand({ id, thread: "x; rm -rf ~" }, "forge")).toBeNull();
     expect(wakeCommand({ id: "x;y", thread: OTHER }, "forge")).toBeNull();
     expect(wakeCommand({ id, thread: OTHER, machine: "arch;id" }, "forge")).toBeNull();
+  });
+
+  test("an origin machine not in HYGIENE_GATE_MACHINES is treated as local and never ssh'd to", async () => {
+    const id = "hygiene-unlock-1793522368049-0123456789ab";
+    expect(wakeCommand({ id, thread: OTHER, machine: "evilbox" }, "forge")![0]).not.toBe("ssh");
+    expect(text(await gateRequest(request([env, user("hi from elsewhere")], "composer", { prompt_cache_key: OTHER }), { machine: "evilbox" }))).toContain("gate armed");
+    verdicts.push(teeth);
+    await cairnTeeth("cairn-teeth");
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].machine).toBeUndefined();
+    expect(wakeCommand(wakes[0], "forge")![0]).not.toBe("ssh");
+    // A listed machine still routes over ssh.
+    const listedBefore = process.env.HYGIENE_GATE_MACHINES;
+    process.env.HYGIENE_GATE_MACHINES = "arch, evilbox";
+    try {
+      expect(wakeCommand({ id, thread: OTHER, machine: "evilbox" }, "forge")![0]).toBe("ssh");
+    } finally {
+      if (listedBefore === undefined) delete process.env.HYGIENE_GATE_MACHINES;
+      else process.env.HYGIENE_GATE_MACHINES = listedBefore;
+    }
+  });
+
+  test("the unlocking chat's note counts its dropped messages", async () => {
+    clock = at(DAY, "06:00");
+    expect(text(await decide(request([env, user("old ask")])))).toContain("gate armed");
+    // Oct 8's evening proofs were sent, so on Oct 9 only the morning teeth photo locks.
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const state = JSON.parse(await readFile(path, "utf8"));
+    state.filled[`${DAY}/morning-teeth`] = state.filled[`${DAY}/shower`] = state.filled[`${DAY}/night-teeth`] = new Date(at(DAY, "20:00")).toISOString();
+    await writeFile(path, JSON.stringify(state));
+    clock = at("2026-10-09", "07:00");
+    const history = [env, user("old ask"), assistant("locked")];
+    expect(text(await decide(request([...history, user("new ask")])))).toContain("gate armed");
+    verdicts.push(teeth);
+    const decision = await decide(request([...history, user("new ask"), assistant("locked"), user({ photo: "teeth-2" })]));
+    expect(decision.action).toBe("forward");
+    const forwarded = JSON.stringify(decision.action === "forward" && decision.request);
+    expect(forwarded).toContain("new ask");
+    expect(forwarded).toContain("(1 older message dropped");
+  });
+
+  test("a chat whose held messages all aged out is logged, not woken", async () => {
+    clock = at(DAY, "06:00");
+    expect(text(await decide(request([env, user("old ask")], "composer", { prompt_cache_key: OTHER })))).toContain("gate armed");
+    clock = at("2026-10-09", "07:00");
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(text(await decide(request([env, user("BYPASS")])))).toContain("bypass #1");
+      await flushWakes();
+      expect(wakes).toHaveLength(0);
+      expect(logged.mock.calls.map((c) => String(c[0])).some((line) => line.includes("dropped 1 held message") && line.includes(OTHER.slice(0, 8)))).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
   });
 });
 
