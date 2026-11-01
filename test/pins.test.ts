@@ -484,3 +484,43 @@ test("runClaude balances a start mark that was queued under contention", async (
     blocker.close();
   }
 }, 30_000);
+
+test("atomic init preserves a newer existing pin", async () => {
+  pinThreadAccount("init-existing", "spare");
+  const result = await call("/pins", { op: "init", pins: [{ threadId: "init-existing", account: "default" }] });
+  expect(result.status).toBe(200);
+  expect(result.body.changed).toBe(0);
+  expect(result.body.pins).toEqual([{ threadId: "init-existing", account: "spare" }]);
+  expect(threadAccount("init-existing")).toBe("spare");
+});
+
+test("concurrent initializations keep exactly one winning pin", async () => {
+  const results = await Promise.all(["default", "spare"].map(account => call("/pins", {
+    op: "init", pins: [{ threadId: "init-race", account }],
+  })));
+  expect(results.map(r => r.status)).toEqual([200, 200]);
+  expect(results.reduce((n, r) => n + r.body.changed, 0)).toBe(1);
+  const winner = threadAccount("init-race");
+  expect(results.every(r => r.body.pins[0].account === winner)).toBe(true);
+  const listed = await call("/pins");
+  expect(listed.body.pins.filter((p: any) => p.threadId === "init-race")).toHaveLength(1);
+});
+
+test("a received but delayed init preserves failover before its body finishes", async () => {
+  let release!: (body: Uint8Array) => void;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) { release = body => { controller.enqueue(body); controller.close(); }; },
+  });
+  const pending = handleRequest(new Request("http://127.0.0.1:3456/pins", {
+    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${pinsToken()}` }, body: stream,
+  }), "127.0.0.1");
+  pinThreadAccount("init-delayed", "spare");
+  const before = threadPin("init-delayed");
+  release(new TextEncoder().encode(JSON.stringify({ op: "init", pins: [{ threadId: "init-delayed", account: "default" }] })));
+  const response = await pending;
+  expect(response.status).toBe(200);
+  const result = await response.json() as any;
+  expect(result.changed).toBe(0);
+  expect(result.pins).toEqual([{ threadId: "init-delayed", account: "spare" }]);
+  expect(threadPin("init-delayed")).toEqual(before);
+});

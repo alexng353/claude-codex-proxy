@@ -38,6 +38,7 @@ import { openUsageDb } from "./usage";
  *
  *   GET  /pins[?account=NAME]                             list
  *   POST /pins       {pins:[{threadId,account}], force?}  set one or many
+ *   POST /pins       {op:"init",pins:[{threadId,account}]} initialize absent pins
  *   POST /pins/move  {from,to,threadIds?,idleForMs?,force?}  bulk move
  *   POST /pins/clear {threadIds}                          clear
  * Writes take `reason` (backup label) and `dryRun`.
@@ -389,6 +390,7 @@ export type PinResult = {
   changed: number;
   changes: PinChange[];
   warnings: string[];
+  pins?: PinWrite[];
 };
 
 function diff(current: ReadonlyMap<string, string>, writes: PinWrite[]): PinChange[] {
@@ -428,7 +430,10 @@ function unknownIds(ids: Iterable<string>): string[] {
 }
 
 export function setPins(input: unknown): PinResult {
-  const fields = body(input, ["pins", "reason", "dryRun", "force"]);
+  const fields = body(input, ["op", "pins", "reason", "dryRun", "force"]);
+  if (fields.op !== undefined && fields.op !== "init" && fields.op !== "set")
+    throw new PinError("op must be init or set");
+  const initialize = fields.op === "init";
   const names = accountNames();
   if (!Array.isArray(fields.pins) || fields.pins.length === 0 || fields.pins.length > MAX_THREADS)
     throw new PinError(`pins must be a list of 1 to ${MAX_THREADS} {threadId, account}`);
@@ -440,13 +445,20 @@ export function setPins(input: unknown): PinResult {
   if (new Set(edits.map((edit) => edit.threadId)).size !== edits.length)
     throw new PinError("pins lists a thread more than once");
   const warnings = unknownIds(edits.map((edit) => edit.threadId));
-  return apply({
+  let pins: PinWrite[] = [];
+  const result = apply({
     dryRun: flag(fields.dryRun, "dryRun"),
     force: flag(fields.force, "force"),
     reason: label(fields.reason),
     warnings,
-    plan: () => edits,
+    // writeThreadAccounts calls this under its BEGIN IMMEDIATE transaction.
+    plan: (current) => {
+      if (!initialize) return edits;
+      pins = edits.map(edit => ({ ...edit, account: current.get(edit.threadId) ?? edit.account }));
+      return edits.filter(edit => !current.has(edit.threadId));
+    },
   });
+  return initialize ? { ...result, pins } : result;
 }
 
 export function movePins(input: unknown): PinResult {
