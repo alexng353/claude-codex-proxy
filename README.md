@@ -199,7 +199,9 @@ curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":"Bubble,
 curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":null}'   # clear
 ```
 
-A name has 1 to 80 characters on one line, with no `<` or `>` and no spaces at the ends. Today exposes the same API as `today-daemon agent-name` and the MCP tools `get_agent_name` and `set_agent_name`.
+A name has 1 to 80 characters on one line, with no `<` or `>` and no spaces at the ends. Today exposes the same API as the MCP tools `get_agent_name` and `set_agent_name`, and as `today-daemon get-agent-name '{"threadId":"T"}'` and `today-daemon set-agent-name '{"threadId":"T","name":"Bubble"}'`. These accept a Today or Codex thread id.
+
+A name is stored under the Codex thread that the chat drives at the time it is set. If Today replaces that engine thread, set the name again.
 
 ### Live usage dashboard
 
