@@ -75,6 +75,15 @@ Provider settings cannot be placed in a repository's `.codex/config.toml`; Codex
 
 A spawned sub-agent inherits its parent task's provider; Codex changes only the model (`core/src/agent/child_config.rs`, 0.155). A task on `claude_subscription` therefore cannot run an OpenAI-model sub-agent: the request reaches this Claude-only endpoint and fails with `Unsupported Claude model`. The proxy never substitutes a Claude model. To mix models, put both behind one provider that dispatches by exact model. Alex's Linux setup does this with a local router at `openai_base_url`: tasks use the built-in `openai` provider, Claude requests reach this proxy, and GPT requests go to OpenAI unchanged. See [desktop/README.md](desktop/README.md).
 
+### Claude sub-agents of a GPT-6 parent (multi-agent v2)
+
+The model catalog gives every GPT-6 model `multi_agent_version: v2`. Under v2 a child gets its task as an `agent_message`: a plaintext header (`Message Type`, `Task name`, `Sender`) and the parent's message as `encrypted_content`. OpenAI encrypted that message for OpenAI models, and nothing on this machine can read it. For a Claude child, the proxy handles it as follows (`src/request.ts`):
+
+- **A `NEW_TASK` whose task name ends in `__<key>`** (`<key>` is 8 to 32 of `[a-z0-9]`): the proxy reads `~/.cache/agent-tasks/<name>.md` in place of the encrypted payload. `AGENT_TASKS_DIR` overrides the directory. The file must be a regular file (not a symlink) that this user owns, with mode `0600` or stricter, at most 512 KiB, and a modification time within a day of now. The comb skill writes these files.
+- **Anything else** (no key, a missing or refused file, or an encrypted follow-up or steer): the child is told the payload is unreadable. It must not guess, and it replies `BLOCKED: ...`.
+
+A known limit: the file is read every time the conversation is rendered. A cold worker that re-renders the conversation after the orchestrator deleted the file (or after a day) sees the BLOCKED notice in place of the task. This was accepted: the reviewer has already acted on the task by then, and the orchestrator's nonce handshake rejects a read that never saw its prompt.
+
 ## Configuration
 
 | Environment variable | Default | Purpose |

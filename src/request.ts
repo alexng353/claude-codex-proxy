@@ -1,4 +1,4 @@
-import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -220,11 +220,22 @@ export function readAgentTaskFile(taskName: string): TaskFile | undefined {
     if (!stat.isFile()) return { path, refused: "it is not a regular file" };
     if (typeof process.getuid === "function" && stat.uid !== process.getuid())
       return { path, refused: "another user owns it" };
-    if (stat.mode & 0o022) return { path, refused: "others can write to it" };
+    // Private, as the comb skill writes it (umask 077): no group or other bits at all.
+    if (stat.mode & 0o077) return { path, refused: "it is not private (mode allows group or others)" };
     if (stat.size > AGENT_TASK_MAX_BYTES) return { path, refused: "it is larger than 512 KiB" };
-    if (Date.now() - stat.mtimeMs > AGENT_TASK_MAX_AGE_MS)
-      return { path, refused: "it is more than a day old" };
-    const text = readFileSync(fd, "utf8");
+    // Absolute age: a future mtime is as untrustworthy as an old one.
+    if (Math.abs(Date.now() - stat.mtimeMs) > AGENT_TASK_MAX_AGE_MS)
+      return { path, refused: "its modification time is more than a day away from now" };
+    // At most MAX+1 bytes: a file that grew after fstat is still caught.
+    const buffer = Buffer.alloc(AGENT_TASK_MAX_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const read = readSync(fd, buffer, length, buffer.length - length, null);
+      if (read === 0) break;
+      length += read;
+    }
+    if (length > AGENT_TASK_MAX_BYTES) return { path, refused: "it is larger than 512 KiB" };
+    const text = buffer.subarray(0, length).toString("utf8");
     return text.trim() ? { path, text } : { path, refused: "it is empty" };
   } finally {
     closeSync(fd);
@@ -233,29 +244,37 @@ export function readAgentTaskFile(taskName: string): TaskFile | undefined {
 
 const agentMessageHeaderName = (text: string): string | undefined =>
   /^Task name: (\S+)$/m.exec(text)?.[1];
+const agentMessageType = (text: string): string | undefined =>
+  /^Message Type: (\S+)$/m.exec(text)?.[1];
 
 function serializeAgentMessage(item: ResponseInputItem): string {
   const parts = typeof item.content === "string" ? [{ type: "input_text", text: item.content }] : (item.content ?? []);
   const plain = parts
     .filter((part) => ["input_text", "output_text", "text"].includes(part.type ?? ""))
     .map((part) => part.text ?? "")
-    .join("");
+    .join("\n");
   const encrypted = parts.some((part) => part.type === "encrypted_content");
   const from = typeof item.author === "string" ? item.author : "another agent";
   const to = typeof item.recipient === "string" ? item.recipient : undefined;
   const lines = [`<agent_message from=${JSON.stringify(from)}${to ? ` to=${JSON.stringify(to)}` : ""}>`, plain.replace(/\n+$/, "")];
   if (encrypted) {
     const taskName = to ?? agentMessageHeaderName(plain) ?? "";
-    const file = readAgentTaskFile(taskName);
+    // The task file is the task itself, so it stands in only for the NEW_TASK that
+    // carried it. A later encrypted follow-up or steer is different text the child
+    // must not be told is its original task again.
+    const newTask = agentMessageType(plain) === "NEW_TASK";
+    const file = newTask ? readAgentTaskFile(taskName) : undefined;
     if (file?.text !== undefined) {
       lines.push(
         `[The sender's payload was encrypted for OpenAI models, so the proxy read the sender's task file ${file.path} in its place. Its text follows and is your task.]`,
         file.text.replace(/\n+$/, ""),
       );
     } else {
-      const where = file
-        ? ` The task file ${file.path} was not used: ${file.refused}.`
-        : ` No task file was looked up: the task name has no "__<nonce>" suffix.`;
+      const where = !newTask
+        ? " Only a NEW_TASK is read from a task file, and this message is not one."
+        : file
+          ? ` The task file ${file.path} was not used: ${file.refused}.`
+          : ` No task file was looked up: the task name has no "__<nonce>" suffix.`;
       lines.push(
         `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${where} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${taskName || "unnamed task"})."]`,
       );

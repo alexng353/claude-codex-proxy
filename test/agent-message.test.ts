@@ -106,4 +106,60 @@ describe("multi-agent v2 agent_message items", () => {
     writeFileSync(join(dir, "leaf__q1w2e3r4t5.md"), "Nested PLUM.", { mode: 0o600 });
     expect(serializeItem(v2Task("/root/driver/leaf__q1w2e3r4t5"))).toContain("Nested PLUM.");
   });
+
+  test("only a NEW_TASK is replaced by the task file; a follow-up or steer is never answered with the old task", () => {
+    const name = "p1_claude__aa11bb22cc";
+    writeFileSync(join(dir, `${name}.md`), "Original task PLUM.", { mode: 0o600 });
+    for (const kind of ["MESSAGE", "FOLLOWUP_TASK"]) {
+      const item = v2Task(`/root/${name}`);
+      const parts = item.content as { type: string; text?: string }[];
+      parts[0] = { type: "input_text", text: `Message Type: ${kind}\nTask name: /root/${name}\nSender: /root\nPayload:\n` };
+      const text = serializeItem(item);
+      expect(text).not.toContain("Original task PLUM.");
+      expect(text).toContain("BLOCKED");
+    }
+  });
+
+  test("plaintext parts are joined with a newline so they cannot run together", () => {
+    const text = serializeItem({
+      type: "agent_message",
+      author: "/root/a",
+      recipient: "/root",
+      content: [
+        { type: "input_text", text: "first" },
+        { type: "input_text", text: "second" },
+      ],
+    } as ResponseInputItem);
+    expect(text).toContain("first\nsecond");
+  });
+
+  test("a task file readable by group or others is refused", () => {
+    const name = "p1_claude__gg44hh55ii";
+    const path = join(dir, `${name}.md`);
+    writeFileSync(path, "Readable task.");
+    chmodSync(path, 0o640);
+    expect(serializeItem(v2Task(`/root/${name}`))).not.toContain("Readable task.");
+    chmodSync(path, 0o604);
+    expect(serializeItem(v2Task(`/root/${name}`))).not.toContain("Readable task.");
+  });
+
+  test("a task file with a future mtime is refused", () => {
+    const name = "p1_claude__ff00ee11dd";
+    const path = join(dir, `${name}.md`);
+    writeFileSync(path, "Future task.", { mode: 0o600 });
+    const future = Date.now() / 1000 + 2 * 86_400;
+    utimesSync(path, future, future);
+    expect(serializeItem(v2Task(`/root/${name}`))).not.toContain("Future task.");
+  });
+
+  // Regression guard for the size limit; the grow-after-fstat race the bounded
+  // read closes cannot be staged deterministically here.
+  test("an oversized task file is refused", () => {
+    const name = "p1_claude__bb22cc33dd";
+    const path = join(dir, `${name}.md`);
+    writeFileSync(path, "x".repeat(512 * 1024 + 1), { mode: 0o600 });
+    const text = serializeItem(v2Task(`/root/${name}`));
+    expect(text).not.toContain("xxxxxxxx");
+    expect(text).toContain("BLOCKED");
+  });
 });
