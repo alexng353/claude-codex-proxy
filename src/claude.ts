@@ -1,3 +1,4 @@
+import { withAgentIdentity } from "./agent-identity";
 import { STRIPPED_ENV } from "./claude-env";
 import { authIncidentId, credentialStatus, recordCredentialObservation } from "./auth-health";
 import { normalizeContext } from "./context.mjs";
@@ -179,7 +180,8 @@ function sessionArgs(session?: SessionLaunch): string[] {
 }
 
 export function systemPrompt(request: ResponsesRequest): string {
-  return [CODEX_TOOL_SYSTEM_PROMPT, systemContext(request)]
+  // A named chat's identity line comes first, right after Claude Code's own fixed prefix.
+  return [request.agentIdentity, CODEX_TOOL_SYSTEM_PROMPT, systemContext(request)]
     .filter(Boolean)
     .join("\n\n");
 }
@@ -268,6 +270,7 @@ class ClaudeWorker {
   readonly effort: string | undefined;
   readonly toolSignature: string;
   readonly instructions: string | undefined;
+  readonly agentIdentity: string | undefined;
   readonly sessionId = crypto.randomUUID();
   readonly key: SessionKey;
   readonly account: Account;
@@ -306,6 +309,7 @@ class ClaudeWorker {
     this.effort = resolveEffort(request);
     this.toolSignature = toolSignature(request);
     this.instructions = request.instructions;
+    this.agentIdentity = request.agentIdentity;
     this.key = sessionKey(request);
     maybePrune();
     try {
@@ -638,6 +642,7 @@ function claimWorker(
       worker.model !== request.model ||
       worker.effort !== effort ||
       worker.instructions !== request.instructions ||
+      worker.agentIdentity !== request.agentIdentity ||
       worker.toolSignature !== signature ||
       input.length <= worker.seenCount ||
       prefixHash(input, worker.seenCount) !== worker.prefixHash
@@ -665,11 +670,16 @@ function inputItems(request: ResponsesRequest): ResponseInputItem[] {
 const sha256 = (value: string) =>
   new Bun.CryptoHasher("sha256").update(value).digest("hex");
 
-function sessionKey(request: ResponsesRequest): SessionKey {
+/** Exported for tests: the key stored sessions are found by. */
+export function sessionKey(request: ResponsesRequest): SessionKey {
+  const instructions = request.instructions ?? "";
   return {
     model: request.model,
     effort: resolveEffort(request) ?? "",
-    instructionsHash: sha256(request.instructions ?? ""),
+    // Unnamed chats keep their existing hash, so their stored sessions still resume.
+    instructionsHash: sha256(
+      request.agentIdentity ? `${request.agentIdentity}\n\n${instructions}` : instructions,
+    ),
     toolsHash: sha256(toolSignature(request)),
   };
 }
@@ -812,6 +822,8 @@ export function threadsInFlight(): ReadonlySet<string> {
 export async function runClaude(
   request: ResponsesRequest,
 ): Promise<ProxyOutput> {
+  // Resolved per call, so a name changed between turns applies on the next one.
+  request = withAgentIdentity(request);
   const threadId =
     typeof request.prompt_cache_key === "string"
       ? request.prompt_cache_key

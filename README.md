@@ -185,6 +185,28 @@ sqlite3 ~/.local/state/claude-codex-proxy/sessions.sqlite "INSERT OR REPLACE INT
 
 Edits take effect on each thread's next turn, with no restart. A turn reads its pin and the pin's generation from SQLite when it starts; nothing caches them. At the end of the turn, it saves the account it ran on only if the pin still has that account and generation. Every API edit increments the generation, and a clear keeps it in `thread_account_generations`. So a turn that is running during an edit never undoes the edit, even an edit away and back to the same account.
 
+### Per-chat agent names
+
+A chat can have its own name. Then each turn tells the model `You are NAME, powered by MODEL (VENDOR).`, for example `You are Bubble, Alex's coordinator, powered by Claude Opus 5.5 (Anthropic).` The model and vendor come from the model that serves the request (`src/agent-identity.ts`). If the model ID does not name exactly one model, the proxy adds no line. Examples are an alias without a version (`opus`), a dated snapshot, or a `-latest` pointer. Chats without a name do not change.
+
+- **Claude:** the line starts the system prompt file. Claude Code still sends its own fixed first line (`You are a Claude agent, built on Anthropic's Claude Agent SDK.`) before it. The subscription accepts only a few such prefixes, so the proxy cannot replace that line. A name change starts a new worker on the next turn.
+- **GPT (through the model router):** the router already sends each GPT turn to `/hygiene/gate`. There the line replaces the first sentence of Codex's instructions (`You are Codex, an agent based on GPT-6.`), or goes in front if that sentence is missing. The router needs no change.
+
+Names are stored in `sessions.sqlite` (`thread_agent_names`), keyed by Codex thread id. `/agent-names` uses the same access rules and token as `/pins`:
+
+```bash
+curl -s 127.0.0.1:3456/agent-names                       # every named chat
+curl -s '127.0.0.1:3456/agent-names?threadId=T'          # {threadId, name|null}
+curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":"Bubble, Alex'\''s coordinator"}'
+curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":null}'   # clear
+```
+
+A name has 1 to 40 code points. It starts with a letter or digit and holds only letters, digits, spaces and `' , & -`. It cannot end with a space. Because `.`, `:`, `(` and `)` are refused, a name cannot end the sentence and start an instruction. The whole words `powered`, `model`, `GPT`, `Claude`, `OpenAI` and `Anthropic` are refused in any case, so a name cannot say which model or vendor it runs on; only the line itself says that. Today's `agent_identity.rs` checks the same rule.
+
+Today owns the names. It keeps each name under its own thread id and writes it here through the MCP tools `get_agent_name` and `set_agent_name`. The CLI `today-daemon get-agent-name` can read a name. Today's tools let only Today's own chat tools and the engine's own MCP process of a full-access chat set a name, and never for the calling chat itself. Today keeps a name only after this API has accepted it. When Today replaces a chat's engine thread, it posts the name for the new Codex thread and clears the old one.
+
+This is a guard in Today's tools, not a security boundary. A process that can read this machine's `pins.token` can write `/agent-names` directly, and a full-access chat can read it. Today's `machine_read_file` refuses that file, but a shell can still read it.
+
 ### Live usage dashboard
 
 Run `bun run dashboard`, then open [the local dashboard](http://127.0.0.1:3458). It shows the last 24 hours of overlapping quota lines, output tokens by model, and input/output/cache percentages. The page refreshes every 30 seconds while visible, or immediately with **Reload**. It reads `limits-history.jsonl` and `usage.sqlite` without changing them or making model requests. Keep the five-minute quota recorder running for fresh observations. The timestamp shows when data was loaded; quota observations can be older and gaps are left open. Failed refreshes preserve the last successful view and display an error.

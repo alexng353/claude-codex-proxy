@@ -114,29 +114,34 @@ export function isLoopback(address: string): boolean {
 
 /** Undefined when the request may proceed; otherwise the refusal. */
 function refuse(request: Request, url: URL, peer: string | undefined): Response | undefined {
+  return refuseLocal(request, url, peer, "Pins");
+}
+
+/** The pins access rules, shared by other local APIs (/agent-names); `label` prefixes refusals. */
+export function refuseLocal(request: Request, url: URL, peer: string | undefined, label: string): Response | undefined {
   const fail = (message: string, status: number) =>
     Response.json({ error: { message, type: "invalid_request_error" } }, { status });
   // Fails closed: a caller that cannot name the socket peer gets nothing.
   if (peer === undefined || !isLoopback(peer))
-    return fail(`Pins: only loopback peers are answered (peer ${peer ?? "unknown"})`, 403);
+    return fail(`${label}: only loopback peers are answered (peer ${peer ?? "unknown"})`, 403);
   if (request.headers.has("origin"))
-    return fail("Pins: browser requests (with an Origin header) are refused", 403);
+    return fail(`${label}: browser requests (with an Origin header) are refused`, 403);
   const port = process.env.PORT ?? "3456";
   const hosts = [`127.0.0.1:${port}`, `localhost:${port}`];
   const host = request.headers.get("host");
   if (!hosts.includes(url.host) || (host !== null && !hosts.includes(host)))
-    return fail(`Pins: Host must be ${hosts.join(" or ")}`, 403);
+    return fail(`${label}: Host must be ${hosts.join(" or ")}`, 403);
   const write = request.method !== "GET";
   if (write) {
     const type = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
-    if (type !== "application/json") return fail("Pins: content-type must be application/json", 415);
+    if (type !== "application/json") return fail(`${label}: content-type must be application/json`, 415);
   }
   const apiKey = process.env.PROXY_API_KEY;
   if (!write && !apiKey) return undefined;
   const header = request.headers.get("authorization") ?? "";
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : "";
   if (bearer && (same(bearer, pinsToken()) || (apiKey !== undefined && same(bearer, apiKey)))) return undefined;
-  return fail(`Pins: ${write ? "writes need" : "PROXY_API_KEY is set, so reads need"} a bearer token from ${pinsTokenPath()}`, 401);
+  return fail(`${label}: ${write ? "writes need" : "PROXY_API_KEY is set, so reads need"} a bearer token from ${pinsTokenPath()}`, 401);
 }
 
 // --- Reading ----------------------------------------------------------------

@@ -1,4 +1,6 @@
 import { accountStatus, usageHeaders } from "./accounts";
+import { withAgentInstructions } from "./agent-identity";
+import { handleAgentNamesRoute } from "./agent-names";
 import { runClaude } from "./claude";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
@@ -90,7 +92,8 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
   if (decision.action === "respond")
     return json({ action: "respond", response: responseObject(body, syntheticOutput(decision.text)) });
   try {
-    const prepared = preloadSkills(decision.request);
+    // GPT turns get a named chat's identity line in their instructions here (agent-identity.ts).
+    const prepared = withAgentInstructions(preloadSkills(decision.request));
     return json(prepared === body ? { action: "forward" } : { action: "forward", request: prepared });
   } catch (cause) {
     // The router fails open on HTTP errors. A normal synthetic response keeps a
@@ -114,6 +117,8 @@ export async function handleRequest(request: Request, peer?: string): Promise<Re
   // its own token, accepting PROXY_API_KEY too, so it runs before the shared key check.
   const pins = await handlePinsRoute(request, url, peer);
   if (pins) return pins;
+  const agentNames = await handleAgentNamesRoute(request, url, peer);
+  if (agentNames) return agentNames;
   if (!authorized(request)) return error("Invalid API key", 401);
   if (url.pathname === "/accounts" && request.method === "GET")
     return json({ accounts: accountStatus() });
