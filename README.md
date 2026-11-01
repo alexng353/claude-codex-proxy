@@ -183,6 +183,24 @@ sqlite3 ~/.local/state/claude-codex-proxy/sessions.sqlite "INSERT OR REPLACE INT
 
 Edits take effect on each thread's next turn, with no restart. A turn reads its pin and the pin's generation from SQLite when it starts; nothing caches them. At the end of the turn, it saves the account it ran on only if the pin still has that account and generation. Every API edit increments the generation, and a clear keeps it in `thread_account_generations`. So a turn that is running during an edit never undoes the edit, even an edit away and back to the same account.
 
+### Per-chat agent names
+
+A chat can have its own name. Then each turn tells the model `You are NAME, powered by MODEL (VENDOR).`, for example `You are Bubble, Alex's coordinator, powered by Claude Opus 5.5 (Anthropic).` The model and vendor come from the model that serves the request (`src/agent-identity.ts`). If the proxy cannot name the model, it adds no line. Chats without a name do not change.
+
+- **Claude:** the line starts the system prompt file. Claude Code still sends its own fixed first line (`You are a Claude agent, built on Anthropic's Claude Agent SDK.`) before it. The subscription accepts only a few such prefixes, so the proxy cannot replace that line. A name change starts a new worker on the next turn.
+- **GPT (through the model router):** the router already sends each GPT turn to `/hygiene/gate`. There the line replaces the first sentence of Codex's instructions (`You are Codex, an agent based on GPT-6.`), or goes in front if that sentence is missing. The router needs no change.
+
+Names are stored in `sessions.sqlite` (`thread_agent_names`), keyed by Codex thread id. `/agent-names` uses the same access rules and token as `/pins`:
+
+```bash
+curl -s 127.0.0.1:3456/agent-names                       # every named chat
+curl -s '127.0.0.1:3456/agent-names?threadId=T'          # {threadId, name|null}
+curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":"Bubble, Alex'\''s coordinator"}'
+curl -s "${j[@]}" 127.0.0.1:3456/agent-names -d '{"threadId":"T","name":null}'   # clear
+```
+
+A name has 1 to 80 characters on one line, with no `<` or `>` and no spaces at the ends. Today exposes the same API as `today-daemon agent-name` and the MCP tools `get_agent_name` and `set_agent_name`.
+
 ### Live usage dashboard
 
 Run `bun run dashboard`, then open [the local dashboard](http://127.0.0.1:3458). It shows the last 24 hours of overlapping quota lines, output tokens by model, and input/output/cache percentages. The page refreshes every 30 seconds while visible, or immediately with **Reload**. It reads `limits-history.jsonl` and `usage.sqlite` without changing them or making model requests. Keep the five-minute quota recorder running for fresh observations. The timestamp shows when data was loaded; quota observations can be older and gaps are left open. Failed refreshes preserve the last successful view and display an error.

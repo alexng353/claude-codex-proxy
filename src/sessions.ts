@@ -75,7 +75,40 @@ function open(): Database {
     thread_id TEXT PRIMARY KEY,
     generation INTEGER NOT NULL
   )`);
+  // A chat's own agent name (agent-identity.ts). No row: the default identity.
+  db.exec(`CREATE TABLE IF NOT EXISTS thread_agent_names (
+    thread_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`);
   return db;
+}
+
+export function threadAgentName(threadId: string): string | undefined {
+  const row = open().query("SELECT name FROM thread_agent_names WHERE thread_id = ?")
+    .get(threadId) as { name: string } | null;
+  return row?.name;
+}
+
+/** Set or (with undefined) clear a chat's agent name; returns the one it replaced. */
+export function setThreadAgentName(threadId: string, name: string | undefined): string | undefined {
+  const database = open();
+  return database.transaction(() => {
+    const previous = threadAgentName(threadId);
+    if (name === undefined)
+      database.query("DELETE FROM thread_agent_names WHERE thread_id = ?").run(threadId);
+    else
+      database.query(`INSERT INTO thread_agent_names (thread_id, name, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(thread_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`)
+        .run(threadId, name, Date.now());
+    return previous;
+  })();
+}
+
+export function listThreadAgentNames(): Array<{ threadId: string; name: string; updatedAt: string }> {
+  return (open().query("SELECT thread_id, name, updated_at FROM thread_agent_names ORDER BY thread_id")
+    .all() as Array<{ thread_id: string; name: string; updated_at: number }>)
+    .map((row) => ({ threadId: row.thread_id, name: row.name, updatedAt: new Date(row.updated_at).toISOString() }));
 }
 
 /** Account ownership outlives transcript pruning and quota resets. */

@@ -48,6 +48,8 @@ export type ResponsesRequest = {
   reasoning?: { effort?: string };
   /** Codex thread key for durable account pinning and usage attribution. */
   prompt_cache_key?: string;
+  /** Internal, set only by agent-identity.ts: the chat's own identity line (Claude route). */
+  agentIdentity?: string;
 };
 
 export type ClaudeResult = {
