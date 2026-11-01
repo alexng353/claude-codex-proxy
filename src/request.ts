@@ -257,7 +257,19 @@ export type AgentMessagePayload =
   | { kind: "task-file"; plain: string; taskName: string; file: TaskFile & { text: string } }
   | { kind: "blocked"; plain: string; taskName: string; newTask: boolean; file?: TaskFile };
 
+/**
+ * One decision per item object: a request's items are serialized several times
+ * (budget, prompt) and read again by the counter, and the task file is read once.
+ */
+const payloads = new WeakMap<ResponseInputItem, AgentMessagePayload>();
+
 export function agentMessagePayload(item: ResponseInputItem): AgentMessagePayload {
+  let payload = payloads.get(item);
+  if (!payload) payloads.set(item, (payload = decideAgentMessagePayload(item)));
+  return payload;
+}
+
+function decideAgentMessagePayload(item: ResponseInputItem): AgentMessagePayload {
   const parts = typeof item.content === "string" ? [{ type: "input_text", text: item.content }] : (item.content ?? []);
   const plain = parts
     .filter((part) => ["input_text", "output_text", "text"].includes(part.type ?? ""))
