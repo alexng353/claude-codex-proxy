@@ -1,9 +1,17 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 // Tests must never inherit live account or state paths, even without shell overrides.
-const scratch = process.env.TMPDIR ?? join(homedir(), ".cache/claude-codex-proxy-tests");
+// The default scratch is RAM-backed: the code under test fsyncs on every request
+// (SQLite commits, the perpetual log), and on a disk shared with other jobs each
+// fsync can take 20-500 ms, which pushed multi-turn tests past bun's 5 s timeout.
+function defaultScratch(): string {
+  for (const ram of [process.env.XDG_RUNTIME_DIR, "/dev/shm"])
+    if (ram && existsSync(ram)) return join(ram, "claude-codex-proxy-tests");
+  return join(homedir(), ".cache/claude-codex-proxy-tests");
+}
+const scratch = process.env.TMPDIR ?? defaultScratch();
 mkdirSync(scratch, { recursive: true, mode: 0o700 });
 const root = mkdtempSync(join(scratch, "proxy-tests-"));
 process.env.TODAY_DAEMON_BIN = join(root, "test-only-today-daemon");
