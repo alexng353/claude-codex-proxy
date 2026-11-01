@@ -3,6 +3,7 @@ import { accountStatus, usageHeaders } from "./accounts";
 import { withAgentInstructions } from "./agent-identity";
 import { handleAgentNamesRoute } from "./agent-names";
 import { runClaude } from "./claude";
+import { recordBlockedTasks } from "./blocked-tasks";
 import { API_PREFIX, handleHygieneApi } from "./hygiene-api";
 import { gateRequest, handleHygieneRoute } from "./hygiene-gate";
 import { GATE_ONLY_HEADER, HOP_HEADER, MACHINE_HEADER, loopResponse, remoteGate } from "./hygiene-remote";
@@ -63,6 +64,18 @@ const syntheticOutput = (text: string): ProxyOutput => ({
   toolCalls: [],
   usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
 });
+
+/**
+ * Counts (and pages) Claude children told their encrypted task is unreadable
+ * (blocked-tasks.ts). Bookkeeping only: it never fails or delays the request.
+ */
+function noteBlockedTasks(request: ResponsesRequest): void {
+  try {
+    void recordBlockedTasks(request).paged;
+  } catch (cause) {
+    console.error("blocked-tasks: could not record:", (cause as Error).message);
+  }
+}
 
 /**
  * The router's question for GPT turns: forward (possibly rewritten) or answer
@@ -160,6 +173,7 @@ export async function handleRequest(request: Request, peer?: string): Promise<Re
       const response = responseObject(body, syntheticOutput(gate.text));
       return body.stream ? streamResponse(response) : json(response);
     }
+    noteBlockedTasks(gate.request);
     // Plate dashboard activity rides along on Alex's newest message (scoped threads only).
     const activity = await preparePlateActivity(gate.request);
     // Perpetual chats (src/perpetual) replace history with a summary view;

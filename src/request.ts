@@ -200,7 +200,7 @@ const AGENT_TASK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const agentTasksDir = (): string =>
   process.env.AGENT_TASKS_DIR || join(homedir(), ".cache", "agent-tasks");
 
-type TaskFile = { path: string; text?: string; refused?: string };
+export type TaskFile = { path: string; text?: string; refused?: string };
 
 /** The task file for a canonical task name, read only if it is this user's own, fresh, regular file. */
 export function readAgentTaskFile(taskName: string): TaskFile | undefined {
@@ -247,41 +247,58 @@ const agentMessageHeaderName = (text: string): string | undefined =>
 const agentMessageType = (text: string): string | undefined =>
   /^Message Type: (\S+)$/m.exec(text)?.[1];
 
-function serializeAgentMessage(item: ResponseInputItem): string {
+/**
+ * What a Claude child gets for one agent_message's payload. `blocked` is the
+ * path that tells it the task is unreadable and to reply BLOCKED; the
+ * blocked-task counter (blocked-tasks.ts) reads the same decision.
+ */
+export type AgentMessagePayload =
+  | { kind: "plain"; plain: string }
+  | { kind: "task-file"; plain: string; taskName: string; file: TaskFile & { text: string } }
+  | { kind: "blocked"; plain: string; taskName: string; newTask: boolean; file?: TaskFile };
+
+export function agentMessagePayload(item: ResponseInputItem): AgentMessagePayload {
   const parts = typeof item.content === "string" ? [{ type: "input_text", text: item.content }] : (item.content ?? []);
   const plain = parts
     .filter((part) => ["input_text", "output_text", "text"].includes(part.type ?? ""))
     .map((part) => part.text ?? "")
     .join("\n");
-  const encrypted = parts.some((part) => part.type === "encrypted_content");
+  if (!parts.some((part) => part.type === "encrypted_content")) return { kind: "plain", plain };
+  const to = typeof item.recipient === "string" ? item.recipient : undefined;
+  const taskName = to ?? agentMessageHeaderName(plain) ?? "";
+  // The task file is the task itself, so it stands in only for the NEW_TASK that
+  // carried it. A later encrypted follow-up or steer is different text the child
+  // must not be told is its original task again.
+  const newTask = agentMessageType(plain) === "NEW_TASK";
+  const file = newTask ? readAgentTaskFile(taskName) : undefined;
+  if (file?.text !== undefined) return { kind: "task-file", plain, taskName, file: { ...file, text: file.text } };
+  return { kind: "blocked", plain, taskName, newTask, file };
+}
+
+function serializeAgentMessage(item: ResponseInputItem): string {
+  const payload = agentMessagePayload(item);
   const from = typeof item.author === "string" ? item.author : "another agent";
   const to = typeof item.recipient === "string" ? item.recipient : undefined;
-  const lines = [`<agent_message from=${JSON.stringify(from)}${to ? ` to=${JSON.stringify(to)}` : ""}>`, plain.replace(/\n+$/, "")];
-  if (encrypted) {
-    const taskName = to ?? agentMessageHeaderName(plain) ?? "";
-    // The task file is the task itself, so it stands in only for the NEW_TASK that
-    // carried it. A later encrypted follow-up or steer is different text the child
-    // must not be told is its original task again.
-    const newTask = agentMessageType(plain) === "NEW_TASK";
-    const file = newTask ? readAgentTaskFile(taskName) : undefined;
-    if (file?.text !== undefined) {
-      lines.push(
-        `[The sender's payload was encrypted for OpenAI models, so the proxy read the sender's task file ${file.path} in its place. Its text follows and is your task.]`,
-        file.text.replace(/\n+$/, ""),
-      );
-    } else {
-      const where = !newTask
-        ? " Only a NEW_TASK is read from a task file, and this message is not one."
-        : file
-          ? ` The task file ${file.path} was not used: ${file.refused}.`
-          : ` No task file was looked up: the task name has no "__<nonce>" suffix.`;
-      lines.push(
-        `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${where} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${taskName || "unnamed task"})."]`,
-      );
-    }
+  const lines = [`<agent_message from=${JSON.stringify(from)}${to ? ` to=${JSON.stringify(to)}` : ""}>`, payload.plain.replace(/\n+$/, "")];
+  if (payload.kind === "task-file") {
+    lines.push(
+      `[The sender's payload was encrypted for OpenAI models, so the proxy read the sender's task file ${payload.file.path} in its place. Its text follows and is your task.]`,
+      payload.file.text.replace(/\n+$/, ""),
+    );
+  } else if (payload.kind === "blocked") {
+    lines.push(
+      `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${blockedReason(payload)} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${payload.taskName || "unnamed task"})."]`,
+    );
   }
   lines.push("</agent_message>");
   return lines.join("\n");
+}
+
+/** Why no task file stood in for a blocked payload, as one leading-space sentence. */
+export function blockedReason(payload: Extract<AgentMessagePayload, { kind: "blocked" }>): string {
+  if (!payload.newTask) return " Only a NEW_TASK is read from a task file, and this message is not one.";
+  if (payload.file) return ` The task file ${payload.file.path} was not used: ${payload.file.refused}.`;
+  return ` No task file was looked up: the task name has no "__<nonce>" suffix.`;
 }
 
 export const serializeItem = (item: ResponseInputItem): string => {
