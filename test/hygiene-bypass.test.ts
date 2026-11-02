@@ -119,7 +119,76 @@ describe("shield bypass", () => {
     const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "04:30")) });
     expect(r.body).toMatchObject({ applied: false, until: null, debt_id: `${DAY}-shield-1` });
     expect(r.body.gate.state).toBe("armed");
-    expect((await state()).debts).toMatchObject([{ skipped: ["morning teeth photo"], status: "open" }]);
+    // Nothing was due at 04:30: the debt says the lock was seen at the report.
+    expect((await state()).debts).toMatchObject([{ skipped: ["at report: morning teeth photo"], status: "open" }]);
+  });
+
+  test("a tap locked by a morning photo is charged even when the report arrives after midnight", async () => {
+    const s = await state();
+    s.filled = { [`${DAY}/shower`]: iso(at(DAY, "21:00")), [`${DAY}/night-teeth`]: iso(at(DAY, "21:00")) };
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    clock = at("2026-11-06", "00:10");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "23:00")) });
+    expect(r.body.gate.state).toBe("clear");
+    expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+    expect((await state()).debts).toMatchObject([{ skipped: ["morning teeth photo"] }]);
+  });
+
+  test("a penance paid after the tap does not make the tap free", async () => {
+    const s = await state();
+    s.filled = { [`${DAY}/morning-teeth`]: iso(at(DAY, "05:30")) };
+    s.debts = [{ id: "d0", at: iso(at(DAY, "05:00")), skipped: [], status: "penance", penance: { description: "ten pushups", setAt: iso(at(DAY, "05:10")), paidAt: iso(at(DAY, "06:20")) } }];
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    clock = at(DAY, "06:30");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:10")) });
+    expect(r.body.gate.state).toBe("clear");
+    expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+  });
+
+  describe("gym", () => {
+    // Morning photo done, so only the gym can lock. A 07:00 plan misses at 07:30.
+    const plan = { id: "p", start: iso(at(DAY, "07:00")), graceMin: 30, status: "planned" as const, createdAt: iso(at(DAY, "01:00")), log: [] };
+    async function withGym(gym: Record<string, unknown>) {
+      const s = await state();
+      s.filled = { [`${DAY}/morning-teeth`]: iso(at(DAY, "05:30")) };
+      s.gym = { plans: [plan], sessions: [], checkins: [], ...gym };
+      await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+      resetGateCache();
+    }
+
+    test("a tap locked by a missed plan is charged after the read goes stale", async () => {
+      await withGym({ syncedAt: iso(at(DAY, "07:45")), readAt: iso(at(DAY, "07:45")) });
+      clock = at(DAY, "08:20");
+      const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "07:50")) });
+      expect(r.body.gate.state).toBe("clear");
+      expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+    });
+
+    test("a check-in received after the tap does not make the tap free", async () => {
+      await withGym({
+        syncedAt: iso(at(DAY, "08:06")),
+        readAt: iso(at(DAY, "08:06")),
+        checkins: [{ clientId: "c1", kind: "start", at: iso(at(DAY, "07:10")), distanceM: 20, accuracyM: 10, receivedAt: iso(at(DAY, "08:06")) }],
+      });
+      clock = at(DAY, "08:08");
+      const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "07:50")) });
+      expect(r.body.gate.state).toBe("clear");
+      expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+    });
+
+    test("a session seen after the tap does not make the tap free", async () => {
+      await withGym({
+        syncedAt: iso(at(DAY, "08:30")),
+        readAt: iso(at(DAY, "08:30")),
+        sessions: [{ id: "manual:1", clientId: null, start: iso(at(DAY, "07:05")), end: iso(at(DAY, "08:00")), sets: 8, seenAt: iso(at(DAY, "08:30")), manual: { by: "test", reason: "photo" } }],
+      });
+      clock = at(DAY, "08:35");
+      const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "07:50")) });
+      expect(r.body.gate.state).toBe("clear");
+      expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+    });
   });
 
   test("proof accepted after the tap does not make the tap free", async () => {

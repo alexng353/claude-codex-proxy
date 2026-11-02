@@ -481,20 +481,25 @@ const SHIELD_KEEP_MS = 7 * 86_400_000;
  * A shield tap at `anchor` cost nothing, judged only from facts with times:
  * - a bypass that had already started covered it (the newest bypass started
  *   at or before the tap and its end is after it), or
- * - nothing locks the gate now (evaluated at the present, where every check
- *   is exact, so the gym still fails open without a fresh read) and nothing
- *   that could have cleared a lock happened after the tap: no proof accepted,
- *   no penance paid, no gym session seen, no DELAY started.
+ * - nothing locks the gate now, nothing locked it at the tap as far as the
+ *   current state can tell (this can only add charges: everything that could
+ *   make the current state under-report the tap's locks is the next list),
+ *   and nothing that could have cleared a lock happened after the tap: no
+ *   proof accepted, no penance paid, no gym session seen or check-in
+ *   received, no DELAY started.
+ * The tap-time check also catches locks that end on their own: midnight
+ * rolling a missed morning photo out of view, and a gym read going stale.
  */
 function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
   const starts = state.bypass.history.map(Date.parse).filter(Number.isFinite);
   const newest = starts.length ? Math.max(...starts) : Number.POSITIVE_INFINITY;
   if (newest <= anchor && bypassActive(state, anchor)) return true;
-  if (outstanding(state, now).length) return false;
+  if (outstanding(state, now).length || outstanding(state, anchor).length) return false;
   const after = (iso: string | null | undefined) => !!iso && Date.parse(iso) > anchor;
   if (state.images.some((r) => r.verdict === "accepted" && after(r.at))) return false;
   if (state.debts.some((d) => after(d.penance?.paidAt))) return false;
   if (state.gym?.sessions.some((s) => after(s.seenAt))) return false;
+  if (state.gym?.checkins.some((c) => after(c.receivedAt))) return false;
   if (state.delay.until && Date.parse(state.delay.until) - DELAY_MS > anchor) return false;
   return true;
 }
@@ -535,9 +540,11 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
       // Numbered from the debts themselves: shield records are trimmed, debts are not.
       const prefix = `${localTime(anchor).day}-shield-`;
       debtId = `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`;
-      // What locks the gate now; empty when a lock was cleared after the tap.
-      const skipped = outstanding(state, now).map((r) => r.label);
-      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped: skipped.length ? skipped : ["a lock cleared after the tap"], status: "open" });
+      // Locks as best the gate can tell at the tap, else those at the report, else a lock that has since cleared.
+      const atTap = outstanding(state, anchor).map((r) => r.label);
+      const atReport = outstanding(state, now).map((r) => `at report: ${r.label}`);
+      const skipped = atTap.length ? atTap : atReport.length ? atReport : ["a lock cleared after the tap"];
+      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped, status: "open" });
       if (until > now) {
         applied = true;
         state.bypass.count += 1;
