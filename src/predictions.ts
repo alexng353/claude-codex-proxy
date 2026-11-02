@@ -6,6 +6,8 @@ export type PredictionInput = {
   deadlineMs?: number;
   /** Codex's thread id (the chat's `prompt_cache_key`), which a fork needs. Newer daemons only. */
   engineThreadId?: string;
+  /** SHA-256 of the completed turn's last answer: a fork runs only for that answer. */
+  lastAnswerSha256?: string;
   /** Set by the route, never by a caller: the key of this request's usage record. */
   attemptId?: string;
 };
@@ -103,7 +105,9 @@ export class PredictionService {
       input.turnId.length > 200 ||
       input.context.length > 16000 ||
       (input.engineThreadId !== undefined &&
-        (typeof input.engineThreadId !== "string" || input.engineThreadId.length > 200))
+        (typeof input.engineThreadId !== "string" || input.engineThreadId.length > 200)) ||
+      (input.lastAnswerSha256 !== undefined &&
+        (typeof input.lastAnswerSha256 !== "string" || input.lastAnswerSha256.length > 128))
     )
       return null;
     const key = JSON.stringify([input.threadId, input.turnId]);

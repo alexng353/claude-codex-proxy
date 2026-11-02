@@ -33,14 +33,13 @@ launch arguments, session, account, answer and context size under the chat's
 `prompt_cache_key`. The context size is the last API call's input. Any turn
 that starts on the chat clears the record, including corrections and
 compactions, and the record expires after ten minutes. The daemon sends that
-key as `engineThreadId` (Today's own thread id differs for chats Today made),
-with its recent context.
+key as `engineThreadId` (Today's own thread id differs for chats Today made).
+It also sends `lastAnswerSha256`, the SHA-256 of the completed turn's last
+agent message, trimmed.
 
-A fork runs only when that context's last message is the recorded answer,
-whole. A different answer that merely ends the same way does not count. An
-answer too long for the daemon's 15,000-byte window must match its last 2,000+
-characters. Otherwise the fork is `stale`: a newer turn finished elsewhere, for
-example on the other proxy copy.
+A fork runs only when that digest is the recorded answer's. Otherwise the fork
+is `stale`: a newer turn finished elsewhere, for example on the other proxy
+copy, or the daemon sent no digest. No text can make a different answer pass.
 
 The resume point is the transcript entry that accepted that same answer, as the
 model wrote it, before the proxy's rewrites. It is found in the transcript's
@@ -64,7 +63,7 @@ Codex and Today never see it.
 Haiku answers instead, with the time the fork leaves it, when:
 - the request has no `engineThreadId` (an older daemon);
 - no fresh final-answer record exists on this proxy copy (`no session`), or
-  the context ends on another answer (`stale`);
+  the turn ended on another answer, or the request had no digest (`stale`);
 - the chat's account is unavailable or over its weekly cap;
 - the last call's input was over `PREDICTION_FORK_MAX_CONTEXT_TOKENS`
   (300,000);

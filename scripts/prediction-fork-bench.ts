@@ -42,7 +42,10 @@ const out = process.env.BENCH_OUTPUT ?? join(homedir(), ".cache/composer-predict
 function privateFile(path: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   if (!existsSync(path)) writeFileSync(path, "", { mode: 0o600 });
-  if (statSync(path).isFile()) chmodSync(path, 0o600);
+  // Anything but a regular file we can append to is refused here, before quota is spent.
+  if (!statSync(path).isFile()) throw new Error(`bench output ${path} is not a regular file`);
+  chmodSync(path, 0o600);
+  appendFileSync(path, "");
 }
 function privateAppend(path: string, text: string): void {
   privateFile(path);
@@ -391,6 +394,8 @@ async function coldQuality() {
     (pins.query("SELECT account FROM thread_accounts WHERE thread_id = ?").get(thread) as { account: string } | null)?.account;
   const scratchState = mkdtempSync(join(tmpdir(), "prediction-bench-state-"));
   process.on("exit", () => rmSync(scratchState, { recursive: true, force: true }));
+  // A default SIGINT/SIGTERM skips "exit" handlers: exit properly so the cleanup runs.
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => process.exit(130));
   const launchArgs = (request: Parameters<typeof buildClaudeArgs>[0]) => {
     const live = process.env.PROXY_STATE_DIR;
     process.env.PROXY_STATE_DIR = scratchState;

@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import { forkArgs, parseForkResult } from "../src/prediction-fork";
+import { answerDigest, forkArgs, parseForkResult } from "../src/prediction-fork";
 
 test("a fork swaps every session flag of the worker for a resume that persists nothing", () => {
   const worker = [
@@ -73,7 +73,10 @@ for await (const line of createInterface({ input: process.stdin })) {
   // "prose answer": the model writes its answer as plain text and submits an empty
   // StructuredOutput, which the proxy replaces with the prose (the transcript keeps "").
   // "slow turn": the answer takes a moment, so a prediction can run while it is going.
-  if (line.includes("slow turn")) await new Promise((resolve) => setTimeout(resolve, 400));
+  if (line.includes("slow turn")) {
+    appendFileSync(${JSON.stringify(join(root, "slow.started"))}, "1");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
   const prose = line.includes("prose answer");
   if (prose) console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "prose reply" }] } }));
   const output = line.includes("use a tool")
@@ -122,8 +125,8 @@ async function withProxyState<T>(forkAnswer: unknown, body: (root: string) => Pr
 const lines = async (path: string) =>
   existsSync(path) ? (await readFile(path, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 
-/** What the daemon sends after the fake chat's turn: it ends on the parked answer. */
-const CONTEXT = "Alex: go\n\nAssistant: done for now";
+/** What Today sends after the fake chat's turn: the digest of the answer it ended on. */
+const DONE = answerDigest("done for now");
 
 test("a fork resumes the chat's parked session at its last answer and leaves no record of itself", async () => {
   await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
@@ -140,7 +143,7 @@ test("a fork resumes the chat's parked session at its last answer and leaves no 
     const [worker] = await lines(join(root, "launches.jsonl"));
     const session = worker.argv[worker.argv.indexOf("--session-id") + 1];
 
-    const outcome = await forkPrediction(thread, new AbortController().signal, Date.now() + 10_000, CONTEXT);
+    const outcome = await forkPrediction(thread, new AbortController().signal, Date.now() + 10_000, DONE);
     expect(outcome).toMatchObject({ kind: "suggested", text: "ship it" });
     expect(outcome.usage?.cacheReadTokens).toBe(5000);
 
@@ -182,16 +185,18 @@ test("no fork without a parked final answer for the chat, or past its account's 
     const { runClaude } = await import("../src/claude");
     const { forkPrediction } = await import("../src/prediction-fork");
     const signal = new AbortController().signal;
-    expect(await forkPrediction(crypto.randomUUID(), signal, Date.now() + 5000, CONTEXT)).toMatchObject({ kind: "failed", reason: "no session" });
+    expect(await forkPrediction(crypto.randomUUID(), signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "no session" });
     const thread = crypto.randomUUID();
     await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
     // The daemon's turn ended on another answer (a newer turn served by another proxy copy).
-    expect(await forkPrediction(thread, signal, Date.now() + 5000, "Alex: go\n\nAssistant: something else")).toMatchObject({ kind: "failed", reason: "stale" });
-    // ...even one that merely ends the same way.
-    expect(await forkPrediction(thread, signal, Date.now() + 5000, "Alex: go\n\nAssistant: not done for now")).toMatchObject({ kind: "failed", reason: "stale" });
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, answerDigest("something else"))).toMatchObject({ kind: "failed", reason: "stale" });
+    // ...even one that ends with the same words, quoted role marker and all.
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, answerDigest("Here is the earlier transcript:\n\nAssistant: done for now"))).toMatchObject({ kind: "failed", reason: "stale" });
+    // A daemon that sends no digest gets no fork.
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, undefined)).toMatchObject({ kind: "failed", reason: "stale" });
     const { markLimited, listAccounts } = await import("../src/accounts");
     markLimited(listAccounts()[0]!);
-    expect(await forkPrediction(thread, signal, Date.now() + 5000, CONTEXT)).toMatchObject({ kind: "failed", reason: "account unavailable" });
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "account unavailable" });
     expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
   });
 });
@@ -209,7 +214,7 @@ test("a later turn that ends in a tool call retires the chat's fork record", asy
       prompt_cache_key: thread,
       tools,
     });
-    expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "no session" });
+    expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "no session" });
     expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
   });
 });
@@ -230,9 +235,9 @@ test("an old or too large record makes no fork", async () => {
     };
     const signal = new AbortController().signal;
     recordForkSource("stale", { ...source, parkedAt: Date.now() - 11 * 60_000 });
-    expect(await forkPrediction("stale", signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "no session" });
+    expect(await forkPrediction("stale", signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "no session" });
     recordForkSource("large", { ...source, contextTokens: 300_001 });
-    expect(await forkPrediction("large", signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "context too large" });
+    expect(await forkPrediction("large", signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "context too large" });
   });
 });
 
@@ -245,7 +250,7 @@ test("cancelling a fork kills it", async () => {
     // The fork never answers.
     await writeFile(join(root, "hang"), "");
     const controller = new AbortController();
-    const pending = forkPrediction(thread, controller.signal, Date.now() + 10_000, CONTEXT);
+    const pending = forkPrediction(thread, controller.signal, Date.now() + 10_000, DONE);
     for (let i = 0; i < 100 && !existsSync(join(root, "hang.pid")); i++) await Bun.sleep(20);
     controller.abort();
     // It ran but reported no usage: its context (the last call's input, not the
@@ -268,8 +273,8 @@ test("a turn in progress on the chat retires its fork record from its start", as
       input: [{ role: "user", content: "go" }, { role: "assistant", content: "done for now" }, { role: "user", content: "slow turn" }],
       prompt_cache_key: thread,
     });
-    await Bun.sleep(150);
-    expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "no session" });
+    for (let i = 0; i < 200 && !existsSync(join(root, "slow.started")); i++) await Bun.sleep(10);
+    expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "no session" });
     await next;
     expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
   });
@@ -285,16 +290,19 @@ test("the fork resumes only at the parked answer's own transcript entry", async 
     const session = worker.argv[worker.argv.indexOf("--session-id") + 1];
     const transcript = join(process.env.CLAUDE_CONFIG_DIR!, "projects", "probe", `${session}.jsonl`);
     const signal = new AbortController().signal;
+    // An unreadable transcript is a failed fork (Haiku answers), never a thrown request.
+    // Checked while its checkpoint would otherwise match; root reads it anyway.
+    if (process.getuid?.() !== 0) {
+      await chmod(transcript, 0o000);
+      expect(await forkPrediction(thread, signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "no checkpoint" });
+      await chmod(transcript, 0o600);
+    }
     // A later answer in the transcript that is not the one parked: never resume past it.
     const later = (await readFile(transcript, "utf8")) +
       JSON.stringify({ type: "assistant", uuid: crypto.randomUUID(), message: { content: [{ type: "tool_use", name: "StructuredOutput", id: "later", input: { text: "a later answer", tool_calls: [] } }] } }) + "\n" +
       JSON.stringify({ type: "user", uuid: "00000000-0000-4000-8000-000000000009", message: { content: [{ type: "tool_result", tool_use_id: "later" }] } }) + "\n";
     await writeFile(transcript, later);
-    expect(await forkPrediction(thread, signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "no checkpoint" });
-    // An unreadable transcript is a failed fork (Haiku answers), never a thrown request.
-    await chmod(transcript, 0o000);
-    expect(await forkPrediction(thread, signal, Date.now() + 5000, CONTEXT)).toMatchObject({ kind: "failed", reason: "no checkpoint" });
-    await chmod(transcript, 0o600);
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "no checkpoint" });
     expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
   });
 });
@@ -306,7 +314,7 @@ test("an answer the proxy rewrote still forks at its raw transcript entry", asyn
     const thread = crypto.randomUUID();
     const answer = await runClaude({ model: "sonnet", input: "prose answer", prompt_cache_key: thread });
     expect(answer.text).toBe("prose reply");
-    const outcome = await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, "Alex: prose answer\n\nAssistant: prose reply");
+    const outcome = await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, answerDigest("prose reply"));
     expect(outcome).toMatchObject({ kind: "suggested", text: "ship it" });
     const fork = (await lines(join(root, "launches.jsonl"))).find((launch) => launch.fork)!;
     expect(fork.argv[fork.argv.indexOf("--resume-session-at") + 1]).toBe("00000000-0000-4000-8000-000000000001");
@@ -429,7 +437,8 @@ test("a fork cancelled mid-flight is logged as a cancelled fork, never as Haiku"
     fork: async () => {
       controller.abort();
       await Bun.sleep(5);
-      return { kind: "failed", reason: "cancelled", unmeteredContextTokens: 1000, account: "work" };
+      // It answers anyway, after Alex typed: the route alone must call this cancelled.
+      return { kind: "suggested", text: "too late", usage: { inputTokens: 4, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 9 }, account: "work" };
     },
   } as never);
   try {
@@ -444,7 +453,8 @@ test("a fork cancelled mid-flight is logged as a cancelled fork, never as Haiku"
     const path = join(root, "prediction-usage.jsonl");
     for (let i = 0; i < 100 && !existsSync(path); i++) await Bun.sleep(10);
     const [line] = await lines(path);
-    expect(line).toMatchObject({ turnId: "turn-c", model: "haiku", fallback: "cancelled", cancelled: true, forkUnmeteredContextTokens: 1000 });
+    expect(line).toMatchObject({ turnId: "turn-c", model: "haiku", fallback: "cancelled", cancelled: true, forkAccount: "work" });
+    expect(line.forkUsage?.cacheReadTokens).toBe(1000);
     expect(typeof line.forkMs).toBe("number");
     expect(haiku).toBe(0);
   } finally {

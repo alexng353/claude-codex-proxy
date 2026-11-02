@@ -164,7 +164,7 @@ export function createPredictionService(
             input.engineThreadId,
             signal,
             input.deadlineMs! - HAIKU_RESERVE_MS,
-            input.context,
+            input.lastAnswerSha256,
           );
           attempt.forkMs = Date.now() - started;
           attempt.fork = outcome.usage;
@@ -174,7 +174,8 @@ export function createPredictionService(
             attempt.fallback = outcome.reason;
             attempt.forkUnmeteredContextTokens = outcome.unmeteredContextTokens;
           }
-          if (signal.aborted) attempt.fallback ??= "cancelled";
+          // The signal also fires at the deadline: only the caller's abort is a cancel.
+          if (signal.aborted) attempt.fallback ??= Date.now() >= input.deadlineMs! ? "timed out" : "cancelled";
           signal.throwIfAborted();
           if (outcome.kind === "declined") {
             attempt.source = "fork";

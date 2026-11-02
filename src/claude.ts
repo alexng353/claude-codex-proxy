@@ -300,8 +300,9 @@ class ClaudeWorker {
   /** Input tokens (cached or not) of the last request: what a fork of it would read. */
   private contextTokens = 0;
   /** The last StructuredOutput text as the model wrote it, before any substitution:
-   * what the transcript holds, so a prediction fork can find its entry. */
-  private rawAnswer = "";
+   * what the transcript holds, so a prediction fork can find its entry. Unset when
+   * the answer came without one (then the transcript has no entry for it). */
+  private rawAnswer: string | undefined;
 
   constructor(
     request: ResponsesRequest,
@@ -546,7 +547,7 @@ class ClaudeWorker {
     // The model sometimes answers in plain text and then submits StructuredOutput
     // with empty text; keep the answer instead of returning nothing to Codex.
     const output = event.structured_output;
-    if (!event.is_error) this.rawAnswer = output?.text ?? "";
+    if (!event.is_error) this.rawAnswer = output?.text;
     if (!event.is_error && output && !output.text.trim() && this.pending.prose.length)
       event.structured_output = { ...output, text: this.pending.prose.join("\n\n") };
     if (event.is_error)

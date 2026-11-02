@@ -58,7 +58,7 @@ export type ForkSource = {
   answer: string;
   /** The same answer as the transcript holds it (before the proxy's rewrites): the
    * fork resumes at the entry that accepted exactly this. */
-  checkpointText: string;
+  checkpointText?: string;
   /** Input tokens of the worker's last request, cached or not: the fork's context size. */
   contextTokens: number;
   parkedAt: number;
@@ -192,26 +192,13 @@ const forkEffort = () => process.env.PREDICTION_FORK_EFFORT || undefined;
 const CHECKPOINT_TAIL_BYTES = 1 << 20;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Below this many characters an answer fits the daemon's 15,000-byte context window whole. */
-const WHOLE_ANSWER_CHARS = 12_000;
-
 /**
- * Whether the daemon's context for the completed turn ends with this parked answer as
- * its last message, whole: `Assistant: <answer>` at a message boundary, so an answer
- * that merely ends the same way ("not done" against "done") does not match. A longer
- * answer arrives cut at its start (predictions.rs recent_context); then the context
- * must be a long enough piece of its end.
+ * The digest Today sends as `lastAnswerSha256`: SHA-256 of the completed turn's last
+ * agent message, trimmed (predictions.rs last_answer_digest). Exact, so no text in or
+ * around the answer can make a different answer pass for it.
  */
-export function endsWithAnswer(context: string | undefined, answer: string): boolean {
-  const text = answer.trimEnd();
-  if (!text.trim() || !context) return false;
-  const tail = context.trimEnd();
-  const whole = `Assistant: ${text}`;
-  if (tail.endsWith(whole)) {
-    const start = tail.length - whole.length;
-    return start === 0 || tail.slice(start - 2, start) === "\n\n";
-  }
-  return text.length > WHOLE_ANSWER_CHARS && tail.length >= 2000 && whole.endsWith(tail);
+export function answerDigest(answer: string): string {
+  return new Bun.CryptoHasher("sha256").update(answer.trim()).digest("hex");
 }
 
 /**
@@ -282,15 +269,18 @@ export async function forkPrediction(
   threadId: string,
   signal: AbortSignal,
   deadlineMs: number,
-  /** The daemon's recent context of the completed turn; it must end with the parked answer. */
-  context?: string,
+  /** Today's digest of the completed turn's last answer; it must be the parked answer's. */
+  answerSha256?: string,
 ): Promise<ForkOutcome> {
   const source = forkSource(threadId);
   if (!source) return { kind: "failed", reason: "no session" };
   // A newer turn may have finished on another proxy copy: fork only the answer Alex saw.
-  if (!endsWithAnswer(context, source.answer)) return { kind: "failed", reason: "stale" };
+  if (!answerSha256 || !source.answer.trim() || answerSha256 !== answerDigest(source.answer))
+    return { kind: "failed", reason: "stale" };
   if (isUnavailable(source.account)) return { kind: "failed", reason: "account unavailable" };
   if (source.contextTokens > maxContextTokens()) return { kind: "failed", reason: "context too large" };
+  // No StructuredOutput this turn (claude.ts fell back to the result text): nothing to resume at.
+  if (source.checkpointText === undefined) return { kind: "failed", reason: "no checkpoint" };
   const checkpoint = await answerCheckpoint(source.sessionId, source.checkpointText);
   if (!checkpoint) return { kind: "failed", reason: "no checkpoint" };
   // Checked after the last await: runFork adds its abort listener before awaiting anything.

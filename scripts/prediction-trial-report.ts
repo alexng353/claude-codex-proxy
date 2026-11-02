@@ -137,7 +137,7 @@ for (const [name, member] of groups) {
     console.log(`  why: ${[...reasons].map(([why, n]) => `${why} ${n}`).join(", ")}`);
   }
 }
-const cancelled = rows.filter((row) => row.cancelled);
+const cancelled = rows.filter((row) => row.cancelled && row.model !== "skipped");
 if (cancelled.length)
   console.log(`\ncancelled (Alex typed or sent first): ${cancelled.length}, of which ${cancelled.filter(forkRan).length} with a fork running`);
 const skipped = rows.filter((row) => row.model === "skipped").length;
