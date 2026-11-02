@@ -84,6 +84,14 @@ export function recordForkSource(threadId: string, source: ForkSource | undefine
   }
 }
 
+/**
+ * A worker started a turn: its transcript moves past every answer it parked, whichever
+ * chat parked it (a live worker can go on to serve another chat with the same history).
+ */
+export function retireForkSourcesOf(sessionId: string): void {
+  for (const [threadId, source] of sources) if (source.sessionId === sessionId) sources.delete(threadId);
+}
+
 function forkSource(threadId: string): ForkSource | undefined {
   const source = sources.get(threadId);
   if (source && Date.now() - source.parkedAt > SOURCE_MAX_AGE_MS) {

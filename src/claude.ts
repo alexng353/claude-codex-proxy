@@ -52,7 +52,7 @@ import {
   type SessionKey,
 } from "./sessions";
 import { markThreadInFlight } from "./in-flight";
-import { recordForkSource } from "./prediction-fork";
+import { recordForkSource, retireForkSourcesOf } from "./prediction-fork";
 import {
   conversationRequest,
   deltaRequest,
@@ -378,6 +378,15 @@ class ClaudeWorker {
     // The chat moved past its last answer (a new turn, a correction, a compaction):
     // no prediction may fork it any more until this worker parks a final answer again.
     if (turn.threadId) recordForkSource(turn.threadId, undefined);
+    retireForkSourcesOf(this.sessionId);
+    // This worker now holds the chat's latest turn, on whichever proxy copy: an older
+    // park elsewhere stops being forkable now, even if this turn's own park write fails.
+    if (turn.threadId)
+      try {
+        recordThreadPark(turn.threadId, this.sessionId);
+      } catch (error) {
+        console.error("Unable to record the thread's park:", (error as Error).message);
+      }
     // The account actually serving this attempt (a reused worker, a failover).
     markTurn(this.account);
     this.attempt = attempt;

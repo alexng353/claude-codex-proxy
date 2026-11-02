@@ -177,7 +177,8 @@ export function createPredictionService(
             attempt.forkUnmeteredContextTokens = outcome.unmeteredContextTokens;
           }
           // The signal also fires at the deadline: only the caller's abort is a cancel.
-          if (signal.aborted) attempt.fallback ??= signal.reason === PREDICTION_DEADLINE ? "timed out" : "cancelled";
+          // Whatever the fork said about its own abort, what stopped it decides the label.
+          if (signal.aborted) attempt.fallback = signal.reason === PREDICTION_DEADLINE ? "timed out" : "cancelled";
           signal.throwIfAborted();
           if (outcome.kind === "declined") {
             attempt.source = "fork";

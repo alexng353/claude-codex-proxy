@@ -405,6 +405,8 @@ export function pruneSessions(
   )
     .map((row) => row.session_id)
     .filter((id) => !keep.has(id));
+  // A park older than retention names a session whose transcript is gone anyway.
+  database.query("DELETE FROM thread_parks WHERE parked_at < ?").run(Date.now() - maxAgeMs);
   const remove = database.query("DELETE FROM sessions WHERE session_id = ?");
   for (const id of expired) {
     deleteTranscript(id);

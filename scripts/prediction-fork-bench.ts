@@ -15,16 +15,18 @@
  */
 import { Database } from "bun:sqlite";
 import {
-  appendFileSync,
-  chmodSync,
+  closeSync,
+  constants,
   existsSync,
+  fchmodSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
-  lstatSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -37,24 +39,40 @@ import { closePredictionPreparation, guardPredictionReply } from "../src/predict
 
 const out = process.env.BENCH_OUTPUT ?? join(homedir(), ".cache/composer-predictions/fork-bench.jsonl");
 
-/** Raw chat text only ever goes to a 0600 file. A missing directory is made 0700; an
- * existing one is left as it is (it may be the checkout, home or /tmp). */
-function privateFile(path: string): void {
+/**
+ * Raw chat text only ever goes to a 0600 regular file, never through a symlink (O_NOFOLLOW
+ * refuses one, dangling or not). A missing directory is made 0700; an existing one is
+ * left as it is (it may be the checkout, home or /tmp).
+ */
+function privateFd(path: string, truncate = false): number {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  if (!existsSync(path)) writeFileSync(path, "", { mode: 0o600 });
-  // Anything but a regular file we can append to is refused here, before quota is spent.
-  // lstat: a symlink is refused too, so text never follows it into another file.
-  if (!lstatSync(path).isFile()) throw new Error(`bench output ${path} is not a regular file`);
-  chmodSync(path, 0o600);
-  appendFileSync(path, "");
+  const { O_WRONLY, O_CREAT, O_APPEND, O_TRUNC, O_NOFOLLOW } = constants;
+  const fd = openSync(path, O_WRONLY | O_CREAT | O_NOFOLLOW | (truncate ? O_TRUNC : O_APPEND), 0o600);
+  if (!fstatSync(fd).isFile()) {
+    closeSync(fd);
+    throw new Error(`bench output ${path} is not a regular file`);
+  }
+  fchmodSync(fd, 0o600);
+  return fd;
+}
+function privateFile(path: string): void {
+  closeSync(privateFd(path));
 }
 function privateAppend(path: string, text: string): void {
-  privateFile(path);
-  appendFileSync(path, text);
+  const fd = privateFd(path);
+  try {
+    writeSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
 }
 function privateWrite(path: string, text: string): void {
-  privateFile(path);
-  writeFileSync(path, text);
+  const fd = privateFd(path, true);
+  try {
+    writeSync(fd, text);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** Fork processes still running, killed with the bench so none outlives it. */

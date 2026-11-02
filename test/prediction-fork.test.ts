@@ -206,6 +206,8 @@ test("the answer digest is the wire contract Today pins", () => {
   expect(answerDigest("  done\n")).toBe("a4c3ed04a95a3da14a9d235c83d868bed7c0f45cf7f3faa751ee8f50598d2211");
   // Only ASCII whitespace is trimmed: a BOM stays, as in Rust.
   expect(answerDigest("﻿done \t\r\n")).toBe("f95c98c274500e4c8b8da54a12a612d3f1286249769fdf1b0b4f1892678cf4b8");
+  // NBSP and NEL: JS trims the first, Rust both; neither may be trimmed here.
+  expect(answerDigest("\u00a0done\u0085")).toBe("c9d63d583af56980ce40b6f2ac0e1275691776b3c1190b4831e56f2688eaf3b5");
 });
 
 test("a later park of the chat on another proxy copy makes this copy's record stale", async () => {
@@ -219,6 +221,41 @@ test("a later park of the chat on another proxy copy makes this copy's record st
     recordThreadPark(thread, crypto.randomUUID());
     expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "stale" });
     expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
+test("a worker that moves on to another chat retires the first chat's fork record", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction } = await import("../src/prediction-fork");
+    const first = crypto.randomUUID();
+    const second = crypto.randomUUID();
+    await runClaude({ model: "sonnet", input: "go", prompt_cache_key: first });
+    // Same history, another chat: the proxy hands it the same live worker.
+    await runClaude({
+      model: "sonnet",
+      input: [{ role: "user", content: "go" }, { role: "assistant", content: "done for now" }, { role: "user", content: "next" }],
+      prompt_cache_key: second,
+    });
+    expect((await lines(join(root, "launches.jsonl"))).filter((launch) => !launch.fork)).toHaveLength(1);
+    // The first chat's record named that session, whose transcript has moved on.
+    expect(await forkPrediction(first, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed" });
+    expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
+test("a turn records the chat's park as it starts, before it answers", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { recordThreadPark, threadParkSession } = await import("../src/sessions");
+    const thread = crypto.randomUUID();
+    // Another copy parked the chat last.
+    recordThreadPark(thread, "another-copy");
+    const turn = runClaude({ model: "sonnet", input: "slow turn", prompt_cache_key: thread });
+    for (let i = 0; i < 200 && !existsSync(join(root, "slow.started")); i++) await Bun.sleep(10);
+    const [worker] = await lines(join(root, "launches.jsonl"));
+    expect(threadParkSession(thread)).toBe(worker.argv[worker.argv.indexOf("--session-id") + 1]);
+    await turn;
   });
 });
 
@@ -507,6 +544,32 @@ test("a fork overtaken by the deadline is logged as timed out, not cancelled", a
   const result = await engine.predict({ threadId: "t", turnId: "d", context: "Assistant: done", engineThreadId: "e", attemptId, deadlineMs: Date.now() + 50 });
   expect(result).toBeNull();
   expect(takeAttemptForTest(attemptId)).toMatchObject({ source: "haiku", fallback: "timed out" });
+});
+
+test("only the deadline makes a fork's abort a time-out; the caller's abort is a cancel", async () => {
+  const { createPredictionService, takeAttemptForTest } = await import("../src/prediction-route");
+  const engine = (fork: (signal: AbortSignal) => Promise<unknown>) =>
+    createPredictionService({
+      prepare: async () => ({ prompt: "p", retrievalMs: 0, guardMs: 0 }),
+      generate: async () => "never",
+      guardReply: async () => true,
+      refresh: () => {},
+      source: () => "fork",
+      fork: async (_thread: string, signal: AbortSignal) => fork(signal),
+    } as never);
+  // The real fork reports its own abort as "cancelled", whatever stopped it.
+  const reportsCancelled = async (signal: AbortSignal) => {
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    return { kind: "failed", reason: "cancelled", account: "work" };
+  };
+  const late = crypto.randomUUID();
+  await engine(reportsCancelled).predict({ threadId: "t", turnId: "late", context: "Assistant: done", engineThreadId: "e", attemptId: late, deadlineMs: Date.now() + 50 });
+  expect(takeAttemptForTest(late)).toMatchObject({ fallback: "timed out" });
+  const caller = new AbortController();
+  setTimeout(() => caller.abort(), 20);
+  const typed = crypto.randomUUID();
+  await engine(reportsCancelled).predict({ threadId: "t", turnId: "typed", context: "Assistant: done", engineThreadId: "e", attemptId: typed, deadlineMs: Date.now() + 2000 }, caller.signal);
+  expect(takeAttemptForTest(typed)).toMatchObject({ fallback: "cancelled" });
 });
 
 test("the switch defaults to Haiku and is read on every request", async () => {
