@@ -488,13 +488,17 @@ const SHIELD_KEEP_MS = 7 * 86_400_000;
  *   proof accepted, no penance paid, no gym session seen or check-in
  *   received, no DELAY started.
  * The tap-time check also catches locks that end on their own: midnight
- * rolling a missed morning photo out of view, and a gym read going stale.
+ * rolling a missed morning photo out of view, a gym read going stale, and a
+ * gym read failing after the tap. For that last one the tap is judged with
+ * the current read error set aside (freshness from syncedAt alone); an error
+ * from before the tap can then over-charge, which is the safe direction. The
+ * live gate still fails open for the gym on any error.
  */
 function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
   const starts = state.bypass.history.map(Date.parse).filter(Number.isFinite);
   const newest = starts.length ? Math.max(...starts) : Number.POSITIVE_INFINITY;
   if (newest <= anchor && bypassActive(state, anchor)) return true;
-  if (outstanding(state, now).length || outstanding(state, anchor).length) return false;
+  if (outstanding(state, now).length || outstanding(atTapView(state), anchor).length) return false;
   const after = (iso: string | null | undefined) => !!iso && Date.parse(iso) > anchor;
   if (state.images.some((r) => r.verdict === "accepted" && after(r.at))) return false;
   if (state.debts.some((d) => after(d.penance?.paidAt))) return false;
@@ -502,6 +506,13 @@ function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
   if (state.gym?.checkins.some((c) => after(c.receivedAt))) return false;
   if (state.delay.until && Date.parse(state.delay.until) - DELAY_MS > anchor) return false;
   return true;
+}
+
+/** The state for judging a past tap: the current gym read error (which has no time) set aside. */
+function atTapView(state: GateState): GateState {
+  if (!state.gym?.syncError) return state;
+  const { syncError: _, ...gym } = state.gym;
+  return { ...state, gym };
 }
 
 /**
@@ -541,7 +552,8 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
       const prefix = `${localTime(anchor).day}-shield-`;
       debtId = `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`;
       // Locks as best the gate can tell at the tap, else those at the report, else a lock that has since cleared.
-      const atTap = outstanding(state, anchor).map((r) => r.label);
+      // Inferred from the current state, so it can over-state (the docs say so).
+      const atTap = outstanding(atTapView(state), anchor).map((r) => r.label);
       const atReport = outstanding(state, now).map((r) => `at report: ${r.label}`);
       const skipped = atTap.length ? atTap : atReport.length ? atReport : ["a lock cleared after the tap"];
       state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped, status: "open" });

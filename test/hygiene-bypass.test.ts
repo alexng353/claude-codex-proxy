@@ -166,6 +166,16 @@ describe("shield bypass", () => {
       expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
     });
 
+    test("a failed read after the tap does not make the tap free", async () => {
+      await withGym({ syncedAt: iso(at(DAY, "07:45")), readAt: iso(at(DAY, "07:52")), syncError: "Uplifting answered 502" });
+      clock = at(DAY, "07:55");
+      const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "07:50")) });
+      // The live gate fails open for the gym on the error; the tap was still locked.
+      expect(r.body.gate.state).toBe("clear");
+      expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+      expect((await state()).debts[0].skipped[0]).toContain("gym");
+    });
+
     test("a check-in received after the tap does not make the tap free", async () => {
       await withGym({
         syncedAt: iso(at(DAY, "08:06")),
