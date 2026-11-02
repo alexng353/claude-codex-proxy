@@ -260,7 +260,8 @@ function tzifOffset(z: Tzif, t: number): Offset {
 // ---- Zone lookup ----
 
 type Source = { kind: "tzif" | "intl"; offset(t: number): Offset };
-type Entry = { path: string | null; stamp: string; checkedAt: number; source: Source };
+/** `stale`: the file failed its last re-read and the last good copy is being served. */
+type Entry = { path: string | null; stamp: string; checkedAt: number; source: Source; stale?: boolean };
 const cache = new Map<string, Entry>();
 const warned = new Set<string>();
 
@@ -320,36 +321,41 @@ function load(key: string, name: string | undefined, now: number): Source {
   // half-written file) the stamp can stay the same while the file becomes readable.
   if (hit && hit.source.kind === "tzif" && hit.path === path && stamp !== null && hit.stamp === stamp) {
     hit.checkedAt = now;
+    hit.stale = false;
     return hit.source;
   }
   let source: Source | null = null;
+  let problem: string | null = null;
   if (path && stamp !== null) {
     try {
       const z = parseTzif(readFileSync(path));
       source = { kind: "tzif", offset: (t) => tzifOffset(z, t) };
     } catch (error) {
-      if (!warned.has(path)) console.error(`zone: cannot read ${path}: ${(error as Error).message}; using Intl`);
-      warned.add(path);
+      problem = `cannot read ${path}: ${(error as Error).message}`;
     }
-  } else if (!warned.has(key)) {
-    console.error(`zone: no zone file for ${name ?? "the local zone"}${path ? ` (${path})` : ""}; using Intl`);
-    warned.add(key);
+  } else {
+    problem = `no zone file for ${name ?? "the local zone"}${path ? ` (${path})` : ""}`;
   }
   if (!source) {
     // A zone file that parsed before beats Intl: during a tzdata upgrade the file can
     // be missing or half-written for a moment, and Intl may be an hour off (bun 1.4).
     // Keep the old stamp so the next check (a minute on) reads the file again.
     if (hit && hit.source.kind === "tzif" && hit.path === path) {
+      // Logged once per stale episode.
+      if (!hit.stale) console.error(`zone: ${problem}; keeping the last good copy read before`);
       hit.checkedAt = now;
+      hit.stale = true;
       return hit.source;
     }
+    if (!warned.has(key)) console.error(`zone: ${problem}; using Intl`);
+    warned.add(key);
     try {
       source = intlSource(name);
     } catch {
       source = intlSource("UTC");
     }
   }
-  cache.set(key, { path, stamp: stamp ?? "", checkedAt: now, source });
+  cache.set(key, { path, stamp: stamp ?? "", checkedAt: now, source, stale: false });
   return source;
 }
 
@@ -359,11 +365,15 @@ export function offsetAt(ms: number, name?: string): Offset {
   return load(key, name, Date.now()).offset(Math.floor(ms / 1000));
 }
 
-/** Where zone `name`'s offsets come from: the zone database file, or the Intl fallback. */
-export function zoneSource(name?: string): { kind: "tzif" | "intl"; path: string | null } {
+/**
+ * Where zone `name`'s offsets come from: the zone database file, the last good copy of
+ * it after a failed re-read (`stale`), or the Intl fallback.
+ */
+export function zoneSource(name?: string): { kind: "tzif" | "stale" | "intl"; path: string | null } {
   const key = name ?? "\0local";
   const kind = load(key, name, Date.now()).kind;
-  return { kind, path: cache.get(key)?.path ?? null };
+  const entry = cache.get(key);
+  return { kind: entry?.stale ? "stale" : kind, path: entry?.path ?? null };
 }
 
 /** This runtime's own Intl offset for `name` at `ms` (what bun's bundled ICU says). */

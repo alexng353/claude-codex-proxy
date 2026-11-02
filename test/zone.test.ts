@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localTime, outstanding, emptyState, zonedTime, type GateState } from "../src/hygiene";
 import { parseCaptureTime } from "../src/hygiene-proof";
-import { offsetAt, parsePosixTz, posixOffsetAt, resetZoneCache, wallTime } from "../src/zone";
+import { offsetAt, parsePosixTz, posixOffsetAt, resetZoneCache, wallTime, zoneSource } from "../src/zone";
 
 /**
  * Every expectation here comes from glibc's `date` reading the same zone
@@ -96,7 +96,13 @@ describe("zone database clock", () => {
   });
 });
 
-describe.skipIf(!hasZic)("follows whatever rule the zone database has", () => {
+// These tests are what prove the gate follows tzdata, so a machine without zic fails
+// here instead of passing with them skipped (Arch: tzdata ships zic; macOS: built in).
+test("zic is installed (the zone-database tests below need it)", () => {
+  expect({ zic: hasZic ? "found" : "missing: install tzdata's zic, these tests must not be skipped" }).toEqual({ zic: "found" });
+});
+
+describe.if(hasZic)("follows whatever rule the zone database has", () => {
   function fakeTzdir(source: string): string {
     const dir = mkdtempSync(join(tmpdir(), "zone-test-"));
     writeFileSync(join(dir, "src.zi"), source);
@@ -160,14 +166,20 @@ describe.skipIf(!hasZic)("follows whatever rule the zone database has", () => {
       console.error = () => {};
       const ms = Date.parse("2030-01-01T00:00:00Z");
       expect(offsetAt(ms, ZONE).offsetMs).toBe(-6 * 3600_000);
+      const logged: string[] = [];
+      console.error = (...a: unknown[]) => void logged.push(a.join(" "));
       rmSync(file);
       Date.now = () => realNow() + 61_000;
-      // Gone for a moment (a tzdata upgrade): still the file's rule, never Intl.
+      // Gone for a moment (a tzdata upgrade): still the file's rule, never Intl, and said so.
       expect(offsetAt(ms, ZONE)).toMatchObject({ offsetMs: -6 * 3600_000, abbrev: "XST" });
+      expect(zoneSource(ZONE).kind).toBe("stale");
+      expect(logged.join("\n")).toContain("last good copy");
+      expect(logged.join("\n")).not.toContain("using Intl");
       writeFileSync(join(dir, "src.zi"), ["Zone America/Vancouver -5:00 - YST", ""].join("\n"));
       sh(["zic", "-d", dir, join(dir, "src.zi")]);
       Date.now = () => realNow() + 122_000;
       expect(offsetAt(ms, ZONE)).toMatchObject({ offsetMs: -5 * 3600_000, abbrev: "YST" });
+      expect(zoneSource(ZONE).kind).toBe("tzif");
     } finally {
       Date.now = realNow;
       console.error = quiet;
@@ -175,7 +187,9 @@ describe.skipIf(!hasZic)("follows whatever rule the zone database has", () => {
     }
   });
 
-  test("a zone file that could not be read is retried once readable, even with the same stamp", () => {
+  // Root reads a mode-000 file anyway, so this cannot be shown as root.
+  const asRoot = process.getuid?.() === 0;
+  test.skipIf(asRoot)(`a zone file that could not be read is retried once readable, even with the same stamp${asRoot ? " (SKIPPED: running as root)" : ""}`, () => {
     const dir = fakeTzdir(["Zone America/Vancouver -6:00 - XST", ""].join("\n"));
     const file = join(dir, "America/Vancouver");
     const realNow = Date.now;

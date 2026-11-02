@@ -3,9 +3,30 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkZone, runZoneCheck, zoneAlarm, type ZoneCheck } from "../src/zone-check";
-import { intlOffsetAt, offsetAt } from "../src/zone";
+import { offsetAt, wallTime } from "../src/zone";
+import { probes } from "../src/zone-check";
 
 const NOW = Date.parse("2026-11-02T07:25:00Z");
+
+/**
+ * Today's daemon, as `today-daemon send --client-message-id` behaves: a new id is
+ * delivered; the same id with the same text is a duplicate (exit 0, not delivered
+ * again); the same id with other text is refused (exit 3).
+ */
+function fakeDaemon() {
+  const seen = new Map<string, string>();
+  const delivered: string[] = [];
+  let failing = false;
+  const send = async (text: string, id: string) => {
+    if (failing) return false;
+    const prev = seen.get(id);
+    if (prev !== undefined) return prev === text;
+    seen.set(id, text);
+    delivered.push(id);
+    return true;
+  };
+  return { send, delivered, fail: (on: boolean) => void (failing = on) };
+}
 
 describe("zone self-check", () => {
   test("a runtime that agrees with the database raises nothing", () => {
@@ -31,16 +52,25 @@ describe("zone self-check", () => {
   });
 
   test("this bun's own Intl is compared for real", () => {
-    // The answer depends on the installed bun; the default comparator must be Intl's.
+    // The answer depends on the installed bun. Work it out here with Intl directly
+    // (wall-clock fields, not offsets) and require the default check to match it.
     const c = checkZone(NOW);
     expect(c.source).toBe("tzif");
-    const viaIntl = checkZone(NOW, "America/Vancouver", intlOffsetAt);
-    expect({ agrees: c.runtimeAgrees, at: c.mismatch?.at }).toEqual({ agrees: viaIntl.runtimeAgrees, at: viaIntl.mismatch?.at });
-    const intlNow = new Intl.DateTimeFormat("en-US", { timeZone: "America/Vancouver", hour: "numeric", hourCycle: "h23" });
-    const intlHour = Number(intlNow.format(new Date(NOW)));
-    const dbHour = new Date(NOW + offsetAt(NOW, "America/Vancouver").offsetMs).getUTCHours();
-    // If Intl's hour differs from the database's, the check must say so.
-    if (intlHour !== dbHour) expect(c.runtimeAgrees).toBe(false);
+    const intl = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/Vancouver", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", hourCycle: "h23",
+    });
+    const fields = (ms: number) => {
+      const p = Object.fromEntries(intl.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+      return [+p.year, +p.month, +p.day, +p.hour, +p.minute];
+    };
+    const firstDiff = [...probes(NOW), NOW].find((ms) => {
+      const w = wallTime(ms, "America/Vancouver");
+      return JSON.stringify(fields(ms)) !== JSON.stringify([w.year, w.month, w.day, w.hour, w.minute]);
+    });
+    expect({ agrees: c.runtimeAgrees, at: c.mismatch?.at }).toEqual({
+      agrees: firstDiff === undefined,
+      at: firstDiff === undefined ? undefined : new Date(firstDiff).toISOString(),
+    });
   });
 
   test("the gate's clock on the Intl fallback is an error", () => {
@@ -48,18 +78,32 @@ describe("zone self-check", () => {
     expect(zoneAlarm(c)).toMatchObject({ level: "error", key: "zone-fallback-2026" });
   });
 
-  test("each fallback episode pages: recovery clears the fallback marker", async () => {
+  test("a gate clock on a stale copy of the zone file is an error that does not say Intl", () => {
+    const c: ZoneCheck = { zone: "America/Vancouver", runtime: "bun x", source: "stale", path: "/z", runtimeAgrees: true, year: 2026 };
+    const alarm = zoneAlarm(c)!;
+    expect(alarm).toMatchObject({ level: "error", key: "zone-fallback-2026" });
+    expect(alarm.text).toContain("last good copy");
+    expect(alarm.text).not.toContain("Intl");
+  });
+
+  test("each fallback episode is delivered under its own id; retries in an episode reuse it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "zone-check-"));
     const base = { zone: "America/Vancouver", runtime: "bun x", path: null, runtimeAgrees: true, year: 2026 } as const;
     const down: ZoneCheck = { ...base, source: "intl" };
     const up: ZoneCheck = { ...base, source: "tzif" };
-    const sent: string[] = [];
-    const send = async (_t: string, id: string) => (sent.push(id), true);
+    const daemon = fakeDaemon();
     const quiet = console.error;
     console.error = () => {};
     try {
-      for (const c of [down, down, up, down]) await runZoneCheck({ now: NOW, send, dir, check: () => c });
-      expect(sent).toEqual(["zone-fallback-2026", "zone-fallback-2026"]);
+      const run = (c: ZoneCheck, at: number) => runZoneCheck({ now: NOW + at, send: daemon.send, dir, check: () => c });
+      daemon.fail(true);
+      await run(down, 0); // episode 1 starts; the page fails
+      daemon.fail(false);
+      await run(down, 60_000); // retried under episode 1's id
+      await run(down, 120_000); // already delivered: nothing
+      await run(up, 180_000); // recovered
+      await run(down, 240_000); // episode 2
+      expect(daemon.delivered).toEqual([`zone-fallback-2026-${NOW}`, `zone-fallback-2026-${NOW + 240_000}`]);
     } finally {
       console.error = quiet;
       rmSync(dir, { recursive: true, force: true });

@@ -11,7 +11,7 @@
  *   The gate is unaffected (it reads src/zone.ts); anything still on Intl is not.
  * Pages go to COMB_BLOCKED_PAGE_THREAD on this machine, like blocked-task pages.
  */
-import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { STRIPPED_ENV } from "./claude-env";
@@ -25,7 +25,8 @@ const RECHECK_MS = 12 * 60 * 60 * 1000;
 export type ZoneCheck = {
   zone: string;
   runtime: string;
-  source: "tzif" | "intl";
+  /** `stale`: the zone file failed its last re-read; the gate runs on the last good copy. */
+  source: "tzif" | "stale" | "intl";
   path: string | null;
   /** Intl and the zone database give the same UTC offset at every probe. */
   runtimeAgrees: boolean;
@@ -79,11 +80,21 @@ const utc = (o: Offset) => {
 };
 
 /** What to log and page, or null when all is well. Deterministic for one runtime, data set and year. */
-export function zoneAlarm(c: ZoneCheck): { level: "error" | "warn"; key: string; text: string } | null {
+export function zoneAlarm(
+  c: ZoneCheck,
+): { level: "error" | "warn"; key: string; text: string; episodic?: boolean } | null {
+  if (c.source === "stale")
+    return {
+      level: "error",
+      key: `zone-fallback-${c.year}`,
+      episodic: true,
+      text: `[agent] claude-codex-proxy zone self-check: the zone file for ${c.zone} (${c.path ?? "no path"}) failed its last re-read, so the hygiene gate keeps the last good copy it read before. Its windows stay right unless tzdata changed meanwhile; check that the file is readable.`,
+    };
   if (c.source !== "tzif")
     return {
       level: "error",
       key: `zone-fallback-${c.year}`,
+      episodic: true,
       text: `[agent] claude-codex-proxy zone self-check: no readable zone file for ${c.zone} (${c.path ?? "no path"}), so the hygiene gate's clock fell back to ${c.runtime}'s Intl, which may lag tzdata. Gate windows can be an hour off until the zone file is readable again.`,
     };
   if (!c.runtimeAgrees && c.mismatch)
@@ -127,7 +138,30 @@ let last: ZoneCheck | null = null;
 /** The newest self-check result, for /health. */
 export const lastZoneCheck = () => last;
 
-/** Runs one check: logs, and pages once per alarm key (marker files in `dir`). */
+const EPISODE_FILE = "zone-fallback-episode.json";
+type Episode = { id: string; paged: boolean };
+
+function readEpisode(dir: string): Episode | null {
+  try {
+    const e = JSON.parse(readFileSync(join(dir, EPISODE_FILE), "utf8"));
+    return typeof e?.id === "string" && typeof e?.paged === "boolean" ? e : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeMarker(dir: string, name: string, body: string) {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, name), body, { mode: 0o600 });
+}
+
+/**
+ * Runs one check: logs, and pages. The Intl-disagreement page goes once per alarm key
+ * (a marker file per key). A fallback page goes once per episode: the episode's id
+ * (`zone-fallback-<year>-<start ms>`) is kept in a marker until the zone file reads
+ * again, so a retry within the episode reuses it and Today's daemon delivers it once,
+ * and the next episode gets a new id the daemon has not seen.
+ */
 export async function runZoneCheck({
   now = Date.now(),
   send = sendZonePage,
@@ -139,19 +173,26 @@ export async function runZoneCheck({
 }> {
   const c = check(now);
   last = c;
-  // Back on the zone file: the next fallback is a new episode and pages again.
-  if (c.source === "tzif" && existsSync(dir))
-    for (const f of readdirSync(dir)) if (f.startsWith("zone-fallback-")) unlinkSync(join(dir, f));
+  // Back on the zone file: the episode is over.
+  if (c.source === "tzif") rmSync(join(dir, EPISODE_FILE), { force: true });
   const alarm = zoneAlarm(c);
   if (!alarm) return { check: c, paged: false };
   (alarm.level === "error" ? console.error : console.warn)(alarm.text.replace(/^\[agent\] /, ""));
+  if (alarm.episodic) {
+    let episode = readEpisode(dir);
+    if (!episode) {
+      episode = { id: `${alarm.key}-${now}`, paged: false };
+      writeMarker(dir, EPISODE_FILE, JSON.stringify(episode));
+    }
+    if (episode.paged) return { check: c, paged: false };
+    const paged = await send(alarm.text, episode.id).catch(() => false);
+    if (paged) writeMarker(dir, EPISODE_FILE, JSON.stringify({ ...episode, paged: true }));
+    return { check: c, paged };
+  }
   const marker = join(dir, alarm.key);
   if (existsSync(marker)) return { check: c, paged: false };
   const paged = await send(alarm.text, alarm.key).catch(() => false);
-  if (paged) {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    writeFileSync(marker, `${new Date(now).toISOString()}\n`, { mode: 0o600 });
-  }
+  if (paged) writeMarker(dir, alarm.key, `${new Date(now).toISOString()}\n`);
   return { check: c, paged };
 }
 
