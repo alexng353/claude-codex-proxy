@@ -93,12 +93,11 @@ Cairn's app shield sends this when Alex taps "Emergency, 15 min", possibly long 
 { "minutes": 15, "source": "cairn-shield", "at": "2026-11-05T13:58:00.000Z" }
 ```
 
-- **`minutes`** is a whole number, 1-60. **`source`** is 1-40 letters, digits, `.`, `_` or `-`. **`at`** is the tap time; more than 5 minutes in the future is refused.
-- **The window runs from `at`**, never from when the report arrives, so a late report cannot grant a fresh window. A longer BYPASS already open is never shortened.
-- **Idempotent on `source` + `at`:** a repeat returns the first answer with `duplicate: true`.
-- **Locked gate:** opens a debt like BYPASS (the model asks why on Alex's next turn; an unjustified ruling sets a penance). The gate opens only if the window hasn't ended yet (`applied: true`).
-- **Clear gate:** nothing opens and no debt is made (`applied: false`, `debt_id: null`).
-- **Response 200:** `{ ok: true, applied, duplicate, until: ISO | null, debt_id: string | null, gate: <same shape as GET /status> }`. **400** `{error}` for bad input, **401/403** for auth, **503** while the gate is disabled.
+- **`minutes`** is a whole number, 1-60. **`source`** is 1-40 letters, digits, `.`, `_` or `-`. **`at`** is the tap time; more than 5 minutes in the future, or more than 24 hours old, is refused (400, final: the phone should not retry it).
+- **The window runs from the tap** (`at`, or the receive time if `at` is ahead of it), never from when the report arrives, so a late report cannot grant a fresh window. A longer BYPASS already open is never shortened.
+- **The charge is judged at the tap too.** Armed then (locked, no bypass open): a debt like BYPASS (the model asks why on Alex's next turn; an unjustified ruling sets a penance), and the gate opens if the window hasn't ended yet (`applied: true`). Clear or already bypassed then (a stale shield on the phone): nothing opens and no debt is made (`applied: false`, `debt_id: null`). Proof sent after the tap doesn't cancel its debt.
+- **Idempotent on `source` + `at`:** a repeat within 7 days returns the first answer with `duplicate: true`.
+- **Response 200:** `{ ok: true, applied, duplicate, until: ISO | null, debt_id: string | null, gate: <same shape as GET /status> }`. `until` is the gate's bypass end when applied (a longer one already open wins), else null. **400** `{error}` for bad input, **401/403** for auth, **503** while the gate is disabled.
 
 ## Phone wake (proxy to Cairn relay)
 

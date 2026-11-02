@@ -22,7 +22,13 @@ beforeAll(async () => {
   directory = await mkdtemp(join(tmpdir(), "hygiene-bypass-test-"));
   for (const key of ["PROXY_STATE_DIR", "HYGIENE_GATE_STATE", "HYGIENE_GATE_DISABLED_FILE", "HYGIENE_GATE_REMOTE"]) saved[key] = process.env[key];
   delete process.env.HYGIENE_GATE_REMOTE;
-  setAuthenticator(async (token) => (token === "phone" ? { id: "phone-1", name: "iphone", role: "phone" } : null));
+  setAuthenticator(async (token) =>
+    token === "phone"
+      ? { id: "phone-1", name: "iphone", role: "phone" }
+      : token === "agent"
+        ? { id: "agent-1", name: "bubble", role: "agent" }
+        : null,
+  );
 });
 
 afterAll(async () => {
@@ -94,13 +100,52 @@ describe("shield bypass", () => {
     expect((await state()).bypass.count).toBe(0);
   });
 
-  test("never shortens a longer bypass already open", async () => {
+  test("a tap while a bypass is already open costs nothing and never shortens it", async () => {
     const s = await state();
     s.bypass = { count: 1, until: iso(at(DAY, "07:00")), history: [iso(at(DAY, "06:00"))] };
     await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
     resetGateCache();
-    await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:00")) });
-    expect((await state()).bypass.until).toBe(iso(at(DAY, "07:00")));
+    clock = at(DAY, "06:05");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:01")) });
+    expect(r.body).toMatchObject({ applied: false, until: null, debt_id: null });
+    const after = await state();
+    expect(after.bypass.until).toBe(iso(at(DAY, "07:00")));
+    expect(after.bypass.count).toBe(1);
+    expect(after.debts).toEqual([]);
+  });
+
+  test("the charge is judged at the tap: clear then, locked by the time it arrives, costs nothing", async () => {
+    clock = at(DAY, "06:30");
+    // The gate first arms at 05:00 (startsAt): a 04:30 tap was taken while it was clear.
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "04:30")) });
+    expect(r.body).toMatchObject({ applied: false, until: null, debt_id: null });
+    expect(r.body.gate.state).toBe("armed");
+    expect((await state()).debts).toEqual([]);
+  });
+
+  test("a tap from a fast phone clock is anchored to the receive time", async () => {
+    clock = at(DAY, "06:10");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(clock + 3 * 60_000) });
+    expect(r.body).toMatchObject({ applied: true, until: iso(clock + 15 * 60_000) });
+    const s = await state();
+    expect(s.bypass.history).toEqual([iso(clock)]);
+    expect(s.debts[0].at).toBe(iso(clock));
+  });
+
+  test("a duplicate of a tap that opened nothing answers exactly like the first", async () => {
+    clock = at(DAY, "04:30");
+    const body = { minutes: 15, source: "cairn-shield", at: iso(at(DAY, "04:29")) };
+    const first = await bypass(body);
+    const again = await bypass(body);
+    expect(first.body).toMatchObject({ applied: false, until: null, debt_id: null, duplicate: false });
+    expect(again.body).toMatchObject({ applied: false, until: null, debt_id: null, duplicate: true });
+  });
+
+  test("taps more than 24 hours old are refused", async () => {
+    clock = at(DAY, "06:30");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(clock - 25 * 3_600_000) });
+    expect(r.status).toBe(400);
+    expect((await state()).debts).toEqual([]);
   });
 
   test("with the gate clear nothing opens and no debt is made", async () => {
@@ -118,6 +163,7 @@ describe("shield bypass", () => {
     expect((await bypass({ minutes: 15, source: "cairn-shield", at: iso(clock + 6 * 60_000) })).status).toBe(400);
     expect((await bypass({ minutes: "15", source: "cairn-shield", at: iso(clock) })).status).toBe(400);
     expect((await bypass({ minutes: 15, source: "cairn-shield", at: iso(clock) }, "nope")).status).toBe(401);
+    expect((await bypass({ minutes: 15, source: "cairn-shield", at: iso(clock) }, "agent")).status).toBe(403);
     expect((await state()).debts).toEqual([]);
   });
 

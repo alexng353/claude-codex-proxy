@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zonedTime } from "../src/hygiene";
 import { resetGateCache, setGateDeps, shieldSignature } from "../src/hygiene-gate";
-import { phoneWakeStep, relaySender, retryAfterMs, type WakeAnswer } from "../src/phone-wake";
+import { phoneWakeStep, relaySender, retryAfterMs, startPhoneWake, type WakeAnswer } from "../src/phone-wake";
 
 let directory = "";
 let run = 0;
@@ -115,6 +115,18 @@ describe("phoneWakeStep", () => {
     const file = JSON.parse(await readFile(path, "utf8"));
     expect(file.failures).toBeUndefined();
     expect(file.sent).toBeUndefined();
+    expect(file.nextAttemptAt).toBe(clock + 10 * 60_000);
+  });
+
+  test("an unchanged or waiting poll leaves the file untouched", async () => {
+    const compact = JSON.stringify({ sent: "armed|" });
+    await writeFile(path, compact);
+    expect(await phoneWakeStep(path, "armed|", now, scripted())).toBe("unchanged");
+    expect(await readFile(path, "utf8")).toBe(compact);
+    const waiting = JSON.stringify({ sent: "armed|", nextAttemptAt: clock + 1000 });
+    await writeFile(path, waiting);
+    expect(await phoneWakeStep(path, "clear|", now, scripted())).toBe("waiting");
+    expect(await readFile(path, "utf8")).toBe(waiting);
   });
 
   test("a corrupt wake file costs one extra wake, nothing more", async () => {
@@ -139,6 +151,20 @@ describe("relaySender", () => {
     const { seen, fetcher } = reply(200);
     expect(await relaySender("https://relay/v1/gate/wake", tokenFile(), fetcher)()).toEqual({ kind: "off" });
     expect(seen.url).toBeUndefined();
+  });
+
+  test("HYGIENE_PHONE_WAKE=off sends nothing even with a token", async () => {
+    await writeFile(tokenFile(), "t");
+    const { seen, fetcher } = reply(200);
+    const saved = process.env.HYGIENE_PHONE_WAKE;
+    process.env.HYGIENE_PHONE_WAKE = "off";
+    try {
+      expect(await relaySender("u", tokenFile(), fetcher)()).toEqual({ kind: "off" });
+      expect(seen.url).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.HYGIENE_PHONE_WAKE;
+      else process.env.HYGIENE_PHONE_WAKE = saved;
+    }
   });
 
   test("posts {} with the bearer from the file", async () => {
@@ -177,6 +203,40 @@ describe("relaySender", () => {
     expect(retryAfterMs("601")).toBeNull();
     expect(retryAfterMs("Wed, 21 Oct 2026 07:28:00 GMT")).toBeNull();
     expect(retryAfterMs(null)).toBeNull();
+  });
+});
+
+describe("startPhoneWake", () => {
+  test("a follower (null signature) never sends", async () => {
+    const send = scripted();
+    const stop = startPhoneWake(() => path, () => null, now, send, 5);
+    await Bun.sleep(40);
+    await stop();
+    expect(send.calls).toBe(0);
+  });
+
+  test("ticks never overlap, and nothing runs after stop", async () => {
+    let inFlight = 0;
+    let most = 0;
+    let calls = 0;
+    let signature = 0;
+    const slow = async (): Promise<WakeAnswer> => {
+      calls++;
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await Bun.sleep(25);
+      inFlight--;
+      return { kind: "accepted" };
+    };
+    // A new signature every tick, so every tick wants to send.
+    const stop = startPhoneWake(() => path, () => `s${signature++}`, now, slow, 5);
+    await Bun.sleep(80);
+    await stop();
+    expect(most).toBe(1);
+    expect(calls).toBeGreaterThan(0);
+    const after = calls;
+    await Bun.sleep(30);
+    expect(calls).toBe(after);
   });
 });
 

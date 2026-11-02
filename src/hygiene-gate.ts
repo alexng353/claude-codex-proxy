@@ -472,14 +472,19 @@ export type ShieldBypassResult =
 
 /** Reports more than this far in the future are refused (phone clocks drift a little). */
 const SHIELD_FUTURE_SLACK_MS = 5 * 60_000;
+/** Taps older than this are refused: the gate can no longer judge whether it was locked then. */
+const SHIELD_MAX_AGE_MS = 24 * 3_600_000;
+/** Shield records are kept this long, past the age cap, so a retry still finds its first answer. */
+const SHIELD_KEEP_MS = 7 * 86_400_000;
 
 /**
  * The "Emergency" button on Cairn's app shield: a BYPASS for `minutes`, sent
  * when the phone is back online. The window is anchored to the tap, never to
  * the report, so a late report can't grant a fresh window, and a repeat of the
- * same source + tap time returns the first answer. A tap while the gate was
- * locked opens a debt the model rules on, as BYPASS does; nothing happens when
- * the gate is clear now.
+ * same source + tap time returns the first answer. The charge is judged at the
+ * tap too: a tap while the gate was armed (locked, no bypass open) opens a debt
+ * the model rules on, as BYPASS does; a tap while it was clear or already
+ * bypassed (a stale shield on the phone) costs nothing and opens nothing.
  */
 export async function shieldBypass(input: { minutes: number; source: string; at: string }): Promise<ShieldBypassResult> {
   const tap = Date.parse(input.at);
@@ -494,27 +499,34 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
     const at = new Date(tap).toISOString();
     state.shieldBypasses ??= [];
     const seen = state.shieldBypasses.find((b) => b.source === input.source && b.at === at);
-    if (seen) return { ok: true, applied: seen.applied, duplicate: true, until: seen.until, debt_id: seen.debtId };
+    if (seen) return { ok: true, applied: seen.applied, duplicate: true, until: seen.applied ? seen.until : null, debt_id: seen.debtId };
+    if (tap < now - SHIELD_MAX_AGE_MS) return { ok: false, status: 400, error: "at is more than 24 hours old" };
 
-    const until = tap + input.minutes * 60_000;
-    const due = outstanding(state, now);
+    // A fast phone clock can't stretch the window past what was asked.
+    const anchor = Math.min(tap, now);
+    const until = anchor + input.minutes * 60_000;
     let debtId: string | null = null;
     let applied = false;
-    if (due.length) {
-      debtId = `${localTime(tap).day}-shield-${state.shieldBypasses.length + 1}`;
-      state.debts.push({ id: debtId, at, skipped: due.map((r) => r.label), status: "open" });
+    if (armed(state, anchor)) {
+      // Numbered from the debts themselves: shield records are trimmed, debts are not.
+      const prefix = `${localTime(anchor).day}-shield-`;
+      debtId = `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`;
+      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped: outstanding(state, anchor).map((r) => r.label), status: "open" });
       if (until > now) {
         applied = true;
         state.bypass.count += 1;
-        state.bypass.history.push(at);
+        state.bypass.history.push(new Date(anchor).toISOString());
         const current = state.bypass.until ? Date.parse(state.bypass.until) : 0;
         if (until > current) state.bypass.until = new Date(until).toISOString();
       }
     }
-    state.shieldBypasses.push({ source: input.source, at, until: new Date(until).toISOString(), applied, debtId, recordedAt: new Date(now).toISOString() });
+    // The gate's own end, which a longer bypass already open may set: the phone re-locks from it.
+    const reported = applied ? state.bypass.until : null;
+    state.shieldBypasses = state.shieldBypasses.filter((b) => now - Date.parse(b.recordedAt) <= SHIELD_KEEP_MS);
+    state.shieldBypasses.push({ source: input.source, at, until: reported ?? new Date(until).toISOString(), applied, debtId, recordedAt: new Date(now).toISOString() });
     saveState(state);
     if (applied) release(state, now, "BYPASS");
-    return { ok: true, applied, duplicate: false, until: applied ? new Date(until).toISOString() : null, debt_id: debtId };
+    return { ok: true, applied, duplicate: false, until: reported, debt_id: debtId };
   });
 }
 

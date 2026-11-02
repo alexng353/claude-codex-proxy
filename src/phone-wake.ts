@@ -72,7 +72,10 @@ function updateWake<T>(path: string, edit: (file: WakeFile) => T): T {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   return withLock(`${path}.lock`, () => {
     const file = readWake(path);
+    const before = JSON.stringify(file);
     const result = edit(file);
+    // Most polls change nothing: skip the write.
+    if (JSON.stringify(file) === before && existsSync(path)) return result;
     const temporary = `${path}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
     renameSync(temporary, path);
@@ -92,6 +95,13 @@ export async function phoneWakeStep(
   now: () => number,
   send: PhoneWakeSender,
 ): Promise<StepResult> {
+  // The common case, nothing changed or still waiting, needs no lock (which
+  // waits synchronously when the other handoff copy holds it).
+  const peek = readWake(path);
+  const t0 = now();
+  if (peek.sent === signature) return "unchanged";
+  if ((peek.claimUntil ?? 0) > t0) return "busy";
+  if ((peek.nextAttemptAt ?? 0) > t0) return "waiting";
   let claimed: StepResult | null;
   try {
     claimed = updateWake(path, (file) => {
