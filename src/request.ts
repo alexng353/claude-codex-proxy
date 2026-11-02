@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type {
   ResponseContentPart,
   ResponseInputItem,
@@ -341,11 +341,16 @@ function serializeAgentMessage(item: ResponseInputItem): string {
       payload.file.text.replace(/\n+$/, ""),
     );
   } else if (payload.kind === "blocked") {
-    // The reply goes to the parent as plain text, so it carries the way out: the
-    // parent writes the task file and spawns again under the name the proxy reads.
+    // The reply goes to the parent as plain text, so a NEW_TASK's reply carries the
+    // way out: the parent writes the task file and spawns again under the name the
+    // proxy reads. Other messages keep the bare reply: a follow-up has no file to
+    // fall back on, and telling the parent to respawn would drop the child's work.
     const { name, path } = payload.retry;
+    const retry = payload.newTask
+      ? ` A Claude agent cannot read an encrypted message. Create ${dirname(path)} with mode 700 if it is missing, write the complete task to ${path} with mode 600, and spawn a new agent with task_name ${name}.`
+      : "";
     lines.push(
-      `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${blockedReason(payload)} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${payload.taskName || "unnamed task"}). A Claude agent cannot read an encrypted message. Write the complete task to ${path} (mode 600) and spawn a new agent with task_name ${name}."]`,
+      `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${blockedReason(payload)} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${payload.taskName || "unnamed task"}).${retry}"]`,
     );
   }
   lines.push("</agent_message>");

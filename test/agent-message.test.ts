@@ -206,4 +206,34 @@ describe("a BLOCKED reply the parent can act on", () => {
   test("a label outside [a-z0-9_] becomes a valid name", () => {
     expect(suggested(serializeItem(v2Task("/root/Comb-Opus.v2")))).toMatch(/^comb_opus_v2__[a-z0-9]{12}$/);
   });
+
+  test("every awkward task name still yields a name and file the proxy reads", () => {
+    const cases: [string, RegExp][] = [
+      ["", /^task__[a-z0-9]{12}$/],
+      ["/root/___", /^task__[a-z0-9]{12}$/],
+      [`/root/${"a_".repeat(40)}`, /^(a_){19}a__[a-z0-9]{12}$/],
+      ["/root/İx", /^i_x__[a-z0-9]{12}$/],
+      ["/root/foo___bar", /^foo__[a-z0-9]{12}$/],
+      ["/root/__k", /^task__[a-z0-9]{12}$/],
+    ];
+    for (const [task, shape] of cases) {
+      const name = suggested(serializeItem(v2Task(task)))!;
+      expect(name).toMatch(shape);
+      writeFileSync(join(dir, `${name}.md`), `Task for ${JSON.stringify(task)}.`, { mode: 0o600 });
+      expect(serializeItem(v2Task(`/root/${name}`))).toContain(`Task for ${JSON.stringify(task)}.`);
+    }
+  });
+
+  test("the reply says to create the directory and write the file privately", () => {
+    const answer = reply(serializeItem(v2Task("/root/comb_opus")));
+    expect(answer).toContain(`Create ${dir} with mode 700 if it is missing`);
+    expect(answer).toContain("with mode 600");
+  });
+
+  test("a follow-up keeps the bare reply: respawning would drop the child's work", () => {
+    const item = v2Task("/root/comb_opus__k3f9q2xa7m");
+    (item.content as { type: string; text?: string }[])[0].text =
+      "Message Type: FOLLOW_UP\nTask name: /root/comb_opus__k3f9q2xa7m\nSender: /root\nPayload:\n";
+    expect(reply(serializeItem(item))).toBe("BLOCKED: the task payload was encrypted and unreadable (/root/comb_opus__k3f9q2xa7m).");
+  });
 });
