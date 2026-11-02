@@ -124,6 +124,22 @@ export type GateState = {
   extraGatedTriggers: string[];
   /** Planned gym sessions and what Uplifting reported (gym.ts). Absent until the first plan. */
   gym?: GymState;
+  /**
+   * Emergency bypasses reported by Cairn's app shield (POST /hygiene/api/v1/bypass),
+   * keyed by source + tap time so an offline retry never opens a second window.
+   */
+  shieldBypasses?: ShieldBypass[];
+};
+
+export type ShieldBypass = {
+  source: string;
+  /** When Alex tapped the shield button; the window runs from here. */
+  at: string;
+  until: string;
+  /** The window opened the gate (it was locked and the window hadn't ended when reported). */
+  applied: boolean;
+  debtId: string | null;
+  recordedAt: string;
 };
 
 export function emptyState(startsAt: string): GateState {

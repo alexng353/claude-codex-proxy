@@ -83,7 +83,22 @@ Response (`200`, also when the photo fails):
 - **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight`, `penance` or `gym`. A `gym` item (slot `gym/<plan id>`, since 2026-11-02) is a planned gym session with no qualifying Uplifting session; no photo fills it, and this API has no gym kind for proofs.
 - **`due_today`** lists what is due later today but does not lock yet, including today's planned gym sessions and one in progress.
 - **`open_debts`** lists BYPASS uses that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt } }`. A penance photo is sent in a chat; this API has no penance kind.
-- **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters.
+- **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters. The one exception is the app shield's emergency button, below.
+
+## POST /bypass
+
+Cairn's app shield sends this when Alex taps "Emergency, 15 min", possibly long after the tap (added 2026-11-02).
+
+```json
+{ "minutes": 15, "source": "cairn-shield", "at": "2026-11-05T13:58:00.000Z" }
+```
+
+- **`minutes`** is a whole number, 1-60. **`source`** is 1-40 letters, digits, `.`, `_` or `-`. **`at`** is the tap time; more than 5 minutes in the future is refused.
+- **The window runs from `at`**, never from when the report arrives, so a late report cannot grant a fresh window. A longer BYPASS already open is never shortened.
+- **Idempotent on `source` + `at`:** a repeat returns the first answer with `duplicate: true`.
+- **Locked gate:** opens a debt like BYPASS (the model asks why on Alex's next turn; an unjustified ruling sets a penance). The gate opens only if the window hasn't ended yet (`applied: true`).
+- **Clear gate:** nothing opens and no debt is made (`applied: false`, `debt_id: null`).
+- **Response 200:** `{ ok: true, applied, duplicate, until: ISO | null, debt_id: string | null, gate: <same shape as GET /status> }`. **400** `{error}` for bad input, **401/403** for auth, **503** while the gate is disabled.
 
 ## GET /photos?from=YYYY-MM-DD&to=YYYY-MM-DD
 

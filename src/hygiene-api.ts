@@ -11,7 +11,7 @@ import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, type ProofKind } from "./hygiene";
-import { gateDisabled, gateStatus, proofDays, proofFile, submitProof, type ProofTarget } from "./hygiene-gate";
+import { gateDisabled, gateStatus, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -127,6 +127,22 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
   if (path === "/weight-reviews" && request.method === "GET") return json(weightReviews());
 
   if (path === "/status" && request.method === "GET") return json(status());
+
+  // Cairn's app-shield "Emergency" button (see shieldBypass).
+  if (path === "/bypass" && request.method === "POST") {
+    if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
+    let body: { minutes?: unknown; source?: unknown; at?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "body must be JSON" }, 400);
+    }
+    if (typeof body?.minutes !== "number" || typeof body.source !== "string" || typeof body.at !== "string")
+      return json({ error: "minutes (number), source and at (strings) are required" }, 400);
+    const result = await shieldBypass({ minutes: body.minutes, source: body.source, at: body.at });
+    if (!result.ok) return json({ error: result.error }, result.status);
+    return json({ ...result, gate: status() });
+  }
 
   if (path === "/proofs" && request.method === "POST") {
     if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);

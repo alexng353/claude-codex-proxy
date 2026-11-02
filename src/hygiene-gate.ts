@@ -465,6 +465,58 @@ function bypassReply(state: GateState, now: number): string {
   return `🚪 bypass #${state.bypass.count}: gate open until ${clockLabel(now + BYPASS_MS)}. Your next turn will ask why.`;
 }
 
+export type ShieldBypassResult =
+  | { ok: true; applied: boolean; duplicate: boolean; until: string | null; debt_id: string | null }
+  | { ok: false; status: number; error: string };
+
+/** Reports more than this far in the future are refused (phone clocks drift a little). */
+const SHIELD_FUTURE_SLACK_MS = 5 * 60_000;
+
+/**
+ * The "Emergency" button on Cairn's app shield: a BYPASS for `minutes`, sent
+ * when the phone is back online. The window is anchored to the tap, never to
+ * the report, so a late report can't grant a fresh window, and a repeat of the
+ * same source + tap time returns the first answer. A tap while the gate was
+ * locked opens a debt the model rules on, as BYPASS does; nothing happens when
+ * the gate is clear now.
+ */
+export async function shieldBypass(input: { minutes: number; source: string; at: string }): Promise<ShieldBypassResult> {
+  const tap = Date.parse(input.at);
+  if (!Number.isInteger(input.minutes) || input.minutes < 1 || input.minutes > 60)
+    return { ok: false, status: 400, error: "minutes must be a whole number, 1-60" };
+  if (!/^[a-z0-9._-]{1,40}$/i.test(input.source)) return { ok: false, status: 400, error: "source must be 1-40 letters, digits, . _ -" };
+  if (!Number.isFinite(tap)) return { ok: false, status: 400, error: "at must be an ISO time" };
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    if (tap > now + SHIELD_FUTURE_SLACK_MS) return { ok: false, status: 400, error: "at is in the future" };
+    const at = new Date(tap).toISOString();
+    state.shieldBypasses ??= [];
+    const seen = state.shieldBypasses.find((b) => b.source === input.source && b.at === at);
+    if (seen) return { ok: true, applied: seen.applied, duplicate: true, until: seen.until, debt_id: seen.debtId };
+
+    const until = tap + input.minutes * 60_000;
+    const due = outstanding(state, now);
+    let debtId: string | null = null;
+    let applied = false;
+    if (due.length) {
+      debtId = `${localTime(tap).day}-shield-${state.shieldBypasses.length + 1}`;
+      state.debts.push({ id: debtId, at, skipped: due.map((r) => r.label), status: "open" });
+      if (until > now) {
+        applied = true;
+        state.bypass.count += 1;
+        state.bypass.history.push(at);
+        const current = state.bypass.until ? Date.parse(state.bypass.until) : 0;
+        if (until > current) state.bypass.until = new Date(until).toISOString();
+      }
+    }
+    state.shieldBypasses.push({ source: input.source, at, until: new Date(until).toISOString(), applied, debtId, recordedAt: new Date(now).toISOString() });
+    saveState(state);
+    if (applied) release(state, now, "BYPASS");
+    return { ok: true, applied, duplicate: false, until: applied ? new Date(until).toISOString() : null, debt_id: debtId };
+  });
+}
+
 function delayReply(state: GateState, now: number): string {
   const { day, minutes } = localTime(now);
   const due = outstanding(state, now);
