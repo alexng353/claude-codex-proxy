@@ -163,3 +163,47 @@ describe("multi-agent v2 agent_message items", () => {
     expect(text).toContain("BLOCKED");
   });
 });
+
+// q proxy-encrypted-subagent-task (arch, Nov 2 13:26-13:29): a gpt-6-astra comb spawned
+// /root/comb_opus, then /root/comb_opus_retry, then /root/comb_opus__a7c92d, with no task
+// file. All three replied a bare BLOCKED, and the third was told its name had no
+// "__<nonce>" suffix when it had a six-character one. OpenAI encrypts the spawn message
+// and rejects a schema without the encryption marker, so the task file is the only way a
+// Claude child gets its task; the BLOCKED reply must tell the parent how to use it.
+describe("a BLOCKED reply the parent can act on", () => {
+  const reply = (text: string) => /Reply only: "(BLOCKED: [^"]*)"\]/.exec(text)?.[1] ?? "";
+  const suggested = (text: string) => /task_name ([a-z0-9_]+__[a-z0-9]+)/.exec(reply(text))?.[1];
+
+  test("a key of the wrong length is named as such, not as a missing suffix", () => {
+    const text = serializeItem(v2Task("/root/comb_opus__a7c92d"));
+    expect(text).not.toContain('has no "__<nonce>" suffix');
+    expect(text).toContain("8 to 32 lowercase letters or digits");
+  });
+
+  test("the reply keeps its prefix and names a task file and task name to spawn again with", () => {
+    const text = serializeItem(v2Task("/root/comb_opus"));
+    const answer = reply(text);
+    expect(answer.startsWith("BLOCKED: the task payload was encrypted and unreadable (/root/comb_opus).")).toBe(true);
+    const name = suggested(text);
+    expect(name).toMatch(/^comb_opus__[a-z0-9]{12}$/);
+    expect(answer).toContain(join(dir, `${name}.md`));
+  });
+
+  test("the suggested name and path are the ones the proxy then reads", () => {
+    const name = suggested(serializeItem(v2Task("/root/comb_opus__a7c92d")))!;
+    writeFileSync(join(dir, `${name}.md`), "Echo PLUM-9090.", { mode: 0o600 });
+    expect(serializeItem(v2Task(`/root/${name}`))).toContain("Echo PLUM-9090.");
+  });
+
+  test("the suggestion is stable across replays and differs between tasks", () => {
+    const a = suggested(serializeItem(v2Task("/root/comb_opus")));
+    expect(suggested(serializeItem(v2Task("/root/comb_opus")))).toBe(a);
+    const other = v2Task("/root/comb_opus");
+    (other.content as { encrypted_content?: string }[])[1].encrypted_content = "gAAAAABq6PIWPXePuty8Ss7dXJzp8e6E5bdd";
+    expect(suggested(serializeItem(other))).not.toBe(a);
+  });
+
+  test("a label outside [a-z0-9_] becomes a valid name", () => {
+    expect(suggested(serializeItem(v2Task("/root/Comb-Opus.v2")))).toMatch(/^comb_opus_v2__[a-z0-9]{12}$/);
+  });
+});

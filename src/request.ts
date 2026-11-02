@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -181,13 +182,19 @@ export const textFromContent = (
  * GPT-6 model) hands a child its task as an `agent_message`: a plaintext header
  * ("Message Type ... Task name ... Payload:") and then the parent's message as
  * `encrypted_content`. A GPT parent's message is encrypted by OpenAI, for
- * OpenAI models; nothing on this machine can read it. Dropping that part, as the
+ * OpenAI models; nothing on this machine can read it. OpenAI writes the
+ * ciphertext itself: the parent's spawn_agent call already
+ * arrives with `message` as a Fernet token, because Codex marks that parameter
+ * `encrypted: true`, and OpenAI refuses a request whose spawn schema lacks the
+ * marker ("reserved for use by this model and must match the configured
+ * schema", forge, Nov 2). Dropping that part, as the
  * generic path does with every non-text part, gave a Claude child an empty task
  * (comb reviewers from Oct 31 on: some asked again, one guessed a target and ran
  * tests under a no-tests prompt).
  *
  * So an encrypted part becomes either the orchestrator's task file or a plain
- * statement that the task cannot be read. The task file is the one plaintext
+ * statement that the task cannot be read, with the file and name a new spawn
+ * can use (taskFileRetry). The task file is the one plaintext
  * channel: the canonical task name rides in the header, so an orchestrator that
  * names a task `<label>__<nonce>` and writes `<AGENT_TASKS_DIR>/<label>__<nonce>.md`
  * gets its task through. The nonce keeps a stale file from another run with a
@@ -202,9 +209,33 @@ export const agentTasksDir = (): string =>
 
 export type TaskFile = { path: string; text?: string; refused?: string };
 
+const taskLeaf = (taskName: string): string => taskName.split("/").filter(Boolean).at(-1) ?? "";
+
+/**
+ * Where the parent can put this task so a new Claude agent receives it: a valid
+ * `<label>__<key>` name and its file. A GPT parent that skipped the task file
+ * (arch, Nov 2: three spawns, three bare BLOCKED replies) learns it from the
+ * BLOCKED reply. The key hashes the task name and ciphertext: the same message
+ * replays to the same bytes, and another task gets another name.
+ */
+export function taskFileRetry(taskName: string, ciphertext: string): { name: string; path: string } {
+  const label =
+    taskLeaf(taskName)
+      .toLowerCase()
+      .replace(/__[^_]*$/, "")
+      .replace(/[^a-z0-9_]+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_|_$/g, "")
+      .slice(0, 40)
+      .replace(/_$/, "") || "task";
+  const key = createHash("sha256").update(`${taskName}\0${ciphertext}`).digest("hex").slice(0, 12);
+  const name = `${label}__${key}`;
+  return { name, path: join(agentTasksDir(), `${name}.md`) };
+}
+
 /** The task file for a canonical task name, read only if it is this user's own, fresh, regular file. */
 export function readAgentTaskFile(taskName: string): TaskFile | undefined {
-  const leaf = taskName.split("/").filter(Boolean).at(-1) ?? "";
+  const leaf = taskLeaf(taskName);
   if (!AGENT_TASK_NAME.test(leaf)) return undefined;
   const path = join(agentTasksDir(), `${leaf}.md`);
   let fd: number;
@@ -255,7 +286,15 @@ const agentMessageType = (text: string): string | undefined =>
 export type AgentMessagePayload =
   | { kind: "plain"; plain: string }
   | { kind: "task-file"; plain: string; taskName: string; file: TaskFile & { text: string } }
-  | { kind: "blocked"; plain: string; taskName: string; newTask: boolean; file?: TaskFile };
+  | {
+      kind: "blocked";
+      plain: string;
+      taskName: string;
+      newTask: boolean;
+      file?: TaskFile;
+      /** The name and file a new spawn can use instead (taskFileRetry). */
+      retry: { name: string; path: string };
+    };
 
 /**
  * One decision per item object: a request's items are serialized several times
@@ -284,7 +323,11 @@ function decideAgentMessagePayload(item: ResponseInputItem): AgentMessagePayload
   const newTask = agentMessageType(plain) === "NEW_TASK";
   const file = newTask ? readAgentTaskFile(taskName) : undefined;
   if (file?.text !== undefined) return { kind: "task-file", plain, taskName, file: { ...file, text: file.text } };
-  return { kind: "blocked", plain, taskName, newTask, file };
+  const ciphertext = parts
+    .map((part) => (part as { encrypted_content?: unknown }).encrypted_content)
+    .filter((blob): blob is string => typeof blob === "string")
+    .join("\0");
+  return { kind: "blocked", plain, taskName, newTask, file, retry: taskFileRetry(taskName, ciphertext) };
 }
 
 function serializeAgentMessage(item: ResponseInputItem): string {
@@ -298,8 +341,11 @@ function serializeAgentMessage(item: ResponseInputItem): string {
       payload.file.text.replace(/\n+$/, ""),
     );
   } else if (payload.kind === "blocked") {
+    // The reply goes to the parent as plain text, so it carries the way out: the
+    // parent writes the task file and spawns again under the name the proxy reads.
+    const { name, path } = payload.retry;
     lines.push(
-      `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${blockedReason(payload)} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${payload.taskName || "unnamed task"})."]`,
+      `[The payload of this message is encrypted for OpenAI models, and this Claude model cannot read it.${blockedReason(payload)} The task is unknown. Do not guess the task, its target or its scope, and take no actions. Reply only: "BLOCKED: the task payload was encrypted and unreadable (${payload.taskName || "unnamed task"}). A Claude agent cannot read an encrypted message. Write the complete task to ${path} (mode 600) and spawn a new agent with task_name ${name}."]`,
     );
   }
   lines.push("</agent_message>");
@@ -310,6 +356,8 @@ function serializeAgentMessage(item: ResponseInputItem): string {
 export function blockedReason(payload: Extract<AgentMessagePayload, { kind: "blocked" }>): string {
   if (!payload.newTask) return " Only a NEW_TASK is read from a task file, and this message is not one.";
   if (payload.file) return ` The task file ${payload.file.path} was not used: ${payload.file.refused}.`;
+  if (taskLeaf(payload.taskName).includes("__"))
+    return ` No task file was looked up: in a task name "<label>__<key>", the label must be 1 to 64 lowercase letters, digits or underscores and the key 8 to 32 lowercase letters or digits.`;
   return ` No task file was looked up: the task name has no "__<nonce>" suffix.`;
 }
 
