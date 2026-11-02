@@ -112,20 +112,23 @@ const first = rows[0]?.at;
 const last = rows.at(-1)?.at;
 console.log(`attempts ${rows.length}${first ? ` from ${new Date(first).toISOString()} to ${new Date(last!).toISOString()}` : ""}`);
 
-/** Rows in the order a reader compares them. Haiku after a fork includes the fork's wait. */
+/** A fork process ran for this row (it answered, failed after starting, or was cut off). */
+const forkRan = (row: Row) => !!row.forkUsage || row.forkUnmeteredContextTokens !== undefined;
+/** Rows in the order a reader compares them; cancelled ones (Alex typed or sent) apart. */
 const groups: Array<[string, (row: Row) => boolean]> = [
   ["fork answered", (row) => row.model === "fork"],
-  ["fork tried, Haiku answered (end-to-end, fork wait included)", (row) => row.model === "haiku" && !!row.fallback],
-  ["Haiku only (switch off)", (row) => row.model === "haiku" && !row.fallback],
+  ["fork ran, then Haiku answered (end to end, fork wait included)", (row) => row.model === "haiku" && forkRan(row)],
+  ["no fork possible, Haiku answered", (row) => row.model === "haiku" && !forkRan(row) && !!row.fallback],
+  ["Haiku only (switch off)", (row) => row.model === "haiku" && !forkRan(row) && !row.fallback],
 ];
 for (const [name, member] of groups) {
-  const mine = rows.filter(member);
+  const mine = rows.filter((row) => !row.cancelled && member(row));
   if (!mine.length) continue;
-  const suggested = mine.filter((row) => row.suggested && !row.cancelled);
+  const suggested = mine.filter((row) => row.suggested);
   const settled = suggested.map((row) => accepted(row.threadId!, row.turnId!)).filter((x) => x !== undefined);
   const yes = settled.filter(Boolean).length;
-  const latency = mine.filter((row) => !row.cancelled).map((row) => row.elapsedMs);
-  console.log(`\n${name}: ${mine.length} attempts (${mine.filter((row) => row.cancelled).length} cancelled), ${suggested.length} suggested, accepted ${yes}/${settled.length} answered` +
+  const latency = mine.map((row) => row.elapsedMs);
+  console.log(`\n${name}: ${mine.length} attempts, ${suggested.length} suggested, accepted ${yes}/${settled.length} answered` +
     (settled.length ? ` (${((100 * yes) / settled.length).toFixed(1)}%)` : ""));
   console.log(`  latency p50 ${pct(latency, 0.5) ?? "-"} ms, p90 ${pct(latency, 0.9) ?? "-"} ms`);
   if (mine.some((row) => row.fallback)) {
@@ -134,13 +137,19 @@ for (const [name, member] of groups) {
     console.log(`  why: ${[...reasons].map(([why, n]) => `${why} ${n}`).join(", ")}`);
   }
 }
+const cancelled = rows.filter((row) => row.cancelled);
+if (cancelled.length)
+  console.log(`\ncancelled (Alex typed or sent first): ${cancelled.length}, of which ${cancelled.filter(forkRan).length} with a fork running`);
 const skipped = rows.filter((row) => row.model === "skipped").length;
 if (skipped) console.log(`\nskipped (duplicate, busy or invalid): ${skipped}`);
 
-// Every fork that ran, answered or not: its own latency, and what it spent.
-const forks = rows.filter((row) => row.forkUsage || row.forkUnmeteredContextTokens !== undefined);
-const forkLatency = forks.map((row) => row.forkMs).filter((ms): ms is number => ms !== undefined);
-console.log(`\nforks run: ${forks.length}, fork latency p50 ${pct(forkLatency, 0.5) ?? "-"} ms, p90 ${pct(forkLatency, 0.9) ?? "-"} ms`);
+// Every fork that ran: its own latency (not cancelled ones), and what all of them spent.
+const forks = rows.filter(forkRan);
+const forkLatency = forks
+  .filter((row) => !row.cancelled)
+  .map((row) => row.forkMs)
+  .filter((ms): ms is number => ms !== undefined);
+console.log(`\nforks run: ${forks.length}, fork latency (not cancelled) p50 ${pct(forkLatency, 0.5) ?? "-"} ms, p90 ${pct(forkLatency, 0.9) ?? "-"} ms`);
 const total = (pick: (row: Row) => Tokens | undefined) => {
   const sum = { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
   for (const row of rows) {
@@ -153,7 +162,7 @@ for (const [name, tokens] of [["fork", total((row) => row.forkUsage)], ["haiku",
   console.log(`${name} tokens: uncached input ${tokens.inputTokens}, cache read ${tokens.cacheReadTokens}, cache write ${tokens.cacheWriteTokens}, output ${tokens.outputTokens}`);
 const unmetered = rows.filter((row) => row.forkUnmeteredContextTokens !== undefined);
 if (unmetered.length)
-  console.log(`unmetered forks (ran, no usage reported): ${unmetered.length}, up to ${unmetered.reduce((sum, row) => sum + row.forkUnmeteredContextTokens!, 0)} context tokens, counted below as cache reads`);
+  console.log(`unmetered forks (ran, no usage reported): ${unmetered.length}, ~${unmetered.reduce((sum, row) => sum + row.forkUnmeteredContextTokens!, 0)} context tokens, estimated below as cache reads (the answer, prompt, output and any cache write come on top)`);
 const byAccount = new Map<string, { metered: number; bound: number }>();
 for (const row of forks) {
   if (!row.forkAccount) continue;
@@ -165,6 +174,6 @@ for (const row of forks) {
 for (const [account, spent] of byAccount) {
   const per1 = calibration.get(account);
   const share = (value: number) => (per1 ? `~${(value / per1).toFixed(3)}%` : "?%");
-  console.log(`  ${account}: ${Math.round(spent.metered)} units metered (${share(spent.metered)} of its weekly window), up to ${Math.round(spent.metered + spent.bound)} with unmetered forks (${share(spent.metered + spent.bound)}); estimates from this proxy's log`);
+  console.log(`  ${account}: ${Math.round(spent.metered)} units metered (${share(spent.metered)} of its weekly window), ~${Math.round(spent.metered + spent.bound)} with an estimate for unmetered forks (${share(spent.metered + spent.bound)}, likely low); shares estimated from this proxy's log`);
 }
 db.close();

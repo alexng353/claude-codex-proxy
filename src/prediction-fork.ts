@@ -54,8 +54,11 @@ export type ForkSource = {
   args: readonly string[];
   sessionId: string;
   account: Account;
-  /** The final answer the worker parked with: the fork must resume exactly there. */
+  /** The final answer the worker parked with, as Codex received it. */
   answer: string;
+  /** The same answer as the transcript holds it (before the proxy's rewrites): the
+   * fork resumes at the entry that accepted exactly this. */
+  checkpointText: string;
   /** Input tokens of the worker's last request, cached or not: the fork's context size. */
   contextTokens: number;
   parkedAt: number;
@@ -189,10 +192,26 @@ const forkEffort = () => process.env.PREDICTION_FORK_EFFORT || undefined;
 const CHECKPOINT_TAIL_BYTES = 1 << 20;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Whether the daemon's context for the completed turn ends with this parked answer. */
-function endsWithAnswer(context: string | undefined, answer: string): boolean {
-  const tail = answer.trim().slice(-2000);
-  return !!tail && !!context && context.trimEnd().endsWith(tail);
+/** Below this many characters an answer fits the daemon's 15,000-byte context window whole. */
+const WHOLE_ANSWER_CHARS = 12_000;
+
+/**
+ * Whether the daemon's context for the completed turn ends with this parked answer as
+ * its last message, whole: `Assistant: <answer>` at a message boundary, so an answer
+ * that merely ends the same way ("not done" against "done") does not match. A longer
+ * answer arrives cut at its start (predictions.rs recent_context); then the context
+ * must be a long enough piece of its end.
+ */
+export function endsWithAnswer(context: string | undefined, answer: string): boolean {
+  const text = answer.trimEnd();
+  if (!text.trim() || !context) return false;
+  const tail = context.trimEnd();
+  const whole = `Assistant: ${text}`;
+  if (tail.endsWith(whole)) {
+    const start = tail.length - whole.length;
+    return start === 0 || tail.slice(start - 2, start) === "\n\n";
+  }
+  return text.length > WHOLE_ANSWER_CHARS && tail.length >= 2000 && whole.endsWith(tail);
 }
 
 /**
@@ -201,6 +220,15 @@ function endsWithAnswer(context: string | undefined, answer: string): boolean {
  * else (a later answer, a cut line, no transcript) gives undefined, so no fork runs.
  */
 async function answerCheckpoint(sessionId: string, answer: string): Promise<string | undefined> {
+  try {
+    return await findAnswerCheckpoint(sessionId, answer);
+  } catch {
+    // Unreadable, or gone between stat and read: no fork, and Haiku still answers.
+    return undefined;
+  }
+}
+
+async function findAnswerCheckpoint(sessionId: string, answer: string): Promise<string | undefined> {
   if (!UUID.test(sessionId)) return undefined;
   const projects = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
   let names: string[];
@@ -263,7 +291,7 @@ export async function forkPrediction(
   if (!endsWithAnswer(context, source.answer)) return { kind: "failed", reason: "stale" };
   if (isUnavailable(source.account)) return { kind: "failed", reason: "account unavailable" };
   if (source.contextTokens > maxContextTokens()) return { kind: "failed", reason: "context too large" };
-  const checkpoint = await answerCheckpoint(source.sessionId, source.answer);
+  const checkpoint = await answerCheckpoint(source.sessionId, source.checkpointText);
   if (!checkpoint) return { kind: "failed", reason: "no checkpoint" };
   // Checked after the last await: runFork adds its abort listener before awaiting anything.
   if (signal.aborted) return { kind: "failed", reason: "cancelled" };

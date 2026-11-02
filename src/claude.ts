@@ -299,6 +299,9 @@ class ClaudeWorker {
   private readonly launchArgs: string[];
   /** Input tokens (cached or not) of the last request: what a fork of it would read. */
   private contextTokens = 0;
+  /** The last StructuredOutput text as the model wrote it, before any substitution:
+   * what the transcript holds, so a prediction fork can find its entry. */
+  private rawAnswer = "";
 
   constructor(
     request: ResponsesRequest,
@@ -434,6 +437,7 @@ class ClaudeWorker {
               sessionId: this.sessionId,
               account: this.account,
               answer: lastTurn.text,
+              checkpointText: this.rawAnswer,
               contextTokens: this.contextTokens,
               parkedAt: Date.now(),
             }
@@ -542,6 +546,7 @@ class ClaudeWorker {
     // The model sometimes answers in plain text and then submits StructuredOutput
     // with empty text; keep the answer instead of returning nothing to Codex.
     const output = event.structured_output;
+    if (!event.is_error) this.rawAnswer = output?.text ?? "";
     if (!event.is_error && output && !output.text.trim() && this.pending.prose.length)
       event.structured_output = { ...output, text: this.pending.prose.join("\n\n") };
     if (event.is_error)

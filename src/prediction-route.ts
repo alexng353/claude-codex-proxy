@@ -169,7 +169,12 @@ export function createPredictionService(
           attempt.forkMs = Date.now() - started;
           attempt.fork = outcome.usage;
           attempt.forkAccount = outcome.account;
-          if (outcome.kind === "failed") attempt.forkUnmeteredContextTokens = outcome.unmeteredContextTokens;
+          // Recorded before the abort check, so a cancelled fork is logged as one.
+          if (outcome.kind === "failed") {
+            attempt.fallback = outcome.reason;
+            attempt.forkUnmeteredContextTokens = outcome.unmeteredContextTokens;
+          }
+          if (signal.aborted) attempt.fallback ??= "cancelled";
           signal.throwIfAborted();
           if (outcome.kind === "declined") {
             attempt.source = "fork";
@@ -181,7 +186,7 @@ export function createPredictionService(
               return outcome.text;
             }
             attempt.fallback = "unsafe text";
-          } else attempt.fallback = outcome.reason;
+          }
         }
       }
       return guardedModelPrediction(

@@ -22,6 +22,8 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -35,12 +37,12 @@ import { closePredictionPreparation, guardPredictionReply } from "../src/predict
 
 const out = process.env.BENCH_OUTPUT ?? join(homedir(), ".cache/composer-predictions/fork-bench.jsonl");
 
-/** Raw chat text only ever goes to a 0600 file in a 0700 directory, whatever was there. */
+/** Raw chat text only ever goes to a 0600 file. A missing directory is made 0700; an
+ * existing one is left as it is (it may be the checkout, home or /tmp). */
 function privateFile(path: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  chmodSync(dirname(path), 0o700);
   if (!existsSync(path)) writeFileSync(path, "", { mode: 0o600 });
-  chmodSync(path, 0o600);
+  if (statSync(path).isFile()) chmodSync(path, 0o600);
 }
 function privateAppend(path: string, text: string): void {
   privateFile(path);
@@ -388,6 +390,7 @@ async function coldQuality() {
   const pinOf = (thread: string) =>
     (pins.query("SELECT account FROM thread_accounts WHERE thread_id = ?").get(thread) as { account: string } | null)?.account;
   const scratchState = mkdtempSync(join(tmpdir(), "prediction-bench-state-"));
+  process.on("exit", () => rmSync(scratchState, { recursive: true, force: true }));
   const launchArgs = (request: Parameters<typeof buildClaudeArgs>[0]) => {
     const live = process.env.PROXY_STATE_DIR;
     process.env.PROXY_STATE_DIR = scratchState;
@@ -569,6 +572,8 @@ if (process.env.BENCH_JOIN) {
   process.exit(0);
 }
 
+// Fail on an unusable output before any model call spends quota.
+if (!process.env.BENCH_DRY) privateFile(out);
 prewarmPredictionModel();
 await Bun.sleep(3000);
 

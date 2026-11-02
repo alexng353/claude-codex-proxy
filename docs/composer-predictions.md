@@ -36,10 +36,16 @@ compactions, and the record expires after ten minutes. The daemon sends that
 key as `engineThreadId` (Today's own thread id differs for chats Today made),
 with its recent context.
 
-A fork runs only when that context ends with the recorded answer. Otherwise it
-is `stale`: a newer turn finished elsewhere, for example on the other proxy
-copy. The resume point is the transcript entry that accepted that same answer,
-found in the transcript's last MiB without blocking the event loop.
+A fork runs only when that context's last message is the recorded answer,
+whole. A different answer that merely ends the same way does not count. An
+answer too long for the daemon's 15,000-byte window must match its last 2,000+
+characters. Otherwise the fork is `stale`: a newer turn finished elsewhere, for
+example on the other proxy copy.
+
+The resume point is the transcript entry that accepted that same answer, as the
+model wrote it, before the proxy's rewrites. It is found in the transcript's
+last MiB without blocking the event loop. An unreadable transcript just means
+no fork.
 
 The fork runs the same Claude Code binary with the worker's arguments, swapping
 in `--resume <session> --fork-session --no-session-persistence
@@ -82,7 +88,9 @@ record. The line holds, never text:
 - `forkUsage` and `haikuUsage`: uncached input, cache read, cache write and
   output tokens;
 - `forkUnmeteredContextTokens`: for a fork that ran but reported no usage
-  (cancelled or late), its context, an upper bound on what it read.
+  (cancelled or late), the chat's last context size. This is an estimate of
+  what the fork read, not a bound: the answer, the prompt, output and any
+  cache write come on top.
 
 The reply says `source` (`fork`, `haiku` or `skipped`), and Today's journal
 says per attempt whether Alex accepted the suggestion.
@@ -105,17 +113,19 @@ Haiku too. Every other machine has its own state directory, with no switch
 file. The daemon must be one that sends `engineThreadId`; an older one gets
 Haiku with `fallback: "no engine thread"`.
 
-`bun scripts/prediction-trial-report.ts [SINCE]` prints three groups: fork
-answered, fork tried then Haiku answered (end to end), and Haiku only. For
-each it gives:
+`bun scripts/prediction-trial-report.ts [SINCE]` prints four groups: fork
+answered, fork ran then Haiku answered (end to end), no fork possible, and
+Haiku only. Cancelled attempts are counted on their own line. For each group
+it gives:
 - attempts, suggestions and accepted suggestions, read from Today's
   `generated_origin` on the chat's next message;
 - latency p50 and p90;
 - why Haiku answered.
 
 It then counts the skipped requests and gives the latency of every fork that
-ran. Last, it gives each path's tokens and an estimate of each account's
-weekly share, metered, and with unmetered forks as an upper bound.
+ran and was not cancelled. Last, it gives each path's tokens and an estimate
+of each account's weekly share: metered, and with an estimate for unmetered
+forks, which is likely low.
 
 The baseline before the trial was 1 accepted of 62 Haiku suggestions on Forge
 (2026-11-01 to 2026-11-02). Measurements and the decision record are in

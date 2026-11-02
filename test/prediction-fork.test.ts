@@ -70,16 +70,21 @@ for await (const line of createInterface({ input: process.stdin })) {
   }
   const file = join(process.env.CLAUDE_CONFIG_DIR, "projects", "probe", id + ".jsonl");
   // "use a tool" in the input makes this turn end in a tool call, as a working turn does.
+  // "prose answer": the model writes its answer as plain text and submits an empty
+  // StructuredOutput, which the proxy replaces with the prose (the transcript keeps "").
+  // "slow turn": the answer takes a moment, so a prediction can run while it is going.
+  if (line.includes("slow turn")) await new Promise((resolve) => setTimeout(resolve, 400));
+  const prose = line.includes("prose answer");
+  if (prose) console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "prose reply" }] } }));
   const output = line.includes("use a tool")
     ? { text: "", tool_calls: [{ name: "valid", arguments: "{}" }] }
-    : { text: "done for now", tool_calls: [] };
+    : { text: prose ? "" : "done for now", tool_calls: [] };
   appendFileSync(file, JSON.stringify({ type: "assistant", uuid: crypto.randomUUID(), message: { content: [{ type: "tool_use", name: "StructuredOutput", id: "answer" + count, input: output }] } }) + "\\n");
   appendFileSync(file, JSON.stringify({ type: "user", uuid: "00000000-0000-4000-8000-00000000000" + count, message: { content: [{ type: "tool_result", tool_use_id: "answer" + count }] } }) + "\\n");
-  // Totals add up every API call of the query; the context is the last call's input.
+  // Totals add up every API call of the query; iterations holds the last call only.
   console.log(JSON.stringify({ type: "result", is_error: false, structured_output: output,
     usage: { input_tokens: 15, cache_read_input_tokens: 5000, cache_creation_input_tokens: 1000, output_tokens: 40,
       iterations: [
-        { input_tokens: 5, cache_read_input_tokens: 1000, cache_creation_input_tokens: 100, output_tokens: 20 },
         { input_tokens: 10, cache_read_input_tokens: 4000, cache_creation_input_tokens: 900, output_tokens: 20 },
       ] } }));
 }
@@ -182,6 +187,8 @@ test("no fork without a parked final answer for the chat, or past its account's 
     await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
     // The daemon's turn ended on another answer (a newer turn served by another proxy copy).
     expect(await forkPrediction(thread, signal, Date.now() + 5000, "Alex: go\n\nAssistant: something else")).toMatchObject({ kind: "failed", reason: "stale" });
+    // ...even one that merely ends the same way.
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, "Alex: go\n\nAssistant: not done for now")).toMatchObject({ kind: "failed", reason: "stale" });
     const { markLimited, listAccounts } = await import("../src/accounts");
     markLimited(listAccounts()[0]!);
     expect(await forkPrediction(thread, signal, Date.now() + 5000, CONTEXT)).toMatchObject({ kind: "failed", reason: "account unavailable" });
@@ -217,6 +224,7 @@ test("an old or too large record makes no fork", async () => {
       sessionId: crypto.randomUUID(),
       account: listAccounts()[0]!,
       answer: "done for now",
+      checkpointText: "done for now",
       contextTokens: 10,
       parkedAt: Date.now(),
     };
@@ -241,11 +249,67 @@ test("cancelling a fork kills it", async () => {
     for (let i = 0; i < 100 && !existsSync(join(root, "hang.pid")); i++) await Bun.sleep(20);
     controller.abort();
     // It ran but reported no usage: its context (the last call's input, not the
-    // query's total) is logged as an upper bound of what it read.
+    // query's total) is logged as an estimate of what it read.
     expect(await pending).toMatchObject({ kind: "failed", reason: "cancelled", unmeteredContextTokens: 4910 });
     const pid = Number(await readFile(join(root, "hang.pid"), "utf8"));
     await Bun.sleep(50);
     expect(() => process.kill(pid, 0)).toThrow();
+  });
+});
+
+test("a turn in progress on the chat retires its fork record from its start", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction } = await import("../src/prediction-fork");
+    const thread = crypto.randomUUID();
+    await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
+    const next = runClaude({
+      model: "sonnet",
+      input: [{ role: "user", content: "go" }, { role: "assistant", content: "done for now" }, { role: "user", content: "slow turn" }],
+      prompt_cache_key: thread,
+    });
+    await Bun.sleep(150);
+    expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "no session" });
+    await next;
+    expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
+test("the fork resumes only at the parked answer's own transcript entry", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction } = await import("../src/prediction-fork");
+    const thread = crypto.randomUUID();
+    await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
+    const [worker] = await lines(join(root, "launches.jsonl"));
+    const session = worker.argv[worker.argv.indexOf("--session-id") + 1];
+    const transcript = join(process.env.CLAUDE_CONFIG_DIR!, "projects", "probe", `${session}.jsonl`);
+    const signal = new AbortController().signal;
+    // A later answer in the transcript that is not the one parked: never resume past it.
+    const later = (await readFile(transcript, "utf8")) +
+      JSON.stringify({ type: "assistant", uuid: crypto.randomUUID(), message: { content: [{ type: "tool_use", name: "StructuredOutput", id: "later", input: { text: "a later answer", tool_calls: [] } }] } }) + "\n" +
+      JSON.stringify({ type: "user", uuid: "00000000-0000-4000-8000-000000000009", message: { content: [{ type: "tool_result", tool_use_id: "later" }] } }) + "\n";
+    await writeFile(transcript, later);
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, CONTEXT)).toMatchObject({ reason: "no checkpoint" });
+    // An unreadable transcript is a failed fork (Haiku answers), never a thrown request.
+    await chmod(transcript, 0o000);
+    expect(await forkPrediction(thread, signal, Date.now() + 5000, CONTEXT)).toMatchObject({ kind: "failed", reason: "no checkpoint" });
+    await chmod(transcript, 0o600);
+    expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
+test("an answer the proxy rewrote still forks at its raw transcript entry", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction } = await import("../src/prediction-fork");
+    const thread = crypto.randomUUID();
+    const answer = await runClaude({ model: "sonnet", input: "prose answer", prompt_cache_key: thread });
+    expect(answer.text).toBe("prose reply");
+    const outcome = await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, "Alex: prose answer\n\nAssistant: prose reply");
+    expect(outcome).toMatchObject({ kind: "suggested", text: "ship it" });
+    const fork = (await lines(join(root, "launches.jsonl"))).find((launch) => launch.fork)!;
+    expect(fork.argv[fork.argv.indexOf("--resume-session-at") + 1]).toBe("00000000-0000-4000-8000-000000000001");
   });
 });
 
@@ -344,6 +408,50 @@ test("every attempt logs its path, why, latency and tokens, keyed by chat and tu
     else process.env.PREDICTION_INDEX = saved;
     if (savedKey === undefined) delete process.env.PROXY_API_KEY;
     else process.env.PROXY_API_KEY = savedKey;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a fork cancelled mid-flight is logged as a cancelled fork, never as Haiku", async () => {
+  const { createPredictionService, handlePredictionRoute } = await import("../src/prediction-route");
+  const root = await mkdtemp(join(tmpdir(), "prediction-cancel-"));
+  const saved = { index: process.env.PREDICTION_INDEX, key: process.env.PROXY_API_KEY };
+  process.env.PREDICTION_INDEX = join(root, "index.sqlite");
+  process.env.PROXY_API_KEY = "prediction-cancel-test";
+  const controller = new AbortController();
+  let haiku = 0;
+  const engine = createPredictionService({
+    prepare: async () => ({ prompt: "p", retrievalMs: 0, guardMs: 0 }),
+    generate: async () => (haiku++, "never"),
+    guardReply: async () => true,
+    refresh: () => {},
+    source: () => "fork",
+    fork: async () => {
+      controller.abort();
+      await Bun.sleep(5);
+      return { kind: "failed", reason: "cancelled", unmeteredContextTokens: 1000, account: "work" };
+    },
+  } as never);
+  try {
+    const body = JSON.stringify({ threadId: "today-chat", turnId: "turn-c", context: "Assistant: done", engineThreadId: "engine-chat" });
+    const request = new Request("http://127.0.0.1:3456/composer-predictions", {
+      method: "POST",
+      body,
+      signal: controller.signal,
+      headers: { "content-type": "application/json", authorization: "Bearer prediction-cancel-test" },
+    });
+    await handlePredictionRoute(request, new URL(request.url), "127.0.0.1", engine);
+    const path = join(root, "prediction-usage.jsonl");
+    for (let i = 0; i < 100 && !existsSync(path); i++) await Bun.sleep(10);
+    const [line] = await lines(path);
+    expect(line).toMatchObject({ turnId: "turn-c", model: "haiku", fallback: "cancelled", cancelled: true, forkUnmeteredContextTokens: 1000 });
+    expect(typeof line.forkMs).toBe("number");
+    expect(haiku).toBe(0);
+  } finally {
+    for (const [key, value] of [["PREDICTION_INDEX", saved.index], ["PROXY_API_KEY", saved.key]] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
