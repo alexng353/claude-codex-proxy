@@ -52,6 +52,8 @@ let fetcher: FeedFetcher = httpFetcher;
 let lastAttempt = 0;
 let inflight: Promise<void> | null = null;
 let inflightSince = 0;
+/** Every read still running, abandoned ones included, so a drain can wait for them. */
+const running = new Set<Promise<void>>();
 /** A read still pending after this long (a fetcher that ignored its abort, a stuck lock) is abandoned. */
 const INFLIGHT_MAX_MS = 30_000;
 
@@ -85,12 +87,13 @@ export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
       error = (e as Error).name === "TimeoutError" ? "Uplifting timed out" : (e as Error).message.slice(0, 200);
     }
     await host.apply((gym, now) => {
-      // An abandoned read that finishes late must not undo a newer one.
-      if (gym.syncedAt && Date.parse(gym.syncedAt) > started) return feed ? mergeFeed(gym, feed, now) : false;
+      // A read that finishes after a newer one was applied (success or failure)
+      // only adds what it saw; it never clears a newer error or moves times back.
+      if (gym.readAt && Date.parse(gym.readAt) > started) return feed ? mergeFeed(gym, feed, now) : false;
+      gym.readAt = new Date(started).toISOString();
       if (!feed) {
-        const changed = gym.syncError !== error;
         gym.syncError = error!;
-        return changed;
+        return true;
       }
       mergeFeed(gym, feed, now);
       gym.syncedAt = new Date(started).toISOString();
@@ -99,8 +102,10 @@ export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
     });
     if (error) console.error("gym-sync:", error);
   })().finally(() => {
+    running.delete(run);
     if (inflight === run) inflight = null;
   });
+  running.add(run);
   inflight = run;
   return run;
 }
@@ -150,6 +155,14 @@ export function startGymSync(host: GymSyncHost, intervalMs = 2 * 60_000): () => 
   timer.unref();
   return async () => {
     clearInterval(timer);
-    await inflight?.catch(() => {});
+    // Wait for every read, abandoned ones too, but never hold a drain for long.
+    let wait: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled([...running]),
+      new Promise<void>((resolve) => {
+        wait = setTimeout(resolve, 20_000);
+      }),
+    ]);
+    clearTimeout(wait);
   };
 }

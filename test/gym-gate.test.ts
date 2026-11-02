@@ -220,22 +220,92 @@ describe("gym on the gate", () => {
     expect(Date.now() - started).toBeLessThan(1_000);
   });
 
-  test("a late read never moves the last read time backwards", async () => {
-    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+  /** One fetcher for a whole test: the first call hangs until released, later calls answer `next`. */
+  function hangFirst(next: () => Promise<UpliftingFeed>) {
+    let calls = 0;
     let release!: (feed: UpliftingFeed) => void;
-    setGymFetcher(() => new Promise((resolve) => (release = resolve)));
-    clock = at(DAY, "18:31");
+    setGymFetcher(() => (calls++ === 0 ? new Promise((resolve) => (release = resolve)) : next()));
+    return (feed: UpliftingFeed) => release(feed);
+  }
+  const lateSession: UpliftingFeed = {
+    checkins: [],
+    workouts: [{ id: "w-late", client_id: null, start_time: iso(at(DAY, "17:00")), end_time: iso(at(DAY, "17:30")), kind: "workout", set_count: 3 }],
+  };
+
+  test("a stuck read is abandoned after 30 s; its late result merges but never moves the read time back", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    const release = hangFirst(async () => ({ checkins: [], workouts: [] }));
     const { syncGym } = await import("../src/gym-sync");
     const { gymHost } = await import("../src/hygiene-gate");
+    clock = at(DAY, "18:31");
     const slow = syncGym(gymHost);
-    // 40 s later the stuck read is abandoned and a fresh one succeeds.
+    // Within 30 s the same stuck read is reused.
+    clock = at(DAY, "18:31") + 20_000;
+    expect(syncGym(gymHost)).toBe(slow);
+    // After 30 s a fresh read starts and finishes while the old one still hangs.
     clock = at(DAY, "18:31") + 40_000;
-    setGymFetcher(async () => ({ checkins: [], workouts: [] }));
     await syncGym(gymHost);
     const fresh = (await route("/hygiene/gym")).body.syncedAt;
     expect(Date.parse(fresh)).toBe(clock);
+    release(lateSession);
+    await slow;
+    const after = (await route("/hygiene/gym")).body;
+    expect(after.syncedAt).toBe(fresh);
+    expect(after.sessions.map((s: any) => s.id)).toEqual(["w-late"]);
+  });
+
+  test("a late success never clears a newer failure", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    const release = hangFirst(async () => {
+      throw new Error("Uplifting answered 502");
+    });
+    const { syncGym } = await import("../src/gym-sync");
+    const { gymHost } = await import("../src/hygiene-gate");
+    clock = at(DAY, "18:31");
+    const slow = syncGym(gymHost);
+    clock = at(DAY, "18:31") + 40_000;
+    await syncGym(gymHost);
     release({ checkins: [], workouts: [] });
     await slow;
-    expect((await route("/hygiene/gym")).body.syncedAt).toBe(fresh);
+    const report = (await route("/hygiene/gym")).body;
+    expect(report.syncError).toBe("Uplifting answered 502");
+    expect(report.syncedAt).toBeNull();
+    expect(await reply("hi")).toBe("forwarded");
+  });
+
+  test("a hung Uplifting at decision time forwards the turn within the refresh cap", async () => {
+    setGateDeps({ now: () => clock, wake: async () => "sent", gymRefreshMs: 200 });
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    clock = at(DAY, "18:31");
+    await route("/hygiene/gym/sync", {});
+    expect(await reply("hi")).toContain("gate armed");
+    // Uplifting stops answering; 11 minutes on, the copy is stale and the refresh hangs.
+    setGymFetcher(() => new Promise(() => {}));
+    clock = at(DAY, "18:42");
+    const started = Date.now();
+    expect(await reply("hi")).toBe("forwarded");
+    expect(Date.now() - started).toBeLessThan(1_500);
+  });
+
+  test("the decision refresh lets the read finish in the background", async () => {
+    const gym = {
+      plans: [{ id: "p", start: iso(at(DAY, "18:00")), graceMin: 30, status: "planned" as const, createdAt: iso(at(DAY, "12:00")), log: [] }],
+      sessions: [],
+      checkins: [],
+    } as import("../src/gym").GymState;
+    const now = at(DAY, "18:40");
+    const host = {
+      now: () => now,
+      hasGym: () => true,
+      neededSince: () => null,
+      apply: async (edit: (g: typeof gym, n: number) => boolean) => void edit(gym, now),
+    };
+    setGymFetcher(() => new Promise((resolve) => setTimeout(() => resolve({ checkins: [], workouts: [] }), 300)));
+    const started = Date.now();
+    await refreshIfDeciding(host, gym, 60_000, 100);
+    expect(Date.now() - started).toBeLessThan(300);
+    await Bun.sleep(400);
+    expect(gym).toMatchObject({ syncedAt: iso(now) });
+    expect("syncError" in gym).toBe(false);
   });
 });

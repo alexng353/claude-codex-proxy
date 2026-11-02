@@ -105,6 +105,8 @@ export type GateDeps = {
   baseUrl: string;
   /** Starts a turn in a chat whose messages the gate held (hygiene-wake.ts). */
   wake: WakeSender;
+  /** Longest a human turn waits for a fresh Uplifting read before deciding (gym-sync.ts). */
+  gymRefreshMs: number;
 };
 
 const defaults: GateDeps = {
@@ -115,6 +117,7 @@ const defaults: GateDeps = {
   archive: archivePhoto,
   baseUrl: `http://127.0.0.1:${process.env.PORT ?? 3456}`,
   wake: todayWake,
+  gymRefreshMs: 5_000,
 };
 let deps: GateDeps = { ...defaults };
 
@@ -506,7 +509,7 @@ export async function gateRequest(request: ResponsesRequest, origin: GateOrigin 
     if (turn.type !== "human") return forward(reapply(request, state));
     // Read Uplifting first if a gym deadline has passed, bounded to 5 s in all.
     // Skipped while a photo is checked: the instant "checking" reply comes first.
-    if (!photoChecking(statePath())) await refreshIfDeciding(gymHost, state.gym);
+    if (!photoChecking(statePath())) await refreshIfDeciding(gymHost, state.gym, 60_000, deps.gymRefreshMs);
     const checking = checkingReply(request, turn, loadState(), origin);
     if (checking) return checking;
     return await serialized(() => decideHumanTurn(request, turn, origin));

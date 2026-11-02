@@ -80,6 +80,8 @@ export type GymState = {
   /** Last successful Uplifting read, and the last error since. */
   syncedAt?: string;
   syncError?: string;
+  /** Start of the newest read applied, success or failure; an older read finishing late only merges. */
+  readAt?: string;
 };
 
 /**
@@ -174,9 +176,11 @@ function plannedAt(plan: GymPlan): number {
  * mid-workout. Missed plans are then made up, oldest first, by unused
  * qualifying sessions that started after the plan's window opened. Either way
  * a session counts only if it ended after the plan was made or last moved, so
- * a plan added after a workout can't be cleared by it (or take it from an
- * older miss). A cancel recorded after the planned start changes nothing: the
- * plan stands, so skipping it is a miss.
+ * a plan added after a workout can't be cleared by it. Keeping comes before
+ * making up: a plan made mid-workout keeps that session, and an older miss
+ * waits for the next one (exactly one of them stays missed either way). A
+ * cancel recorded after the planned start changes nothing: the plan stands,
+ * so skipping it is a miss.
  *
  * A miss needs evidence: a read of Uplifting from after the moment the plan
  * failed (its deadline, or the end of an unfinished Start's 4 hours). Without
@@ -230,8 +234,13 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       continue;
     }
     const failed = started.map((c) => finishedClients.get(c.clientId)).find(Boolean);
+    const failedCheck = failed && checks.find((c) => c.session.id === failed.id);
     const reason = failed
-      ? `session didn't count: ${checks.find((c) => c.session.id === failed.id)?.reason ?? "did not qualify"}`
+      ? failedCheck?.qualifies
+        ? ms(failed.end) < madeAt
+          ? `session ended ${clockLabel(ms(failed.end))}, before this plan was made`
+          : "that session already counted for another plan"
+        : `session didn't count: ${failedCheck?.reason ?? "did not qualify"}`
       : started.length
         ? "started, never finished"
         : `no Start at the gym by ${clockLabel(deadline)}`;

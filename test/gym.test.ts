@@ -141,6 +141,32 @@ describe("plans and the deadline", () => {
     }
   });
 
+  test("a session that ended before the plan was made can't make it up, and the lock says why", () => {
+    const gym = emptyGym();
+    feed(gym, at(DAY, "19:02"), {
+      checkins: [checkin("c1", "start", at(DAY, "18:00")), checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+    });
+    editPlan(gym, { action: "add", start: iso(at(DAY, "20:05")) }, at(DAY, "19:05"));
+    feed(gym, at(DAY, "20:36"), {});
+    expect(evaluateGym(gym, at(DAY, "20:36"))[0]).toMatchObject({
+      status: "missed",
+      reason: "session ended 19:00, before this plan was made",
+    });
+  });
+
+  test("a plan made mid-workout keeps that session; an older miss waits for the next", () => {
+    const { gym } = planned();
+    feed(gym, at(DAY, "18:31"), {});
+    feed(gym, at("2026-11-06", "17:20"), { checkins: [checkin("c2", "start", at("2026-11-06", "17:00"))] });
+    editPlan(gym, { action: "add", start: iso(at("2026-11-06", "18:00")) }, at("2026-11-06", "17:30"));
+    feed(gym, at("2026-11-06", "19:10"), {
+      checkins: [checkin("c2", "finish", at("2026-11-06", "19:00"))],
+      workouts: [workout("w2", "c2", at("2026-11-06", "17:00"), at("2026-11-06", "19:00"))],
+    });
+    expect(statusAt(gym, at("2026-11-06", "19:10"))).toEqual(["missed", "kept"]);
+  });
+
   test("a stale or failed read never locks, though the plan shows as missed", () => {
     const { gym } = planned();
     feed(gym, at(DAY, "18:31"), {});
@@ -298,6 +324,20 @@ describe("Uplifting feed", () => {
       expect(evaluateGym(gym, now)[0]).toMatchObject({ status: "kept", sessionId: "w1" });
     }
     expect(gym.plans[0].settled).toMatchObject({ status: "kept", sessionId: "w1" });
+  });
+
+  test("settling comes before pruning even when the Start check-in is a minute before the session", () => {
+    const { gym } = planned();
+    feed(gym, at(DAY, "19:30"), {
+      checkins: [checkin("c1", "start", at(DAY, "17:59")), checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+    });
+    // The cutoff (now - 60 days) falls between the check-in (17:59) and the session start (18:00).
+    const now = at(DAY, "17:59") + 60 * 86_400_000 + 30_000;
+    gym.syncedAt = iso(now);
+    pruneGym(gym, now);
+    expect(gym.plans[0].settled).toMatchObject({ status: "kept" });
+    expect(statusAt(gym, now)).toEqual(["kept"]);
   });
 });
 
