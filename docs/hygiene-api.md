@@ -80,8 +80,8 @@ Response (`200`, also when the photo fails):
   - `clear`: nothing is locked
   - `bypassed`: locked, but a BYPASS hour is open
   - `disabled`: the kill switch is on
-- **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight` or `penance`.
-- **`due_today`** lists what is due later today but does not lock yet.
+- **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight`, `penance` or `gym`. A `gym` item (slot `gym/<plan id>`, since 2026-11-02) is a planned gym session with no qualifying Uplifting session; no photo fills it, and this API has no gym kind for proofs.
+- **`due_today`** lists what is due later today but does not lock yet, including today's planned gym sessions and one in progress.
 - **`open_debts`** lists BYPASS uses that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt } }`. A penance photo is sent in a chat; this API has no penance kind.
 - **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters.
 

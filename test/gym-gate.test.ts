@@ -1,0 +1,175 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEFAULT_GYM_SETTINGS, type UpliftingFeed } from "../src/gym";
+import { setGymFetcher } from "../src/gym-sync";
+import { zonedTime } from "../src/hygiene";
+import { gateRequest, handleHygieneRoute, resetGateCache, setGateDeps } from "../src/hygiene-gate";
+import type { ResponseInputItem, ResponsesRequest } from "../src/types";
+
+const at = (day: string, time: string) => {
+  const [h, m] = time.split(":").map(Number);
+  return zonedTime(day, h * 60 + m);
+};
+const iso = (ms: number) => new Date(ms).toISOString();
+const DAY = "2026-11-05";
+const GOLDS = { latitude: DEFAULT_GYM_SETTINGS.gym.lat, longitude: DEFAULT_GYM_SETTINGS.gym.lon };
+
+let directory = "";
+let run = 0;
+let clock = at(DAY, "12:00");
+let uplifting: UpliftingFeed | Error = { checkins: [], workouts: [] };
+let reads = 0;
+const saved: Record<string, string | undefined> = {};
+
+beforeAll(async () => {
+  directory = await mkdtemp(join(tmpdir(), "gym-gate-test-"));
+  for (const key of ["PROXY_STATE_DIR", "HYGIENE_GATE_STATE", "HYGIENE_GATE_DISABLED_FILE", "HYGIENE_GATE_REMOTE"]) saved[key] = process.env[key];
+  delete process.env.HYGIENE_GATE_REMOTE;
+});
+
+afterAll(async () => {
+  setGateDeps({});
+  setGymFetcher();
+  resetGateCache();
+  for (const [key, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  await rm(directory, { recursive: true, force: true });
+});
+
+beforeEach(async () => {
+  run++;
+  process.env.PROXY_STATE_DIR = join(directory, `state-${run}`);
+  process.env.HYGIENE_GATE_STATE = join(directory, `state-${run}`, "hygiene-gate.json");
+  process.env.HYGIENE_GATE_DISABLED_FILE = join(directory, `disabled-${run}`);
+  resetGateCache();
+  clock = at(DAY, "12:00");
+  uplifting = { checkins: [], workouts: [] };
+  reads = 0;
+  setGateDeps({ now: () => clock, wake: async () => "sent" });
+  setGymFetcher(async () => {
+    reads++;
+    if (uplifting instanceof Error) throw uplifting;
+    return uplifting;
+  });
+  await mkdir(join(directory, `state-${run}`), { recursive: true });
+  // Photo checks start in 2027, so only the gym can lock here.
+  await writeFile(
+    process.env.HYGIENE_GATE_STATE!,
+    JSON.stringify({
+      version: 1,
+      startsAt: iso(at("2027-01-01", "05:00")),
+      images: [],
+      filled: {},
+      bypass: { count: 0, until: null, history: [] },
+      debts: [],
+      notes: [],
+      extraGatedTriggers: [],
+    }),
+  );
+});
+
+async function route(path: string, body?: unknown) {
+  const request = new Request(`http://127.0.0.1:3456${path}`, body === undefined ? {} : { method: "POST", body: JSON.stringify(body) });
+  const reply = await handleHygieneRoute(request, new URL(request.url));
+  // Unknown paths fall through to app.ts, which answers 404.
+  if (!reply) return { status: 404, body: null as any };
+  return { status: reply!.status, body: (await reply!.json()) as any };
+}
+
+const turn = (text: string): ResponsesRequest =>
+  ({
+    model: "opus",
+    prompt_cache_key: "01a10494-b499-7af3-986b-3c30d8c94b91",
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify({ request_kind: "turn", thread_source: "user", turn_trigger: "composer" }) },
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text }] } as ResponseInputItem],
+  }) as ResponsesRequest;
+const reply = async (text: string) => {
+  const d = await gateRequest(turn(text));
+  return d.action === "respond" ? d.text : "forwarded";
+};
+
+describe("gym on the gate", () => {
+  test("a missed plan locks the next turn; a qualifying session unlocks it", async () => {
+    const added = await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+    expect(added.status).toBe(200);
+    expect(added.body).toMatchObject({ ok: true, plan: { id: `${DAY}-1`, graceMin: 30 } });
+
+    clock = at(DAY, "18:29");
+    expect(await reply("hi")).toBe("forwarded");
+
+    clock = at(DAY, "18:31");
+    // The turn reads Uplifting first: nothing there, so the plan is missed.
+    expect(await reply("hi")).toBe(
+      "💪 gate armed: gym session planned Thu, Nov 5 18:00 (no Start at the gym by 18:30)\n" +
+        "Log a gym session in Uplifting (Start and Finish at the gym) to unlock, or reply BYPASS.",
+    );
+    expect(reads).toBeGreaterThan(0);
+
+    uplifting = {
+      checkins: [
+        { client_workout_id: "c1", kind: "start", at: iso(at(DAY, "19:00")), ...GOLDS, accuracy_m: 15 },
+        { client_workout_id: "c1", kind: "finish", at: iso(at(DAY, "19:55")), ...GOLDS, accuracy_m: 15 },
+      ],
+      workouts: [
+        { id: "w1", client_id: "c1", start_time: iso(at(DAY, "19:00")), end_time: iso(at(DAY, "19:55")), kind: "workout", set_count: 14 },
+      ],
+    };
+    clock = at(DAY, "20:00");
+    expect(await reply("back")).toBe("forwarded");
+    const report = await route("/hygiene/gym");
+    expect(report.body.plans[0]).toMatchObject({ status: "made-up", sessionId: "w1" });
+    expect(report.body.sessions[0]).toMatchObject({ id: "w1", counts: true });
+  });
+
+  test("with Uplifting unreachable the gate never locks on a plan", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    uplifting = new Error("Uplifting answered 502");
+    clock = at(DAY, "19:00");
+    expect(await reply("hi")).toBe("forwarded");
+    expect((await route("/hygiene/gym")).body).toMatchObject({ syncError: "Uplifting answered 502", plans: [{ status: "upcoming" }] });
+  });
+
+  test("move, cancel and the grace setting go through the routes and are logged", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+    expect((await route("/hygiene/gym/settings", { grace_min: 45 })).body).toMatchObject({ ok: true, settings: { graceMin: 45 } });
+    const moved = await route(`/hygiene/gym/plans/${DAY}-1/move`, { start: iso(at(DAY, "19:00")), by: "bubble", note: "class ran late" });
+    expect(moved.body).toMatchObject({ ok: true, message: "moved to Thu, Nov 5 19:00, start by 19:30" });
+    await route("/hygiene/gym/plans", { start: iso(at("2026-11-06", "07:00")) });
+    expect((await route("/hygiene/gym/plans/2026-11-06-1", {})).status).toBe(404);
+    expect((await route("/hygiene/gym/plans/2026-11-06-1/cancel", { by: "bubble" })).body).toMatchObject({
+      ok: true,
+      plan: { status: "cancelled", graceMin: 45 },
+    });
+    const plans = (await route("/hygiene/gym")).body.plans;
+    expect(plans.map((p: any) => [p.id, p.status])).toEqual([
+      [`${DAY}-1`, "upcoming"],
+      ["2026-11-06-1", "cancelled"],
+    ]);
+    expect(plans[0].log.map((e: any) => [e.action, e.by])).toEqual([
+      ["add", "bubble"],
+      ["move", "bubble"],
+    ]);
+    expect((await route("/hygiene/gym/plans", { start: "soon" })).status).toBe(400);
+  });
+
+  test("a hand credit clears a miss and needs a reason", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    clock = at(DAY, "18:31");
+    expect(await reply("hi")).toContain("gate armed");
+    expect((await route("/hygiene/gym/sessions/credit", { by: "cli", start: iso(at(DAY, "18:40")), end: iso(at(DAY, "19:40")) })).status).toBe(400);
+    const credited = await route("/hygiene/gym/sessions/credit", {
+      by: "cli",
+      reason: "photo at Gold's plus Uplifting workout",
+      start: iso(at(DAY, "18:40")),
+      end: iso(at(DAY, "19:40")),
+      workout_id: "w-hand",
+    });
+    expect(credited.body).toMatchObject({ ok: true, session: { id: "w-hand", manual: { by: "cli" } } });
+    clock = at(DAY, "19:45");
+    expect(await reply("hi")).toBe("forwarded");
+  });
+});

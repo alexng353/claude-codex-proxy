@@ -16,8 +16,11 @@
  *   teeth requirement: one photo fills one requirement.
  * - BYPASS opens the gate for an hour and opens a debt, which the model
  *   rules on and may turn into a penance photo requirement.
+ * - Planned gym sessions (gym.ts): a plan with no Start at the gym in
+ *   Uplifting by its start plus a grace locks until a qualifying session.
  */
 import { createHash } from "node:crypto";
+import { gymDueToday, gymOutstanding, type GymState } from "./gym";
 import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from "./types";
 import { wallTime } from "./zone";
 
@@ -119,6 +122,8 @@ export type GateState = {
    * (normally exempt). Leave empty in normal use.
    */
   extraGatedTriggers: string[];
+  /** Planned gym sessions and what Uplifting reported (gym.ts). Absent until the first plan. */
+  gym?: GymState;
 };
 
 export function emptyState(startsAt: string): GateState {
@@ -187,7 +192,8 @@ function dayLabel(day: string): string {
 
 export type Requirement = {
   slot: string;
-  kind: ProofKind;
+  /** A photo kind, or "gym": filled by an Uplifting session, never a photo. */
+  kind: ProofKind | "gym";
   label: string;
   /** Penance only: what the photo must show. */
   description?: string;
@@ -261,6 +267,7 @@ export function outstanding(state: GateState, now: number): Requirement[] {
       label: `penance photo: ${debt.penance!.description}`,
       description: debt.penance!.description,
     });
+  result.push(...gymOutstanding(state.gym, now));
   return result;
 }
 
@@ -284,6 +291,7 @@ export function dueToday(state: GateState, now: number): Requirement[] {
     result.push({ slot: slot.morning(day), kind: "teeth", label: "morning teeth photo (from 05:00)" });
   if (morningPending && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day)))
     result.push({ slot: slot.weight(day), kind: "weight", label: "morning weigh-in photo (from 05:00)" });
+  result.push(...gymDueToday(state.gym, now));
   return result;
 }
 
@@ -327,6 +335,7 @@ export function wantedKinds(state: GateState, now: number): ProofKind[] {
 }
 
 export function slotLabel(name: string, state?: GateState): string {
+  if (name.startsWith("gym/")) return `gym session (${name.slice(4)})`;
   if (name.startsWith("penance/")) {
     const debt = state?.debts.find((d) => `penance/${d.id}` === name);
     return debt?.penance ? `penance (${debt.penance.description})` : "penance";
@@ -776,13 +785,19 @@ export const hasNote = (item: ResponseInputItem) => partsOf(item).some(isNotePar
 
 // ---- Rendering ----
 
-const EMOJI: Record<ProofKind, string> = { teeth: "🪥", shower: "🚿", weight: "🏋️", penance: "⚖️" };
+const EMOJI: Record<Requirement["kind"], string> = { teeth: "🪥", shower: "🚿", weight: "🏋️", penance: "⚖️", gym: "💪" };
 
 export function lockedText(requirements: Requirement[], results: string[] = []): string {
+  const photos = requirements.some((r) => r.kind !== "gym");
+  const gym = requirements.some((r) => r.kind === "gym");
+  const unlock = [
+    ...(photos ? ["send a fresh photo"] : []),
+    ...(gym ? ["log a gym session in Uplifting (Start and Finish at the gym)"] : []),
+  ].join(" and ");
   return [
     ...results,
     `${EMOJI[requirements[0].kind]} gate armed: ${requirements.map((r) => r.label).join(", ")}`,
-    "Send a fresh photo to unlock, or reply BYPASS.",
+    `${unlock[0].toUpperCase()}${unlock.slice(1)} to unlock, or reply BYPASS.`,
   ].join("\n");
 }
 

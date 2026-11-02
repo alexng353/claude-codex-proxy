@@ -70,6 +70,17 @@ import {
 } from "./hygiene-proof";
 import { tryLock, unlock } from "./filelock";
 import {
+  checkSession,
+  editPlan,
+  emptyGym,
+  evaluateGym,
+  gymSettings,
+  when as vancouverLabel,
+  type GymState,
+  type PlanEdit,
+} from "./gym";
+import { refreshIfDeciding, startGymSync, syncGym, upliftingToken, type GymSyncHost } from "./gym-sync";
+import {
   flushWakes as flushWakeQueue,
   heldNoteText,
   holdMessage,
@@ -493,7 +504,9 @@ export async function gateRequest(request: ResponsesRequest, origin: GateOrigin 
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
     if (turn.type !== "human") return forward(reapply(request, state));
-    const checking = checkingReply(request, turn, state, origin);
+    // Never lock a turn on a gym miss from a stale read of Uplifting.
+    await refreshIfDeciding(gymHost, state.gym).catch(() => {});
+    const checking = checkingReply(request, turn, loadState(), origin);
     if (checking) return checking;
     return await serialized(() => decideHumanTurn(request, turn, origin));
   } catch (error) {
@@ -639,6 +652,151 @@ async function decideHumanTurn(
 
 // ---- Status and ruling ----
 
+// ---- Gym (gym.ts) ----
+
+/**
+ * Edits the gym part of the state behind the gate's lock. Saves when `edit`
+ * reports a change, then releases held chats if the gate is open.
+ */
+async function mutateGym<T>(edit: (gym: GymState, now: number) => { changed: boolean; result: T }, reason: string): Promise<T> {
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    state.gym ??= emptyGym();
+    const { changed, result } = edit(state.gym, now);
+    if (changed) {
+      saveState(state);
+      release(state, now, reason);
+    }
+    return result;
+  });
+}
+
+export const gymHost: GymSyncHost = {
+  now: () => deps.now(),
+  hasGym: () => !gateDisabled() && !remoteGate() && !!loadState().gym?.plans.length,
+  apply: (edit) => mutateGym((gym, now) => ({ changed: edit(gym, now), result: undefined }), "gym session"),
+};
+
+/** Polls Uplifting while there are plans (authority only; followers ask the authority). */
+export function startGymPolling(intervalMs?: number): () => Promise<void> {
+  if (remoteGate()) return async () => {};
+  return startGymSync(gymHost, intervalMs);
+}
+
+/** Plans with their status, recent sessions and whether each counted. */
+export function gymReport() {
+  const now = deps.now();
+  const gym = loadState().gym;
+  const settings = gymSettings(gym);
+  return {
+    now: new Date(now).toISOString(),
+    settings,
+    token: !!upliftingToken(),
+    syncedAt: gym?.syncedAt ?? null,
+    syncError: gym?.syncError ?? null,
+    plans: evaluateGym(gym, now).map((r) => ({
+      id: r.plan.id,
+      start: r.plan.start,
+      startLabel: vancouverLabel(r.plan.start),
+      graceMin: r.plan.graceMin,
+      deadline: new Date(r.deadline).toISOString(),
+      deadlineLabel: vancouverLabel(new Date(r.deadline).toISOString()),
+      status: r.status,
+      ...(r.reason ? { reason: r.reason } : {}),
+      ...(r.sessionId ? { sessionId: r.sessionId } : {}),
+      ...(r.plan.note ? { note: r.plan.note } : {}),
+      log: r.plan.log,
+    })),
+    sessions: (gym?.sessions ?? []).slice(-20).map((s) => {
+      const check = checkSession(gym!, s);
+      return { ...s, counts: check.qualifies, ...(check.reason ? { reason: check.reason } : {}) };
+    }),
+    checkins: (gym?.checkins ?? []).slice(-20),
+  };
+}
+
+type JsonBody = Record<string, unknown>;
+const text = (v: unknown, max = 200) => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : undefined);
+
+async function gymRoute(request: Request, url: URL): Promise<Response | null> {
+  const path = url.pathname.slice("/hygiene/gym".length);
+  if (path === "" && request.method === "GET") return Response.json(gymReport());
+  if (request.method !== "POST") return null;
+  let body: JsonBody = {};
+  try {
+    const raw = await request.text();
+    body = raw ? (JSON.parse(raw) as JsonBody) : {};
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error();
+  } catch {
+    return Response.json({ error: "body must be a JSON object" }, { status: 400 });
+  }
+  const by = text(body.by, 80);
+  const note = text(body.note);
+
+  const plan = async (edit: PlanEdit) => {
+    const result = await mutateGym((gym, now) => {
+      const r = editPlan(gym, edit, now);
+      return { changed: r.ok, result: r };
+    }, "gym plan changed");
+    return Response.json(result, { status: result.ok ? 200 : 400 });
+  };
+  if (path === "/plans") {
+    const start = text(body.start, 40);
+    if (!start) return Response.json({ error: "start (ISO time) is required" }, { status: 400 });
+    const grace = body.grace_min === undefined ? undefined : Number(body.grace_min);
+    return plan({ action: "add", start, graceMin: grace, note, by });
+  }
+  const edit = /^\/plans\/([A-Za-z0-9-]+)\/(move|cancel)$/.exec(path);
+  if (edit) {
+    if (edit[2] === "cancel") return plan({ action: "cancel", id: edit[1], note, by });
+    const start = text(body.start, 40);
+    if (!start) return Response.json({ error: "start (ISO time) is required" }, { status: 400 });
+    return plan({ action: "move", id: edit[1], start, note, by });
+  }
+  if (path === "/settings") {
+    const grace = Number(body.grace_min);
+    if (!Number.isInteger(grace) || grace < 0 || grace > 360)
+      return Response.json({ error: "grace_min must be a whole number of minutes, 0-360" }, { status: 400 });
+    const settings = await mutateGym((gym) => {
+      gym.settings = { ...(gym.settings ?? {}), graceMin: grace };
+      return { changed: true, result: gymSettings(gym) };
+    }, "gym settings");
+    return Response.json({ ok: true, settings, note: "applies to plans added from now on" });
+  }
+  if (path === "/sync") {
+    await syncGym(gymHost);
+    return Response.json(gymReport());
+  }
+  // Hand credit for a session verified outside the gate (e.g. the first night,
+  // before Uplifting reported locations). Kept off the MCP tool on purpose.
+  if (path === "/sessions/credit") {
+    const reason = text(body.reason, 300);
+    const startMs = Date.parse(String(body.start));
+    const endMs = Date.parse(String(body.end));
+    if (!by || !reason) return Response.json({ error: "by and reason are required" }, { status: 400 });
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs)
+      return Response.json({ error: "start and end must be ISO times, end after start" }, { status: 400 });
+    const session = await mutateGym((gym, now) => {
+      const id = text(body.workout_id, 80) ?? `manual:${gym.sessions.filter((s) => s.manual).length + 1}`;
+      if (gym.sessions.some((s) => s.id === id)) gym.sessions = gym.sessions.filter((s) => s.id !== id);
+      const s = {
+        id,
+        clientId: null,
+        start: new Date(startMs).toISOString(),
+        end: new Date(endMs).toISOString(),
+        sets: Number.isFinite(Number(body.sets)) ? Number(body.sets) : 0,
+        seenAt: new Date(now).toISOString(),
+        manual: { by, reason },
+      };
+      gym.sessions.push(s);
+      return { changed: true, result: s };
+    }, "gym session credited");
+    return Response.json({ ok: true, session });
+  }
+  return null;
+}
+
 export function gateStatus() {
   const now = deps.now();
   const disabled = gateDisabled();
@@ -699,6 +857,10 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
   if (!url.pathname.startsWith("/hygiene/")) return null;
   const remote = remoteGate();
   if (remote) return passThrough(remote, request, url);
+  if (url.pathname === "/hygiene/gym" || url.pathname.startsWith("/hygiene/gym/")) {
+    const gym = await gymRoute(request, url);
+    if (gym) return gym;
+  }
   if (url.pathname === "/hygiene/status" && request.method === "GET") return Response.json(gateStatus());
   // The whole state, for proxies that follow this gate (hygiene-remote.ts). Local callers only.
   if (url.pathname === "/hygiene/state" && request.method === "GET") return Response.json(loadState());
