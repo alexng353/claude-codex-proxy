@@ -51,12 +51,16 @@ export type GymSyncHost = {
 let fetcher: FeedFetcher = httpFetcher;
 let lastAttempt = 0;
 let inflight: Promise<void> | null = null;
+let inflightSince = 0;
+/** A read still pending after this long (a fetcher that ignored its abort, a stuck lock) is abandoned. */
+const INFLIGHT_MAX_MS = 30_000;
 
 /** For tests. */
 export function setGymFetcher(next: FeedFetcher = httpFetcher): void {
   fetcher = next;
   lastAttempt = 0;
   inflight = null;
+  inflightSince = 0;
 }
 
 /**
@@ -64,14 +68,15 @@ export function setGymFetcher(next: FeedFetcher = httpFetcher): void {
  * only for what Uplifting had by then. Failures are recorded, never thrown.
  */
 export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
-  if (inflight) return inflight;
   const started = host.now();
+  if (inflight && started - inflightSince < INFLIGHT_MAX_MS) return inflight;
   lastAttempt = started;
+  inflightSince = started;
   // Reach back to the oldest unresolved plan, so a long outage can't turn a
   // session outside the default window into a miss.
   const needed = host.neededSince();
   const from = Math.max(started - MAX_LOOKBACK_MS, Math.min(started - LOOKBACK_MS, needed ?? Infinity));
-  inflight = (async () => {
+  const run: Promise<void> = (async () => {
     let feed: UpliftingFeed | null = null;
     let error: string | null = null;
     try {
@@ -80,6 +85,8 @@ export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
       error = (e as Error).name === "TimeoutError" ? "Uplifting timed out" : (e as Error).message.slice(0, 200);
     }
     await host.apply((gym, now) => {
+      // An abandoned read that finishes late must not undo a newer one.
+      if (gym.syncedAt && Date.parse(gym.syncedAt) > started) return feed ? mergeFeed(gym, feed, now) : false;
       if (!feed) {
         const changed = gym.syncError !== error;
         gym.syncError = error!;
@@ -92,9 +99,10 @@ export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
     });
     if (error) console.error("gym-sync:", error);
   })().finally(() => {
-    inflight = null;
+    if (inflight === run) inflight = null;
   });
-  return inflight;
+  inflight = run;
+  return run;
 }
 
 /**
@@ -116,9 +124,11 @@ export async function refreshIfDeciding(
   );
   const fresh = gym.syncedAt && now - Date.parse(gym.syncedAt) < maxAgeMs;
   if (!pending || fresh || now - lastAttempt < maxAgeMs / 4) return;
+  lastAttempt = now;
   let timer: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([
-    syncGym(host, timeoutMs).catch(() => {}),
+    // The read keeps its own 15 s limit and finishes in the background; only the wait is capped.
+    syncGym(host).catch(() => {}),
     new Promise<void>((resolve) => {
       timer = setTimeout(resolve, timeoutMs);
     }),

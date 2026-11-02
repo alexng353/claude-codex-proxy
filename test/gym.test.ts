@@ -115,6 +115,30 @@ describe("plans and the deadline", () => {
     // Planned at 19:05 for 20:05: the 18:00 session is in its early window but predates it.
     editPlan(gym, { action: "add", start: iso(at("2026-11-06", "20:05")) }, later);
     expect(statusAt(gym, later)).toEqual(["made-up", "upcoming"]);
+    // Nor can that finished session clear the new plan once its deadline passes.
+    feed(gym, at("2026-11-06", "20:36"), {});
+    expect(statusAt(gym, at("2026-11-06", "20:36"))).toEqual(["made-up", "missed"]);
+  });
+
+  test("a plan added or moved mid-workout is held by the Start already tapped", () => {
+    for (const how of ["add", "move"] as const) {
+      const gym = emptyGym();
+      const id =
+        how === "add"
+          ? null
+          : (editPlan(gym, { action: "add", start: iso(at(DAY, "21:00")) }, at("2026-11-04", "12:00")) as { plan: { id: string } }).plan.id;
+      // At the gym from 17:00; the plan for 18:00 is made (or moved there) at 17:30.
+      feed(gym, at(DAY, "17:20"), { checkins: [checkin("c1", "start", at(DAY, "17:00"))] });
+      if (id) editPlan(gym, { action: "move", id, start: iso(at(DAY, "18:00")) }, at(DAY, "17:30"));
+      else editPlan(gym, { action: "add", start: iso(at(DAY, "18:00")) }, at(DAY, "17:30"));
+      feed(gym, at(DAY, "18:31"), {});
+      expect(statusAt(gym, at(DAY, "18:31"))).toEqual(["in-progress"]);
+      feed(gym, at(DAY, "19:10"), {
+        checkins: [checkin("c1", "finish", at(DAY, "19:00"))],
+        workouts: [workout("w1", "c1", at(DAY, "17:00"), at(DAY, "19:00"))],
+      });
+      expect(statusAt(gym, at(DAY, "19:10"))).toEqual(["kept"]);
+    }
   });
 
   test("a stale or failed read never locks, though the plan shows as missed", () => {
@@ -125,6 +149,18 @@ describe("plans and the deadline", () => {
     gym.syncError = "Uplifting timed out";
     expect(gymOutstanding(gym, at(DAY, "18:32"))).toEqual([]);
     expect(statusAt(gym, at(DAY, "18:32"))).toEqual(["missed"]);
+  });
+
+  test("a failed read drops only the gym lock; photo checks still lock", () => {
+    // Photos enforced from Nov 4, and nothing filled: Nov 5 morning teeth is due at 18:32.
+    const state = emptyState(iso(at("2026-11-04", "05:00")));
+    state.filled["2026-11-04/shower"] = "x";
+    state.filled["2026-11-04/night-teeth"] = "x";
+    state.gym = planned().gym;
+    feed(state.gym, at(DAY, "18:31"), {});
+    expect(outstanding(state, at(DAY, "18:32")).map((r) => r.kind).sort()).toEqual(["gym", "teeth"]);
+    state.gym.syncError = "Uplifting answered 502";
+    expect(outstanding(state, at(DAY, "18:32")).map((r) => r.kind)).toEqual(["teeth"]);
   });
 
   test("a qualifying session later makes up a miss; one session never counts twice", () => {

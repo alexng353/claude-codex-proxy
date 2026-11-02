@@ -177,7 +177,7 @@ describe("gym on the gate", () => {
     expect(await reply("hi")).toBe("forwarded");
   });
 
-  test("a failed read after a miss stops the gym lock (fail open), photos untouched", async () => {
+  test("a failed read after a miss stops the gym lock (fail open)", async () => {
     await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
     clock = at(DAY, "18:31");
     expect(await reply("hi")).toContain("gate armed");
@@ -187,18 +187,6 @@ describe("gym on the gate", () => {
     expect(await reply("hi")).toBe("forwarded");
     expect((await route("/hygiene/gym")).body.plans[0].status).toBe("missed");
   });
-
-  test("a read older than 10 minutes can't lock", async () => {
-    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
-    clock = at(DAY, "18:31");
-    await route("/hygiene/gym/sync", {});
-    // Uplifting stops answering in time; the refresh gives up after 5 s.
-    setGymFetcher(() => new Promise(() => {}));
-    clock = at(DAY, "18:42");
-    const started = Date.now();
-    expect(await reply("hi")).toBe("forwarded");
-    expect(Date.now() - started).toBeLessThan(6_500);
-  }, 10_000);
 
   test("grace_min null means the default, not zero", async () => {
     const added = await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), grace_min: null });
@@ -230,5 +218,24 @@ describe("gym on the gate", () => {
     const started = Date.now();
     await refreshIfDeciding(host, gym, 60_000, 200);
     expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("a late read never moves the last read time backwards", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    let release!: (feed: UpliftingFeed) => void;
+    setGymFetcher(() => new Promise((resolve) => (release = resolve)));
+    clock = at(DAY, "18:31");
+    const { syncGym } = await import("../src/gym-sync");
+    const { gymHost } = await import("../src/hygiene-gate");
+    const slow = syncGym(gymHost);
+    // 40 s later the stuck read is abandoned and a fresh one succeeds.
+    clock = at(DAY, "18:31") + 40_000;
+    setGymFetcher(async () => ({ checkins: [], workouts: [] }));
+    await syncGym(gymHost);
+    const fresh = (await route("/hygiene/gym")).body.syncedAt;
+    expect(Date.parse(fresh)).toBe(clock);
+    release({ checkins: [], workouts: [] });
+    await slow;
+    expect((await route("/hygiene/gym")).body.syncedAt).toBe(fresh);
   });
 });

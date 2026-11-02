@@ -46,7 +46,8 @@ async function main() {
       return show(await gymCall("/sync", {}));
     case "add": {
       const start = parseStart(positional[0] ?? "") ?? fail('add needs a start: "YYYY-MM-DD HH:MM" (Vancouver) or ISO with an offset');
-      return show(await gymCall("/plans", { start, by, note, ...(named.grace ? { grace_min: Number(named.grace) } : {}) }));
+      if (named.grace !== undefined && !/^\d+$/.test(named.grace)) fail("--grace must be a whole number of minutes");
+      return show(await gymCall("/plans", { start, by, note, ...(named.grace !== undefined ? { grace_min: Number(named.grace) } : {}) }));
     }
     case "move": {
       const [id, when] = positional;
@@ -58,6 +59,7 @@ async function main() {
       if (!positional[0]) fail("cancel needs a plan id");
       return show(await gymCall(`/plans/${encodeURIComponent(positional[0])}/cancel`, { by, note }));
     case "grace": {
+      if (!/^\d+$/.test(positional[0] ?? "")) fail("grace needs a whole number of minutes");
       const r = await gymCall("/settings", { grace_min: Number(positional[0]) });
       if (r.status >= 400) fail(r.body?.error ?? `failed (${r.status})`);
       return console.log(`default grace is now ${r.body.settings.graceMin} min (${r.body.note})`);

@@ -169,13 +169,14 @@ function plannedAt(plan: GymPlan): number {
 /**
  * Every plan's status at `now`, oldest first. A session keeps at most one
  * plan. A plan is kept by a qualifying session that starts between `earlyMin`
- * before it and its deadline, and after the plan was made or last moved (so a
- * new plan can't take a session that already made up an older miss); a Start
- * at the gym in that window holds it open until the Finish arrives (or
- * `maxOpenMin` passes). Missed plans are then made up, oldest first, by unused
- * qualifying sessions that started after the plan's window opened. A cancel
- * recorded after the planned start changes nothing: the plan stands, so
- * skipping it is a miss.
+ * before it and its deadline; a Start at the gym in that window holds it open
+ * until the Finish arrives (or `maxOpenMin` passes), even if the plan was made
+ * mid-workout. Missed plans are then made up, oldest first, by unused
+ * qualifying sessions that started after the plan's window opened. Either way
+ * a session counts only if it ended after the plan was made or last moved, so
+ * a plan added after a workout can't be cleared by it (or take it from an
+ * older miss). A cancel recorded after the planned start changes nothing: the
+ * plan stands, so skipping it is a miss.
  *
  * A miss needs evidence: a read of Uplifting from after the moment the plan
  * failed (its deadline, or the end of an unfinished Start's 4 hours). Without
@@ -203,9 +204,11 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       continue;
     }
     const opens = start - s.earlyMin * MIN;
-    const from = Math.max(opens, plannedAt(plan));
-    const inWindow = (iso: string) => ms(iso) >= from && ms(iso) <= deadline;
-    const keeper = checks.find((c) => c.qualifies && !used.has(c.session.id) && inWindow(c.session.start));
+    const inWindow = (iso: string) => ms(iso) >= opens && ms(iso) <= deadline;
+    const madeAt = plannedAt(plan);
+    const keeper = checks.find(
+      (c) => c.qualifies && !used.has(c.session.id) && inWindow(c.session.start) && ms(c.session.end) >= madeAt,
+    );
     if (keeper) {
       used.add(keeper.session.id);
       results.push({ plan, status: "kept", deadline, sessionId: keeper.session.id });
@@ -238,8 +241,16 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   for (const result of results) {
     if (result.status !== "missed") continue;
     const opens = ms(result.plan.start) - s.earlyMin * MIN;
+    const madeAt = plannedAt(result.plan);
     const makeup = checks
-      .filter((c) => c.qualifies && !used.has(c.session.id) && ms(c.session.start) >= opens && ms(c.session.start) <= now)
+      .filter(
+        (c) =>
+          c.qualifies &&
+          !used.has(c.session.id) &&
+          ms(c.session.start) >= opens &&
+          ms(c.session.end) >= madeAt &&
+          ms(c.session.start) <= now,
+      )
       .sort((a, b) => ms(a.session.start) - ms(b.session.start))[0];
     if (!makeup) continue;
     used.add(makeup.session.id);
@@ -459,8 +470,9 @@ export function pruneGym(gym: GymState, now: number): boolean {
   for (const r of results) {
     if (r.status !== "kept" && r.status !== "made-up") continue;
     if (r.plan.settled) continue;
-    // Settle before pruning either the plan's day or its session (which can start before the plan).
-    if (Math.min(ms(r.plan.start), sessionStart.get(r.sessionId!) ?? Infinity) < cutoff) {
+    // Settle a day before pruning can reach the plan, its session (which can
+    // start before the plan) or that session's check-ins.
+    if (Math.min(ms(r.plan.start), sessionStart.get(r.sessionId!) ?? Infinity) < cutoff + 86_400_000) {
       r.plan.settled = { status: r.status, sessionId: r.sessionId!, at: new Date(now).toISOString() };
       changed = true;
     }
