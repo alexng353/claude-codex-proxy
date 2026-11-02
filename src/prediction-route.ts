@@ -4,7 +4,7 @@ import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { refuseLocal } from "./pins";
-import { PredictionService } from "./predictions";
+import { PREDICTION_DEADLINE, PredictionService } from "./predictions";
 import {
   preparePrediction,
   guardPredictionReply,
@@ -72,6 +72,8 @@ function takeAttempt(id: string): PredictionAttempt | undefined {
   attempts.delete(id);
   return attempt;
 }
+/** Tests read the record a request made, as the route's usage line would. */
+export const takeAttemptForTest = takeAttempt;
 /** Single guarded model boundary for production and the paired holdout. Raw fields
  * are checked in an isolated worker before formatting; outputs are checked too. */
 export async function guardedModelPrediction(
@@ -175,7 +177,7 @@ export function createPredictionService(
             attempt.forkUnmeteredContextTokens = outcome.unmeteredContextTokens;
           }
           // The signal also fires at the deadline: only the caller's abort is a cancel.
-          if (signal.aborted) attempt.fallback ??= Date.now() >= input.deadlineMs! ? "timed out" : "cancelled";
+          if (signal.aborted) attempt.fallback ??= signal.reason === PREDICTION_DEADLINE ? "timed out" : "cancelled";
           signal.throwIfAborted();
           if (outcome.kind === "declined") {
             attempt.source = "fork";

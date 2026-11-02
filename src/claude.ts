@@ -45,6 +45,7 @@ import {
   pinThreadAccount,
   pruneSessions,
   registerSession,
+  recordThreadPark,
   resumeCheckpoint,
   saveSession,
   stateDir,
@@ -428,7 +429,13 @@ class ClaudeWorker {
     } catch (error) {
       console.error("Unable to save Claude session:", (error as Error).message);
     }
-    if (this.turn.threadId)
+    if (this.turn.threadId) {
+      try {
+        recordThreadPark(this.turn.threadId, this.sessionId);
+      } catch (error) {
+        // A missing park record only costs forks (they fall back to Haiku).
+        console.error("Unable to record the thread's park:", (error as Error).message);
+      }
       recordForkSource(
         this.turn.threadId,
         lastTurn.callIds.size === 0
@@ -444,6 +451,7 @@ class ClaudeWorker {
             }
           : undefined,
       );
+    }
     idleWorkers.delete(this);
     idleWorkers.add(this);
     const maxIdle = Number(process.env.CLAUDE_MAX_IDLE_WORKERS ?? 8);

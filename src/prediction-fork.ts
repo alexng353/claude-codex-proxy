@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { accountEnv, isUnavailable, type Account } from "./accounts";
 import { STRIPPED_ENV } from "./claude-env";
-import { stateDir } from "./sessions";
+import { stateDir, threadParkSession } from "./sessions";
 
 export const FORK_PREDICTION_PROMPT = `<composer_prediction>
 This message is from Today, not from Alex, and Alex never sees it. Your answer is thrown away unless it is shown to him as a suggestion in his message box.
@@ -194,11 +194,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * The digest Today sends as `lastAnswerSha256`: SHA-256 of the completed turn's last
- * agent message, trimmed (predictions.rs last_answer_digest). Exact, so no text in or
- * around the answer can make a different answer pass for it.
+ * agent message with ASCII whitespace trimmed at both ends (predictions.rs
+ * last_answer_digest trims the same set; JS and Rust `trim` differ beyond it).
  */
 export function answerDigest(answer: string): string {
-  return new Bun.CryptoHasher("sha256").update(answer.trim()).digest("hex");
+  return new Bun.CryptoHasher("sha256").update(answer.replace(/^[ \t\n\r]+|[ \t\n\r]+$/g, "")).digest("hex");
 }
 
 /**
@@ -277,6 +277,15 @@ export async function forkPrediction(
   // A newer turn may have finished on another proxy copy: fork only the answer Alex saw.
   if (!answerSha256 || !source.answer.trim() || answerSha256 !== answerDigest(source.answer))
     return { kind: "failed", reason: "stale" };
+  // The same words can end two turns: also require that no worker, on this proxy copy
+  // or the other, has parked the chat since this one did.
+  let latest: string | undefined;
+  try {
+    latest = threadParkSession(threadId);
+  } catch {
+    latest = undefined;
+  }
+  if (latest !== source.sessionId) return { kind: "failed", reason: "stale" };
   if (isUnavailable(source.account)) return { kind: "failed", reason: "account unavailable" };
   if (source.contextTokens > maxContextTokens()) return { kind: "failed", reason: "context too large" };
   // No StructuredOutput this turn (claude.ts fell back to the result text): nothing to resume at.

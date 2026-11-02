@@ -23,7 +23,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
-  statSync,
+  lstatSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -43,7 +43,8 @@ function privateFile(path: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   if (!existsSync(path)) writeFileSync(path, "", { mode: 0o600 });
   // Anything but a regular file we can append to is refused here, before quota is spent.
-  if (!statSync(path).isFile()) throw new Error(`bench output ${path} is not a regular file`);
+  // lstat: a symlink is refused too, so text never follows it into another file.
+  if (!lstatSync(path).isFile()) throw new Error(`bench output ${path} is not a regular file`);
   chmodSync(path, 0o600);
   appendFileSync(path, "");
 }
@@ -55,6 +56,22 @@ function privateWrite(path: string, text: string): void {
   privateFile(path);
   writeFileSync(path, text);
 }
+
+/** Fork processes still running, killed with the bench so none outlives it. */
+const children = new Set<Bun.Subprocess>();
+function track<T extends Bun.Subprocess>(child: T): T {
+  children.add(child);
+  void child.exited.then(() => children.delete(child));
+  return child;
+}
+// A default SIGINT/SIGTERM skips "exit" handlers and leaves children running: stop
+// them (and the Haiku pool), then exit so the scratch cleanup runs.
+for (const signal of ["SIGINT", "SIGTERM"] as const)
+  process.on(signal, () => {
+    for (const child of children) child.kill("SIGKILL");
+    void closePredictionModel();
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  });
 const maxPoints = Number(process.env.BENCH_MAX ?? 24);
 const windowMs = Number(process.env.BENCH_WINDOW_MS ?? 55 * 60_000);
 const effortOverride = process.env.BENCH_EFFORT;
@@ -273,13 +290,13 @@ async function runFork(point: Point, effort = effortOverride) {
   for (const key of STRIPPED_ENV) delete env[key];
   delete env.CLAUDE_CODE_EFFORT_LEVEL;
   const started = performance.now();
-  const child = Bun.spawn([point.worker.bin, ...args], {
+  const child = track(Bun.spawn([point.worker.bin, ...args], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
     cwd: claudeCwd,
     env: { ...env, ...accountEnv(point.worker.account) },
-  });
+  }));
   child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: FORK_PREDICTION_PROMPT }] } }) + "\n");
   child.stdin.flush();
   const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
@@ -395,7 +412,6 @@ async function coldQuality() {
   const scratchState = mkdtempSync(join(tmpdir(), "prediction-bench-state-"));
   process.on("exit", () => rmSync(scratchState, { recursive: true, force: true }));
   // A default SIGINT/SIGTERM skips "exit" handlers: exit properly so the cleanup runs.
-  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => process.exit(130));
   const launchArgs = (request: Parameters<typeof buildClaudeArgs>[0]) => {
     const live = process.env.PROXY_STATE_DIR;
     process.env.PROXY_STATE_DIR = scratchState;
@@ -504,13 +520,13 @@ async function coldQuality() {
     for (const key of STRIPPED_ENV) delete env[key];
     delete env.CLAUDE_CODE_EFFORT_LEVEL;
     const started = performance.now();
-    const child = Bun.spawn([process.env.CLAUDE_BIN ?? join(homedir(), ".local/share/claude/versions/2.1.302"), ...launchArgs(fitted.request)], {
+    const child = track(Bun.spawn([process.env.CLAUDE_BIN ?? join(homedir(), ".local/share/claude/versions/2.1.302"), ...launchArgs(fitted.request)], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
       cwd: join(homedir(), ".cache/composer-predictions"),
       env: { ...env, ...accountEnv(account) },
-    });
+    }));
     const content = [...prepared.content, { type: "text", text: FORK_PREDICTION_PROMPT }];
     child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
     child.stdin.flush();

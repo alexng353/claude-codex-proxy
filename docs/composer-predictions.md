@@ -34,12 +34,18 @@ launch arguments, session, account, answer and context size under the chat's
 that starts on the chat clears the record, including corrections and
 compactions, and the record expires after ten minutes. The daemon sends that
 key as `engineThreadId` (Today's own thread id differs for chats Today made).
-It also sends `lastAnswerSha256`, the SHA-256 of the completed turn's last
-agent message, trimmed.
+It also sends `lastAnswerSha256`, the SHA-256 of that turn's own last agent
+message, with ASCII whitespace trimmed. A turn with no answer sends none.
 
-A fork runs only when that digest is the recorded answer's. Otherwise the fork
-is `stale`: a newer turn finished elsewhere, for example on the other proxy
-copy, or the daemon sent no digest. No text can make a different answer pass.
+A fork runs only when both of these hold:
+- that digest is the recorded answer's;
+- the recording worker is the last to have parked the chat on either proxy
+  copy, which `thread_parks` in the shared `sessions.sqlite` records.
+
+Otherwise the fork is `stale`. Either a newer turn finished elsewhere, even
+one that ended with the same words, or the daemon sent no digest. During a
+deploy that mixes in a copy without `thread_parks`, that copy's turns are not
+recorded there.
 
 The resume point is the transcript entry that accepted that same answer, as the
 model wrote it, before the proxy's rewrites. It is found in the transcript's

@@ -1,3 +1,6 @@
+/** The abort reason when a request's own deadline, not its caller, stopped it. */
+export const PREDICTION_DEADLINE = "prediction deadline";
+
 export type PredictionInput = {
   threadId: string;
   turnId: string;
@@ -124,7 +127,7 @@ export class PredictionService {
     );
     const timer = new AbortController();
     const timeout = setTimeout(
-      () => timer.abort(),
+      () => timer.abort(PREDICTION_DEADLINE),
       Math.max(0, deadline - Date.now()),
     );
     const signal = callerSignal

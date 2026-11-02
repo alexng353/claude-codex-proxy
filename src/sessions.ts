@@ -81,7 +81,30 @@ function open(): Database {
     name TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`);
+  // The Claude session that last parked each chat, on any proxy copy (both share this
+  // file): a composer-prediction fork runs only from the session that holds the chat's
+  // latest turn, never from an older one another copy has since moved past.
+  db.exec(`CREATE TABLE IF NOT EXISTS thread_parks (
+    thread_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    parked_at INTEGER NOT NULL
+  )`);
   return db;
+}
+
+/** A worker of this chat parked (a final answer or tool calls): it holds the latest turn. */
+export function recordThreadPark(threadId: string, sessionId: string): void {
+  open()
+    .query(`INSERT INTO thread_parks (thread_id, session_id, parked_at) VALUES (?, ?, ?)
+      ON CONFLICT(thread_id) DO UPDATE SET session_id = excluded.session_id, parked_at = excluded.parked_at`)
+    .run(threadId, sessionId, Date.now());
+}
+
+/** The session that last parked `threadId` on any proxy copy, if any. */
+export function threadParkSession(threadId: string): string | undefined {
+  const row = open().query("SELECT session_id FROM thread_parks WHERE thread_id = ?")
+    .get(threadId) as { session_id: string } | null;
+  return row?.session_id;
 }
 
 export function threadAgentName(threadId: string): string | undefined {

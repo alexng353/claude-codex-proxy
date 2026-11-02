@@ -201,6 +201,27 @@ test("no fork without a parked final answer for the chat, or past its account's 
   });
 });
 
+test("the answer digest is the wire contract Today pins", () => {
+  // The same vectors as predictions.rs the_answer_digest_names_the_last_agent_message_exactly.
+  expect(answerDigest("  done\n")).toBe("a4c3ed04a95a3da14a9d235c83d868bed7c0f45cf7f3faa751ee8f50598d2211");
+  // Only ASCII whitespace is trimmed: a BOM stays, as in Rust.
+  expect(answerDigest("﻿done \t\r\n")).toBe("f95c98c274500e4c8b8da54a12a612d3f1286249769fdf1b0b4f1892678cf4b8");
+});
+
+test("a later park of the chat on another proxy copy makes this copy's record stale", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction } = await import("../src/prediction-fork");
+    const { recordThreadPark } = await import("../src/sessions");
+    const thread = crypto.randomUUID();
+    await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
+    // The other copy served the next turn, ending with the same words.
+    recordThreadPark(thread, crypto.randomUUID());
+    expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "stale" });
+    expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
 test("a later turn that ends in a tool call retires the chat's fork record", async () => {
   await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
     const { runClaude } = await import("../src/claude");
@@ -236,6 +257,8 @@ test("an old or too large record makes no fork", async () => {
     const signal = new AbortController().signal;
     recordForkSource("stale", { ...source, parkedAt: Date.now() - 11 * 60_000 });
     expect(await forkPrediction("stale", signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "no session" });
+    const { recordThreadPark } = await import("../src/sessions");
+    recordThreadPark("large", source.sessionId);
     recordForkSource("large", { ...source, contextTokens: 300_001 });
     expect(await forkPrediction("large", signal, Date.now() + 5000, DONE)).toMatchObject({ reason: "context too large" });
   });
@@ -464,6 +487,26 @@ test("a fork cancelled mid-flight is logged as a cancelled fork, never as Haiku"
     }
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("a fork overtaken by the deadline is logged as timed out, not cancelled", async () => {
+  const { createPredictionService } = await import("../src/prediction-route");
+  const engine = createPredictionService({
+    prepare: async () => ({ prompt: "p", retrievalMs: 0, guardMs: 0 }),
+    generate: async () => "never",
+    guardReply: async () => true,
+    refresh: () => {},
+    source: () => "fork",
+    fork: async () => {
+      await Bun.sleep(150);
+      return { kind: "suggested", text: "late", account: "work" };
+    },
+  } as never);
+  const { takeAttemptForTest } = await import("../src/prediction-route");
+  const attemptId = crypto.randomUUID();
+  const result = await engine.predict({ threadId: "t", turnId: "d", context: "Assistant: done", engineThreadId: "e", attemptId, deadlineMs: Date.now() + 50 });
+  expect(result).toBeNull();
+  expect(takeAttemptForTest(attemptId)).toMatchObject({ source: "haiku", fallback: "timed out" });
 });
 
 test("the switch defaults to Haiku and is read on every request", async () => {
