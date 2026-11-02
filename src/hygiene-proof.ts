@@ -17,6 +17,9 @@ const unavailable =
   ((accounts as Record<string, unknown>).isUnavailable as ((account: Account) => boolean) | undefined) ??
   ((account: Account) => isLimited(account));
 import type { ClassifiedKind, ProofKind } from "./hygiene";
+import { offsetAt, wallTime } from "./zone";
+
+const PHONE_ZONE = "America/Vancouver";
 
 export type DecodedImage = { mediaType: string; bytes: Buffer };
 
@@ -95,10 +98,12 @@ export function parseCaptureTime(raw: string): number | null {
   const [, y, mo, d, h, mi, s] = match;
   const iso = `${y}-${mo}-${d}T${h}:${mi}:${s}`;
   if (offset && /^[+-]\d{2}:\d{2}$/.test(offset)) return Date.parse(`${iso}${offset}`);
-  // No offset: interpret as Vancouver wall time.
-  const utcGuess = Date.parse(`${iso}Z`);
-  const local = new Date(utcGuess).toLocaleString("sv-SE", { timeZone: "America/Vancouver" }).replace(" ", "T");
-  return utcGuess + (utcGuess - Date.parse(`${local}Z`));
+  // No offset: interpret as Vancouver wall time (system zone database, see zone.ts).
+  const wall = Date.parse(`${iso}Z`);
+  if (Number.isNaN(wall)) return null;
+  let guess = wall;
+  for (let k = 0; k < 3; k++) guess = wall - offsetAt(guess, PHONE_ZONE).offsetMs;
+  return guess;
 }
 
 // ---- Vision verdict ----
@@ -280,20 +285,9 @@ const EXTENSIONS: Record<string, string> = {
  * (Vancouver time), byte for byte. Directories are 0700 and the file 0600.
  */
 export function archivePhoto(image: DecodedImage, kind: string, at: number, hash: string): string {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/Vancouver",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23",
-    })
-      .formatToParts(new Date(at))
-      .map((p) => [p.type, p.value]),
-  );
+  const w = wallTime(at, PHONE_ZONE);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const parts = { year: String(w.year), month: pad(w.month), day: pad(w.day), hour: pad(w.hour), minute: pad(w.minute), second: pad(w.second) };
   let directory = photoDir();
   for (const segment of ["", parts.year, parts.month, parts.day]) {
     directory = segment ? join(directory, segment) : directory;

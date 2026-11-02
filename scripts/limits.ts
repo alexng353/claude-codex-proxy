@@ -10,6 +10,7 @@
  */
 import { listAccounts, type Account } from "../src/accounts";
 import { stateDir } from "../src/sessions";
+import { DAY_NAMES, stampLabel, wallTime } from "../src/zone";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -226,11 +227,8 @@ function resetIn(iso: string | null): string {
   const minutes = Math.max(0, Math.round((Date.parse(iso) - Date.now()) / 60_000));
   const days = Math.floor(minutes / 1440);
   const hours = Math.floor((minutes % 1440) / 60);
-  const when = new Date(iso).toLocaleString(undefined, {
-    weekday: "short",
-    hour: "numeric",
-    minute: "2-digit",
-  });
+  const w = wallTime(Date.parse(iso));
+  const when = `${DAY_NAMES[w.weekday]} ${w.hour}:${String(w.minute).padStart(2, "0")}`;
   const span = days ? `${days}d ${hours}h` : hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
   return `resets in ${span} (${when})`;
 }
@@ -296,7 +294,7 @@ if (!quiet) rows.forEach((row, index) => {
   const active = row.name === activeAccount?.name
     ? `  ▶ ACTIVE (last proxy activity ${Math.max(0, Math.round((Date.now() - Date.parse(activeAccount.observedAt!)) / 60_000))}m ago)`
     : "";
-  const limited = row.limitedUntil ? `  LIMITED until ${new Date(row.limitedUntil).toLocaleString()}` : "";
+  const limited = row.limitedUntil ? `  LIMITED until ${stampLabel(Date.parse(row.limitedUntil))}` : "";
   const age = row.observedAt
     ? `, seen ${Math.round((Date.now() - Date.parse(row.observedAt)) / 60_000)}m ago`
     : "";

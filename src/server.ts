@@ -10,6 +10,7 @@ import { closeIdleWorkers } from "./claude";
 import { healthInfo, isDraining, runningCommit, setDraining } from "./handoff";
 import { drainPerpetual, perpetualBusy } from "./perpetual";
 import { startUsageProbe } from "./usage-probe";
+import { startZoneCheck } from "./zone-check";
 
 const hostname = process.env.HOST ?? "127.0.0.1";
 const port = Number(process.env.PORT ?? 3456);
@@ -51,6 +52,8 @@ const stopWarnings = startAuthWarnings();
 const stopPhotoRetries = startPhotoRetries(remoteGate() ?? `http://127.0.0.1:${port}`);
 const stopWakeRetries = startWakeRetries();
 const stopWeights = startWeightWorker();
+// Runtime Intl vs the system zone database for Vancouver: logs, pages once (zone-check.ts).
+const stopZoneCheck = startZoneCheck();
 
 /**
  * Hand over (alex-0230): stop accepting, start no new work (the usage probe, idle
@@ -67,6 +70,7 @@ async function drain(signal: string): Promise<void> {
   const warningsDone = stopWarnings();
   const photosDone = stopPhotoRetries();
   const wakesDone = stopWakeRetries();
+  stopZoneCheck();
   let weightsDone = false;
   void stopWeights().finally(() => (weightsDone = true));
   closeIdleWorkers();

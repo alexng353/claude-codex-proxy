@@ -15,6 +15,7 @@ import { fetchRemoteState, remoteGate } from "./hygiene-remote";
 import { isCompactionRequest } from "./request";
 import { stateDir } from "./sessions";
 import type { ResponsesRequest } from "./types";
+import { wallTime } from "./zone";
 
 /**
  * Durable half of the plate-activity block (see plate-activity.mjs).
@@ -189,7 +190,8 @@ async function freshBlock(
   const gate = (reported ?? []).filter((e) => !seen.has(e.key));
   const truncated = events.length >= PAGE && events[0].id > cursor + 1;
   return {
-    block: renderBlock(events, { timeZone: config.timeZone, truncated, hygiene: gate }),
+    // The zone-database clock, not bun's Intl (src/zone.ts).
+    block: renderBlock(events, { timeZone: config.timeZone, truncated, hygiene: gate, clock: wallTime }),
     through: events.at(-1)?.id ?? cursor,
     hygieneThrough: reported === null ? null : now,
     hygieneKeys: gate.map((e) => e.key),

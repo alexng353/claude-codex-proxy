@@ -27,9 +27,14 @@ const slots = (s: GateState, now: number) => outstanding(s, now).map((r) => r.sl
 
 describe("clock", () => {
   test("zonedTime and localTime round-trip across DST", () => {
+    // Expectations come from glibc reading the same tzdata (test/zone.test.ts
+    // covers the transitions); no offset is written down here.
+    const sys = (local: string) =>
+      Number(Bun.spawnSync(["date", "-d", local, "+%s"], { env: { ...process.env, TZ: "America/Vancouver" } }).stdout.toString()) * 1000;
     expect(new Date(at("2026-10-08", "05:00")).toISOString()).toBe("2026-10-08T12:00:00.000Z");
-    expect(new Date(at("2026-12-01", "05:00")).toISOString()).toBe("2026-12-01T13:00:00.000Z");
-    // 2026-11-01 is the fall-back day; midnight is still PDT.
+    expect(at("2026-12-01", "05:00")).toBe(sys("2026-12-01 05:00"));
+    expect(at("2026-03-08", "05:00")).toBe(sys("2026-03-08 05:00"));
+    // 2026-11-01 is the day BC's clocks stopped changing; midnight is still PDT.
     expect(localTime(at("2026-11-01", "00:00"))).toEqual({ day: "2026-11-01", minutes: 0 });
     expect(localTime(at("2026-11-01", "05:00"))).toEqual({ day: "2026-11-01", minutes: 300 });
     expect(addDays("2026-12-31", 1)).toBe("2027-01-01");

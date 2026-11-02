@@ -14,6 +14,7 @@ import {
 import { join } from "node:path";
 import { emptyView, type ViewState } from "./view";
 import { tryLock, unlock } from "../filelock";
+import { dayKey } from "../zone";
 
 /**
  * One perpetual chat on disk (gist section 1):
@@ -66,9 +67,10 @@ export class LockedError extends Error {}
 const bytes = (text: string) => Buffer.byteLength(text, "utf8");
 const nodeKey = (level: number, index: number) => `${level}:${index}`;
 
+// This machine's calendar day from the system zone database (bun's own local
+// time lags tzdata; see src/zone.ts).
 function localDate(now: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  return dayKey(now.getTime());
 }
 
 function readJsonl<T>(directory: string): T[] {

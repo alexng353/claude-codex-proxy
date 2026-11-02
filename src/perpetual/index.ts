@@ -9,6 +9,7 @@ import {
   textFromContent,
 } from "../request";
 import { legacyRunning } from "../handoff";
+import { stampLabel } from "../zone";
 import { stateDir } from "../sessions";
 import type {
   ProxyOutput,
@@ -609,7 +610,7 @@ class Turn {
       return result(`Error: id must be a message id from 0 to ${store.length - 1}.`);
     if (call.name === DATE_TOOL) {
       const date = new Date(store.messages[id].date);
-      return result(`${id}: ${date.toISOString()} (${date.toLocaleString("en-CA", { timeZoneName: "short" })})`);
+      return result(`${id}: ${date.toISOString()} (${stampLabel(date.getTime())})`);
     }
     const n = Number(args.n);
     if (!Number.isInteger(n) || n < 1 || (n & (n - 1)) !== 0 || id % n !== 0)

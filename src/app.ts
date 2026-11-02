@@ -16,6 +16,7 @@ import { responseObject, streamResponse } from "./responses";
 import { scrubRequest } from "./scrub.mjs";
 import { preloadSkills } from "./skill-preload";
 import type { ProxyOutput, ResponsesRequest } from "./types";
+import { lastZoneCheck } from "./zone-check";
 
 const json = (value: unknown, status = 200) => Response.json(value, { status });
 const error = (message: string, status = 400) =>
@@ -110,7 +111,7 @@ async function hygieneGateEndpoint(request: Request): Promise<Response> {
 export async function handleRequest(request: Request, peer?: string): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/health" && request.method === "GET")
-    return json(healthInfo());
+    return json({ ...healthInfo(), zone: lastZoneCheck() });
   // Tailscale Serve exposes this port for Cairn. Anything that came through a
   // proxy hop may reach only the separately authenticated hygiene API.
   const forwarded = request.headers.has("x-forwarded-for") || request.headers.has("tailscale-user-login");

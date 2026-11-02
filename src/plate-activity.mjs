@@ -115,32 +115,52 @@ export function relevantEvent(event) {
   return AGENT_FINISH.has(event.action);
 }
 
-function localStamp(iso, timeZone, withDate) {
-  const date = new Date(iso);
-  const time = date.toLocaleTimeString("en-CA", {
-    timeZone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  if (!withDate) return time;
-  const day = date.toLocaleDateString("en-US", { timeZone, month: "short", day: "numeric" });
-  return `${day} ${time}`;
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAYS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+/**
+ * Wall-clock fields { month (1-12), day, hour, minute, weekday (0 = Sunday) }.
+ * `zone.clock(ms, timeZone)` supplies them when the caller has a better source
+ * than this runtime's Intl (bun's ICU lags tzdata; the proxy passes its
+ * zone-database clock). Without one, Intl.
+ */
+function wallParts(ms, zone) {
+  if (zone.clock) return zone.clock(ms, zone.timeZone);
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: zone.timeZone,
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "numeric",
+      weekday: "short",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date(ms))
+      .map((p) => [p.type, p.value]),
+  );
+  return { month: +parts.month, day: +parts.day, hour: +parts.hour, minute: +parts.minute, weekday: WEEKDAYS[parts.weekday] ?? 0 };
 }
 
-function untilLabel(value, timeZone) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return clip(value, 40);
-  return date.toLocaleDateString("en-US", {
-    timeZone,
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-  });
+const pad2 = (n) => String(n).padStart(2, "0");
+
+function localStamp(iso, zone, withDate) {
+  const w = wallParts(Date.parse(iso), zone);
+  const time = `${pad2(w.hour)}:${pad2(w.minute)}`;
+  if (!withDate) return time;
+  return `${MONTH_NAMES[w.month - 1]} ${w.day} ${time}`;
+}
+
+function untilLabel(value, zone) {
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) return clip(value, 40);
+  const w = wallParts(ms, zone);
+  return `${DAY_NAMES[w.weekday]}, ${MONTH_NAMES[w.month - 1]} ${w.day}`;
 }
 
 /** One event as "<label> (key) …" under its action heading. */
-function describe(event, timeZone) {
+function describe(event, zone) {
   const key = event.key ? ` (${event.key})` : "";
   const detail = event.detail ?? "";
   switch (event.action) {
@@ -158,7 +178,7 @@ function describe(event, timeZone) {
       const title = rest.shift();
       const note = rest.join(" | ");
       let text = `${clip(title ?? event.key ?? "item", 80)}${title ? key : ""}`;
-      if (until) text += ` until ${untilLabel(until.slice(6), timeZone)}`;
+      if (until) text += ` until ${untilLabel(until.slice(6), zone)}`;
       if (note) text += `: "${clip(note, 200)}"`;
       return text;
     }
@@ -180,8 +200,10 @@ const MAX_AGENT_KEYS = 6;
  * worth mentioning. `cursor` is the newest event id covered, offered so the
  * model can page further with plate_events if the block was truncated.
  * `hygiene` is the hygiene gate's outcomes, `{ at, text }` oldest first.
+ * `clock(ms, timeZone)`, when given, supplies wall-clock fields (see wallParts).
  */
-export function renderBlock(events, { timeZone, truncated = false, hygiene = [] } = {}) {
+export function renderBlock(events, { timeZone, truncated = false, hygiene = [], clock } = {}) {
+  const zone = { timeZone, clock };
   const relevant = events.filter(relevantEvent);
   if (!relevant.length && !hygiene.length) return null;
   const groups = new Map();
@@ -193,17 +215,17 @@ export function renderBlock(events, { timeZone, truncated = false, hygiene = [] 
     }
     const label = LABELS[event.action] ?? event.action;
     if (!groups.has(label)) groups.set(label, []);
-    groups.get(label).push(describe(event, timeZone));
+    groups.get(label).push(describe(event, zone));
   }
   const stamps = [...relevant, ...hygiene].map((e) => e.at).sort((a, b) => Date.parse(a) - Date.parse(b));
   const first = stamps[0];
   const last = stamps.at(-1);
   const sameDay =
-    localStamp(first, timeZone, true).split(" ").slice(0, 2).join(" ") ===
-    localStamp(last, timeZone, true).split(" ").slice(0, 2).join(" ");
+    localStamp(first, zone, true).split(" ").slice(0, 2).join(" ") ===
+    localStamp(last, zone, true).split(" ").slice(0, 2).join(" ");
   // First, so the length cap drops dashboard lines before the gate's.
   const lines = hygiene.length
-    ? [`- hygiene gate: ${hygiene.map((h) => `${localStamp(h.at, timeZone, !sameDay)} ${clip(h.text, 120)}`).join("; ")}`]
+    ? [`- hygiene gate: ${hygiene.map((h) => `${localStamp(h.at, zone, !sameDay)} ${clip(h.text, 120)}`).join("; ")}`]
     : [];
   lines.push(...[...groups].map(([label, items]) => `- ${label}: ${items.join("; ")}`));
   if (agentKeys.length) {
@@ -211,7 +233,7 @@ export function renderBlock(events, { timeZone, truncated = false, hygiene = [] 
     const more = agentKeys.length > MAX_AGENT_KEYS ? ` (+${agentKeys.length - MAX_AGENT_KEYS} more)` : "";
     lines.push(`- agents finished: ${shown}${more}`);
   }
-  const since = localStamp(first, timeZone, !sameDay);
+  const since = localStamp(first, zone, !sameDay);
   const newest = events.at(-1)?.id;
   const header = `<${BLOCK_TAG} source="plate-dashboard" since="${since}">`;
   const preface =

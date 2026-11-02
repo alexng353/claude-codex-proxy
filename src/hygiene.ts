@@ -19,6 +19,7 @@
  */
 import { createHash } from "node:crypto";
 import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from "./types";
+import { wallTime } from "./zone";
 
 export const TIME_ZONE = "America/Vancouver";
 export const MORNING_MINUTE = 5 * 60;
@@ -136,29 +137,11 @@ export function emptyState(startsAt: string): GateState {
 
 // ---- Time ----
 
-const formatter = new Intl.DateTimeFormat("en-CA", {
-  timeZone: TIME_ZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hourCycle: "h23",
-});
-
+// Vancouver's offset comes from the system zone database (src/zone.ts), not
+// from Intl: bun's bundled ICU still had BC falling back to PST on
+// 2026-11-01, an hour off Alex's clock.
 function wallClock(ms: number) {
-  const parts = Object.fromEntries(
-    formatter.formatToParts(new Date(ms)).map((part) => [part.type, part.value]),
-  );
-  return {
-    year: Number(parts.year),
-    month: Number(parts.month),
-    day: Number(parts.day),
-    hour: Number(parts.hour),
-    minute: Number(parts.minute),
-    second: Number(parts.second),
-  };
+  return wallTime(ms, TIME_ZONE);
 }
 
 /** Local calendar day ("YYYY-MM-DD") and minutes since local midnight. */
