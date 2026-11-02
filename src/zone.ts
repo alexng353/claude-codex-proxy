@@ -12,7 +12,11 @@
  * Lookup order: `$TZDIR/<name>` (default /usr/share/zoneinfo); for the local
  * zone, `$TZ` (a name, `:name` or a path) then /etc/localtime. The file is
  * re-checked at most once a minute, so a tzdata update applies without a
- * restart. If no file can be read, it falls back to Intl and says so once.
+ * restart. If no file was ever read, it falls back to Intl and says so once;
+ * a file that read before and fails later keeps its last good contents.
+ *
+ * `bun test` pins its own clock to UTC but leaves TZ unset, so under test the
+ * local zone here is still /etc/localtime, unlike bun's local Date.
  */
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
@@ -312,7 +316,9 @@ function load(key: string, name: string | undefined, now: number): Source {
   const hit = cache.get(key);
   if (hit && hit.path === path && now - hit.checkedAt < RECHECK_MS) return hit.source;
   const stamp = path ? fileStamp(path) : null;
-  if (hit && hit.path === path && stamp !== null && hit.stamp === stamp) {
+  // Only a file that parsed may skip the re-read: after a failed read (EACCES, a
+  // half-written file) the stamp can stay the same while the file becomes readable.
+  if (hit && hit.source.kind === "tzif" && hit.path === path && stamp !== null && hit.stamp === stamp) {
     hit.checkedAt = now;
     return hit.source;
   }
@@ -330,6 +336,13 @@ function load(key: string, name: string | undefined, now: number): Source {
     warned.add(key);
   }
   if (!source) {
+    // A zone file that parsed before beats Intl: during a tzdata upgrade the file can
+    // be missing or half-written for a moment, and Intl may be an hour off (bun 1.4).
+    // Keep the old stamp so the next check (a minute on) reads the file again.
+    if (hit && hit.source.kind === "tzif" && hit.path === path) {
+      hit.checkedAt = now;
+      return hit.source;
+    }
     try {
       source = intlSource(name);
     } catch {

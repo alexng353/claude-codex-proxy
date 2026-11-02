@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { localTime, outstanding, emptyState, zonedTime, type GateState } from "../src/hygiene";
@@ -149,7 +149,56 @@ describe.skipIf(!hasZic)("follows whatever rule the zone database has", () => {
     }
   });
 
-  test("a zone file that changes under a running process is picked up", () => {
+  test("a zone file that read before keeps its rule while missing mid-update, then reloads", () => {
+    const dir = fakeTzdir(["Zone America/Vancouver -6:00 - XST", ""].join("\n"));
+    const file = join(dir, "America/Vancouver");
+    const realNow = Date.now;
+    const quiet = console.error;
+    try {
+      process.env.TZDIR = dir;
+      resetZoneCache();
+      console.error = () => {};
+      const ms = Date.parse("2030-01-01T00:00:00Z");
+      expect(offsetAt(ms, ZONE).offsetMs).toBe(-6 * 3600_000);
+      rmSync(file);
+      Date.now = () => realNow() + 61_000;
+      // Gone for a moment (a tzdata upgrade): still the file's rule, never Intl.
+      expect(offsetAt(ms, ZONE)).toMatchObject({ offsetMs: -6 * 3600_000, abbrev: "XST" });
+      writeFileSync(join(dir, "src.zi"), ["Zone America/Vancouver -5:00 - YST", ""].join("\n"));
+      sh(["zic", "-d", dir, join(dir, "src.zi")]);
+      Date.now = () => realNow() + 122_000;
+      expect(offsetAt(ms, ZONE)).toMatchObject({ offsetMs: -5 * 3600_000, abbrev: "YST" });
+    } finally {
+      Date.now = realNow;
+      console.error = quiet;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a zone file that could not be read is retried once readable, even with the same stamp", () => {
+    const dir = fakeTzdir(["Zone America/Vancouver -6:00 - XST", ""].join("\n"));
+    const file = join(dir, "America/Vancouver");
+    const realNow = Date.now;
+    const quiet = console.error;
+    try {
+      process.env.TZDIR = dir;
+      resetZoneCache();
+      chmodSync(file, 0o000);
+      console.error = () => {};
+      const ms = Date.parse("2030-01-01T00:00:00Z");
+      // Unreadable: the Intl fallback, whatever this runtime says (never XST's -6).
+      expect(offsetAt(ms, ZONE).offsetMs).not.toBe(-6 * 3600_000);
+      chmodSync(file, 0o644);
+      Date.now = () => realNow() + 61_000;
+      expect(offsetAt(ms, ZONE)).toMatchObject({ offsetMs: -6 * 3600_000, abbrev: "XST" });
+    } finally {
+      Date.now = realNow;
+      console.error = quiet;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a zone file replaced under a running process is picked up", () => {
     const dir = fakeTzdir(["Zone America/Vancouver -7:00 - MST", ""].join("\n"));
     try {
       process.env.TZDIR = dir;

@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkZone, runZoneCheck, zoneAlarm, type ZoneCheck } from "../src/zone-check";
-import { offsetAt } from "../src/zone";
+import { intlOffsetAt, offsetAt } from "../src/zone";
 
 const NOW = Date.parse("2026-11-02T07:25:00Z");
 
@@ -31,10 +31,16 @@ describe("zone self-check", () => {
   });
 
   test("this bun's own Intl is compared for real", () => {
-    // No expectation on the answer (it depends on the installed bun); the check must run.
+    // The answer depends on the installed bun; the default comparator must be Intl's.
     const c = checkZone(NOW);
     expect(c.source).toBe("tzif");
-    expect(typeof c.runtimeAgrees).toBe("boolean");
+    const viaIntl = checkZone(NOW, "America/Vancouver", intlOffsetAt);
+    expect({ agrees: c.runtimeAgrees, at: c.mismatch?.at }).toEqual({ agrees: viaIntl.runtimeAgrees, at: viaIntl.mismatch?.at });
+    const intlNow = new Intl.DateTimeFormat("en-US", { timeZone: "America/Vancouver", hour: "numeric", hourCycle: "h23" });
+    const intlHour = Number(intlNow.format(new Date(NOW)));
+    const dbHour = new Date(NOW + offsetAt(NOW, "America/Vancouver").offsetMs).getUTCHours();
+    // If Intl's hour differs from the database's, the check must say so.
+    if (intlHour !== dbHour) expect(c.runtimeAgrees).toBe(false);
   });
 
   test("the gate's clock on the Intl fallback is an error", () => {
@@ -42,7 +48,25 @@ describe("zone self-check", () => {
     expect(zoneAlarm(c)).toMatchObject({ level: "error", key: "zone-fallback-2026" });
   });
 
-  test("pages once per alarm key; a failed page is retried next time", async () => {
+  test("each fallback episode pages: recovery clears the fallback marker", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "zone-check-"));
+    const base = { zone: "America/Vancouver", runtime: "bun x", path: null, runtimeAgrees: true, year: 2026 } as const;
+    const down: ZoneCheck = { ...base, source: "intl" };
+    const up: ZoneCheck = { ...base, source: "tzif" };
+    const sent: string[] = [];
+    const send = async (_t: string, id: string) => (sent.push(id), true);
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      for (const c of [down, down, up, down]) await runZoneCheck({ now: NOW, send, dir, check: () => c });
+      expect(sent).toEqual(["zone-fallback-2026", "zone-fallback-2026"]);
+    } finally {
+      console.error = quiet;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("pages once per alarm key, retrying a failed page", async () => {
     const dir = mkdtempSync(join(tmpdir(), "zone-check-"));
     try {
       const bad: ZoneCheck = {

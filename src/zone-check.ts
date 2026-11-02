@@ -11,7 +11,7 @@
  *   The gate is unaffected (it reads src/zone.ts); anything still on Intl is not.
  * Pages go to COMB_BLOCKED_PAGE_THREAD on this machine, like blocked-task pages.
  */
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { STRIPPED_ENV } from "./claude-env";
@@ -139,6 +139,9 @@ export async function runZoneCheck({
 }> {
   const c = check(now);
   last = c;
+  // Back on the zone file: the next fallback is a new episode and pages again.
+  if (c.source === "tzif" && existsSync(dir))
+    for (const f of readdirSync(dir)) if (f.startsWith("zone-fallback-")) unlinkSync(join(dir, f));
   const alarm = zoneAlarm(c);
   if (!alarm) return { check: c, paged: false };
   (alarm.level === "error" ? console.error : console.warn)(alarm.text.replace(/^\[agent\] /, ""));
