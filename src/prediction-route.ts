@@ -9,7 +9,18 @@ import {
   preparePrediction,
   guardPredictionReply,
 } from "./prediction-preparation";
-import { generatePrediction, prewarmPredictionModel } from "./prediction-model";
+import {
+  generatePrediction,
+  prewarmPredictionModel,
+  type PredictionModelMetrics,
+  type PredictionTokens,
+} from "./prediction-model";
+import {
+  forkPrediction,
+  predictionSource,
+  type ForkOutcome,
+  type PredictionSource,
+} from "./prediction-fork";
 
 export const predictionIndexPath = () =>
   process.env.PREDICTION_INDEX ??
@@ -27,13 +38,39 @@ type PredictionDependencies = {
   generate: typeof generatePrediction;
   guardReply: typeof guardPredictionReply;
   refresh: () => void;
+  source: () => PredictionSource;
+  fork: typeof forkPrediction;
 };
 const productionDependencies: PredictionDependencies = {
   prepare: preparePrediction,
   generate: generatePrediction,
   guardReply: guardPredictionReply,
   refresh: refreshCorpusInBackground,
+  source: predictionSource,
+  fork: forkPrediction,
 };
+
+/** Time kept back from a fork so a failed one still leaves Haiku its p90 (5.4 s on Forge). */
+const HAIKU_RESERVE_MS = 5_500;
+
+/** How an attempt was answered, for its usage line. Never the text. */
+export type PredictionAttempt = {
+  source: PredictionSource;
+  /** Why the fork did not answer, when Haiku did instead. */
+  fallback?: string;
+  forkMs?: number;
+  fork?: ForkOutcome["usage"];
+  forkAccount?: string;
+  haiku?: PredictionTokens;
+};
+const attempts = new Map<string, PredictionAttempt>();
+const attemptKey = (threadId: unknown, turnId: unknown) => JSON.stringify([threadId, turnId]);
+function takeAttempt(threadId: unknown, turnId: unknown): PredictionAttempt | undefined {
+  const key = attemptKey(threadId, turnId);
+  const attempt = attempts.get(key);
+  attempts.delete(key);
+  return attempt;
+}
 /** Single guarded model boundary for production and the paired holdout. Raw fields
  * are checked in an isolated worker before formatting; outputs are checked too. */
 export async function guardedModelPrediction(
@@ -43,6 +80,7 @@ export async function guardedModelPrediction(
   deadlineMs: number,
   onTiming?: (timing: PredictionTiming) => void,
   dependencies: PredictionDependencies = productionDependencies,
+  onModel?: (metrics: PredictionModelMetrics) => void,
 ): Promise<string | null> {
   const started = Date.now();
   const prepared = await dependencies.prepare(
@@ -55,7 +93,7 @@ export async function guardedModelPrediction(
   const modelStart = Date.now();
   if (!prepared.prompt) return null;
   const reply = (
-    await dependencies.generate(prepared.prompt, signal, undefined, deadlineMs)
+    await dependencies.generate(prepared.prompt, signal, onModel, deadlineMs)
   ).trim();
   signal.throwIfAborted();
   const guardStart = Date.now();
@@ -110,8 +148,37 @@ export function createPredictionService(
     (text) => text,
     () => [],
     claim,
-    (input, signal) => {
+    async (input, signal) => {
       if (input.corpusEnabled === true) dependencies.refresh();
+      const attempt: PredictionAttempt = { source: "haiku" };
+      attempts.set(attemptKey(input.threadId, input.turnId), attempt);
+      if (attempts.size > 64) attempts.delete(attempts.keys().next().value!);
+      if (dependencies.source() === "fork") {
+        if (typeof input.engineThreadId !== "string") attempt.fallback = "no engine thread";
+        else {
+          const started = Date.now();
+          const outcome = await dependencies.fork(
+            input.engineThreadId,
+            signal,
+            input.deadlineMs! - HAIKU_RESERVE_MS,
+          );
+          signal.throwIfAborted();
+          attempt.forkMs = Date.now() - started;
+          attempt.fork = outcome.usage;
+          attempt.forkAccount = outcome.account;
+          if (outcome.kind === "declined") {
+            attempt.source = "fork";
+            return null;
+          }
+          if (outcome.kind === "suggested") {
+            if (await dependencies.guardReply(outcome.text, signal)) {
+              attempt.source = "fork";
+              return outcome.text;
+            }
+            attempt.fallback = "unsafe text";
+          } else attempt.fallback = outcome.reason;
+        }
+      }
       return guardedModelPrediction(
         input.context,
         input.corpusEnabled === true ? undefined : [],
@@ -119,6 +186,9 @@ export function createPredictionService(
         input.deadlineMs!,
         undefined,
         dependencies,
+        (metrics) => {
+          attempt.haiku = metrics.tokens;
+        },
       );
     },
   );
@@ -156,12 +226,22 @@ export async function handlePredictionRoute(
         void (engine ?? localService())
           .predict(value, signal)
           .then((prediction) => {
+            const attempt = takeAttempt(value?.threadId, value?.turnId);
             appendFileSync(
               join(dirname(predictionIndexPath()), "prediction-usage.jsonl"),
               JSON.stringify({
                 at: Date.now(),
                 kind: "composer_prediction",
-                model: "haiku",
+                // Ids only, so the trial can join Today's accepted line: never text.
+                ...(typeof value?.threadId === "string" ? { threadId: value.threadId } : {}),
+                ...(typeof value?.turnId === "string" ? { turnId: value.turnId } : {}),
+                // Which model answered: the chat's own (fork) or Haiku.
+                model: attempt?.source === "fork" ? "fork" : "haiku",
+                ...(attempt?.fallback ? { fallback: attempt.fallback } : {}),
+                ...(attempt?.forkMs !== undefined ? { forkMs: attempt.forkMs } : {}),
+                ...(attempt?.fork ? { forkUsage: attempt.fork } : {}),
+                ...(attempt?.forkAccount ? { forkAccount: attempt.forkAccount } : {}),
+                ...(attempt?.haiku ? { haikuUsage: attempt.haiku } : {}),
                 elapsedMs: Date.now() - started,
                 suggested: prediction !== null,
                 cancelled: signal.aborted,
@@ -170,7 +250,9 @@ export async function handlePredictionRoute(
             );
             if (!signal.aborted) {
               controller.enqueue(
-                new TextEncoder().encode(JSON.stringify({ prediction })),
+                new TextEncoder().encode(
+                  JSON.stringify({ prediction, source: attempt?.source ?? "haiku" }),
+                ),
               );
               controller.close();
             }

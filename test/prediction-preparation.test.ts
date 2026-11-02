@@ -110,7 +110,7 @@ test("ordinary HTTP stays responsive during real cold prediction preparation", a
     expect((await response.json()).error).toBeDefined();
     expect(performance.now() - predictionStarted).toBeLessThan(400);
     expect(settled).toBe(false);
-    expect(await pending).toEqual({ prediction: null });
+    expect(await pending).toEqual({ prediction: null, source: "haiku" });
   } finally {
     clearTimeout(watchdog);
     clearTimeout(markerTimer);

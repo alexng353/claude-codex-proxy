@@ -7,17 +7,93 @@ gate. It never writes a conversation, sends a message, or executes model tools.
 ## Bounds and account use
 
 Each thread/turn pair receives one persistent attempt claim, including failures.
-There is no retry or fallback. At most two requests run concurrently, including
+There is no retry. At most two requests run concurrently, including
 retrieval. Generation uses the existing subscription account environment with
 billing/API-key variables removed, Haiku, low effort, no tools, no session
 persistence. One absolute deadline covers preparation, retrieval, generation, and output checking: the earlier of the caller deadline and 12 seconds after receipt. Output must be a short single-line string
 inside a JSON prediction response; null or invalid output produces no suggestion.
+With the fork switch on (below), Haiku is the fallback instead of the only model.
 
 The shared prompt builder keeps the last 3,000 context characters and at most
 two example pairs (500 assistant characters and 200 reply characters each).
 Corpus examples are independently opt-in (`corpusEnabled: true`); the default is no examples. The shared runtime/evaluation boundary checks raw context and each raw example field before JSON escaping or truncation, and checks
 the prediction before return. The local usage log contains time, model, duration,
 and whether a suggestion was produced; it contains no message text.
+
+## Fork of the chat (switch, off by default)
+
+`src/prediction-fork.ts` can answer from an invisible fork of the chat itself
+instead of Haiku. It is off until switched on: `PREDICTION_SOURCE=fork`, or a
+`prediction-source` file in the proxy state directory whose first line is
+`fork`. The file is read on every request, so turning it on or off needs no
+restart. Anything else means Haiku.
+
+When a worker parks after a final answer (no tool calls) it records its launch
+arguments, session, account and context size under the chat's
+`prompt_cache_key`. A tool-call park clears the record, and it expires after ten
+minutes. The daemon sends that key as `engineThreadId` (Today's own thread id
+differs for chats Today made). The fork runs the same Claude Code binary with
+the worker's arguments, but with `--resume <session> --fork-session
+--no-session-persistence --resume-session-at <last accepted answer>` and
+`--effort low` (`PREDICTION_FORK_EFFORT`). Model, system prompt file and output
+schema stay the same, so the request reads the chat's prompt cache; effort is
+outside the cached prefix (measured: a low-effort fork of a high-effort chat
+read 651k cached tokens). One user message asks for Alex's likely next
+message. The first result ends the process, which is then killed.
+
+What makes it invisible: the fork bypasses `runClaude`, so it writes no
+usage.jsonl row, session map row, pin, hygiene accounting or transcript, and
+Codex and Today never see it. The route logs one `prediction-usage.jsonl` line:
+`threadId` and `turnId` (Today's), `model` (`fork` or `haiku`), `fallback`
+(why the fork did not answer), `elapsedMs`, `forkMs`, `forkAccount`, and
+`forkUsage` and `haikuUsage` (uncached input, cache read, cache write and
+output tokens). It never logs text. The reply says `source` (`fork` or
+`haiku`), and Today's journal says per attempt whether Alex accepted it.
+
+### The trial
+
+The decision (2026-11-02 10:10, Bubble): Haiku stays the default everywhere,
+and a 1-2 day trial runs on Forge's Claude chats only. Alex decides the
+default from the trial numbers; the code never flips it. The trial is one
+config change on Forge, which needs no restart:
+
+```sh
+echo fork > ~/.local/state/claude-codex-proxy/prediction-source   # start
+rm ~/.local/state/claude-codex-proxy/prediction-source             # stop
+```
+
+The rest of the scope follows from the code: GPT chats never reach this proxy,
+so they keep Haiku. Chats over 300,000 tokens and accounts past their cap keep
+Haiku too. Every other machine has its own state directory, with no switch
+file. The daemon must be one that sends `engineThreadId`; an older one gets
+Haiku with `fallback: "no engine thread"`.
+
+`bun scripts/prediction-trial-report.ts [SINCE]` prints, per path:
+- attempts, suggestions and accepted suggestions, read from Today's
+  `generated_origin` on the chat's next message;
+- latency p50 and p90;
+- why Haiku answered;
+- tokens, and an estimate of each account's weekly share.
+
+The baseline before the trial was 1 accepted of 62 Haiku suggestions on Forge
+(2026-11-01 to 2026-11-02).
+
+Haiku answers instead, with the time the fork leaves it, when:
+- the request has no `engineThreadId` (an older daemon);
+- no fresh final-answer record exists (the chat ran on another proxy copy, or
+  the turn ended in a compaction);
+- the chat's account is unavailable or over its weekly cap;
+- the last request was over `PREDICTION_FORK_MAX_CONTEXT_TOKENS` (300,000;
+  large chats answer too slowly even from cache);
+- the transcript has no accepted answer to resume at;
+- the fork errs, calls a tool, answers more than one short line, or its text
+  fails the scrubber;
+- the fork is not done 5.5 s before the deadline, which leaves Haiku its p90.
+
+If the fork answers with empty text, nothing is predictable, and Haiku is not
+asked. Cancelling the request kills the fork. The fork uses no corpus examples:
+it already has the chat's own words. Measurements and the decision record are
+in Tayshun, `tooling/today-predictions/2026-11-02-prediction-fork.md`.
 
 ## Private index
 

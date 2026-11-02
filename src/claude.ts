@@ -51,6 +51,7 @@ import {
   type SessionKey,
 } from "./sessions";
 import { markThreadInFlight } from "./in-flight";
+import { recordForkSource } from "./prediction-fork";
 import {
   conversationRequest,
   deltaRequest,
@@ -293,6 +294,11 @@ class ClaudeWorker {
   private closed = false;
   /** The stored session this process forked, if it did not start fresh. */
   private readonly resumedFrom?: string;
+  /** How this process was started, so a composer prediction can fork its session. */
+  private readonly bin: string;
+  private readonly launchArgs: string[];
+  /** Input tokens (cached or not) of the last request: what a fork of it would read. */
+  private contextTokens = 0;
 
   constructor(
     request: ResponsesRequest,
@@ -320,15 +326,14 @@ class ClaudeWorker {
     }
     const { CLAUDE_CODE_EFFORT_LEVEL: _effortLevel, ...env } = process.env;
     for (const key of STRIPPED_ENV) delete env[key];
+    this.bin = process.env.CLAUDE_BIN ?? "claude";
+    this.launchArgs = buildClaudeArgs(request, {
+      id: this.sessionId,
+      resumeFrom,
+      resumeAt: resumeFrom ? resumeAt : undefined,
+    });
     this.subprocess = Bun.spawn(
-      [
-        process.env.CLAUDE_BIN ?? "claude",
-        ...buildClaudeArgs(request, {
-          id: this.sessionId,
-          resumeFrom,
-          resumeAt: resumeFrom ? resumeAt : undefined,
-        }),
-      ],
+      [this.bin, ...this.launchArgs],
       {
         stdin: "pipe",
         stdout: "pipe",
@@ -416,6 +421,20 @@ class ClaudeWorker {
     } catch (error) {
       console.error("Unable to save Claude session:", (error as Error).message);
     }
+    if (this.turn.threadId)
+      recordForkSource(
+        this.turn.threadId,
+        lastTurn.callIds.size === 0
+          ? {
+              bin: this.bin,
+              args: this.launchArgs,
+              sessionId: this.sessionId,
+              account: this.account,
+              contextTokens: this.contextTokens,
+              parkedAt: Date.now(),
+            }
+          : undefined,
+      );
     idleWorkers.delete(this);
     idleWorkers.add(this);
     const maxIdle = Number(process.env.CLAUDE_MAX_IDLE_WORKERS ?? 8);
@@ -523,6 +542,10 @@ class ClaudeWorker {
       event.structured_output = { ...output, text: this.pending.prose.join("\n\n") };
     if (event.is_error)
       this.noteFailure(event.api_error_status, resultErrorText(event));
+    const usage = (event as { usage?: Record<string, unknown> }).usage;
+    if (usage)
+      this.contextTokens = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .reduce((sum, key) => sum + (typeof usage[key] === "number" ? (usage[key] as number) : 0), 0);
     recordUsage(event, {
       requestId: this.turn.requestId,
       workerId: this.workerId,

@@ -4,6 +4,13 @@ import { STRIPPED_ENV } from "./claude-env";
 import { parsePrediction, PREDICTION_SYSTEM } from "./predictions";
 
 type Child = Bun.Subprocess<"pipe", "pipe", "ignore">;
+/** Tokens of one Haiku call, as Claude Code's result reports them. */
+export type PredictionTokens = {
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+};
 export type PredictionModelMetrics = {
   warm: boolean;
   spawnMs: number;
@@ -11,8 +18,21 @@ export type PredictionModelMetrics = {
   modelMs: number;
   apiMs?: number;
   totalMs: number;
+  tokens?: PredictionTokens;
 };
-type Result = { text: string; apiMs?: number };
+type Result = { text: string; apiMs?: number; tokens?: PredictionTokens };
+
+const tokenCount = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+export function predictionTokens(usage: unknown): PredictionTokens | undefined {
+  if (!usage || typeof usage !== "object") return undefined;
+  const raw = usage as Record<string, unknown>;
+  return {
+    inputTokens: tokenCount(raw.input_tokens),
+    cacheReadTokens: tokenCount(raw.cache_read_input_tokens),
+    cacheWriteTokens: tokenCount(raw.cache_creation_input_tokens),
+    outputTokens: tokenCount(raw.output_tokens),
+  };
+}
 type Worker = {
   child: Child;
   born: number;
@@ -90,6 +110,7 @@ export class PredictionModelPool {
           typeof event.duration_api_ms === "number"
             ? event.duration_api_ms
             : undefined,
+        tokens: predictionTokens(event.usage),
       };
     };
     for await (const chunk of worker.child.stdout) {
@@ -166,6 +187,7 @@ export class PredictionModelPool {
         modelMs: ended - Math.max(started, worker.initAt ?? started),
         apiMs: result.apiMs,
         totalMs: ended - started,
+        tokens: result.tokens,
       });
       return result.text;
     } finally {
