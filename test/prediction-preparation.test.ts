@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PredictionPreparationPool } from "../src/prediction-preparation";
+import { processAlive } from "./proc-alive";
 
 test("ordinary HTTP stays responsive during real cold prediction preparation", async () => {
   const dir = mkdtempSync(join(tmpdir(), "prediction-app-"));
@@ -178,9 +179,7 @@ test("aborting cold preparation kills its synchronous scrubber descendant", asyn
     const pid = Number(readFileSync(pidPath, "utf8"));
     abort.abort();
     await expect(pending).rejects.toBeDefined();
-    const statPath = `/proc/${pid}/stat`;
-    const alive =
-      existsSync(statPath) && !readFileSync(statPath, "utf8").includes(") Z ");
+    const alive = processAlive(pid);
     try {
       expect(alive).toBe(false);
     } finally {
