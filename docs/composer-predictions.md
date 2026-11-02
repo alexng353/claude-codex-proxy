@@ -58,13 +58,22 @@ no fork.
 
 The fork runs the same Claude Code binary with the worker's arguments, swapping
 in `--resume <session> --fork-session --no-session-persistence
---resume-session-at <that entry>`. Model, effort, system prompt file and output
-schema stay the chat's own, so the fork reads the chat's prompt cache.
-`PREDICTION_FORK_EFFORT` can override the effort, which is outside the cached
-prefix: a low-effort fork of a high-effort chat read 651k cached tokens.
-Measured 2026-11-02, forcing low was no faster at the median, and its p90 was
-10.3 s against 4.1 s. One user message asks for Alex's likely next message.
-The first result ends the process, which is then killed.
+--resume-session-at <that entry>`. Model, system prompt file and output schema
+stay the chat's own, so the fork reads the chat's prompt cache.
+
+Effort is outside the cached prefix: a low-effort fork of a high-effort chat
+read 651k cached tokens. So the fork keeps the chat's effort, capped at
+medium, and `PREDICTION_FORK_EFFORT` overrides it. On Forge, 2026-11-02, with
+n=45 warm forks:
+
+| Effort | p50 | p90 |
+|---|---|---|
+| medium | 2.7 s | 3.7 s |
+| high | 6.6 s | 9.4 s |
+| forced low | 2.5 s | 7.9 s, including the two worst outliers |
+
+One user message asks for Alex's likely next message. The first result ends
+the process, which is then killed.
 
 What makes it invisible: the fork bypasses `runClaude`, so it writes no
 usage.jsonl row, session map row, pin, hygiene accounting or transcript, and

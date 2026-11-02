@@ -156,8 +156,9 @@ test("a fork resumes the chat's parked session at its last answer and leaves no 
     // Same prefix as the chat: system prompt file, schema and model.
     for (const flag of ["--system-prompt-file", "--json-schema", "--model"])
       expect(fork.argv[fork.argv.indexOf(flag) + 1]).toBe(worker.argv[worker.argv.indexOf(flag) + 1]);
-    // The chat's own effort: forcing low measured no faster and had a longer tail.
-    expect(fork.argv[fork.argv.indexOf("--effort") + 1]).toBe("high");
+    // The chat's own effort, capped at medium: measured, high was slower and forced low
+    // had a longer tail, while medium matched low's median.
+    expect(fork.argv[fork.argv.indexOf("--effort") + 1]).toBe("medium");
     const inputs = await lines(join(root, "inputs.jsonl"));
     expect(inputs.filter((input) => input.fork)).toHaveLength(1);
     expect(inputs.find((input) => input.fork).line).toContain("composer_prediction");
@@ -253,6 +254,24 @@ test("a record retired while its checkpoint is being read makes no fork", async 
     const [worker] = await lines(join(root, "launches.jsonl"));
     // The worker starts another turn (for another chat) while the transcript is read.
     forkTestHooks.afterCheckpoint = () => retireForkSourcesOf(worker.argv[worker.argv.indexOf("--session-id") + 1]);
+    try {
+      expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "stale" });
+    } finally {
+      forkTestHooks.afterCheckpoint = undefined;
+    }
+    expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
+test("a park by the other copy while the checkpoint is being read makes no fork", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction, forkTestHooks } = await import("../src/prediction-fork");
+    const { recordThreadPark } = await import("../src/sessions");
+    const thread = crypto.randomUUID();
+    await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
+    // This copy's record stays; the other copy starts the chat's next turn meanwhile.
+    forkTestHooks.afterCheckpoint = () => recordThreadPark(thread, crypto.randomUUID());
     try {
       expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "stale" });
     } finally {

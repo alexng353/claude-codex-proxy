@@ -192,9 +192,19 @@ export function parseForkResult(event: Record<string, unknown>): ForkOutcome {
 
 /** Larger chats are slow to answer even from cache; they keep Haiku (measured 2026-11-02). */
 const maxContextTokens = () => Number(process.env.PREDICTION_FORK_MAX_CONTEXT_TOKENS ?? 300_000);
-/** Unset keeps the chat's own effort: on 2026-11-02 a forced low effort was no faster
- * at the median and had a far longer tail (p90 10.3 s against 4.1 s). */
-const forkEffort = () => process.env.PREDICTION_FORK_EFFORT || undefined;
+/**
+ * The fork's effort: `PREDICTION_FORK_EFFORT` if set, else the chat's own, capped at
+ * medium. Effort is outside the cached prefix, so any of them reads the cache. Measured
+ * on Forge 2026-11-02 (n=45 warm forks): medium p50 2.7 s / p90 3.7 s; high p50 6.6 s /
+ * p90 9.4 s; forced low p50 2.5 s / p90 7.9 s, with the two worst outliers.
+ */
+function forkEffort(workerArgs: readonly string[]): string | undefined {
+  const override = process.env.PREDICTION_FORK_EFFORT;
+  if (override) return override;
+  const at = workerArgs.indexOf("--effort");
+  const chat = at >= 0 ? workerArgs[at + 1] : undefined;
+  return chat && ["high", "xhigh", "max"].includes(chat) ? "medium" : undefined;
+}
 
 /** Bytes read from a transcript's end for the checkpoint; the answer is its last entries. */
 const CHECKPOINT_TAIL_BYTES = 1 << 20;
@@ -334,7 +344,7 @@ async function runFork(
     const { CLAUDE_CODE_EFFORT_LEVEL: _effort, ...inherited } = process.env;
     const env: Record<string, string | undefined> = { ...inherited };
     for (const key of STRIPPED_ENV) delete env[key];
-    child = Bun.spawn([source.bin, ...forkArgs(source.args, source.sessionId, checkpoint, forkEffort())], {
+    child = Bun.spawn([source.bin, ...forkArgs(source.args, source.sessionId, checkpoint, forkEffort(source.args))], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
