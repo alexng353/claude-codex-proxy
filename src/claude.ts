@@ -370,6 +370,9 @@ class ClaudeWorker {
       throw new Error("Claude CLI worker is already processing a turn");
     this.turn = turn;
     turn.account = this.account;
+    // The chat moved past its last answer (a new turn, a correction, a compaction):
+    // no prediction may fork it any more until this worker parks a final answer again.
+    if (turn.threadId) recordForkSource(turn.threadId, undefined);
     // The account actually serving this attempt (a reused worker, a failover).
     markTurn(this.account);
     this.attempt = attempt;
@@ -430,6 +433,7 @@ class ClaudeWorker {
               args: this.launchArgs,
               sessionId: this.sessionId,
               account: this.account,
+              answer: lastTurn.text,
               contextTokens: this.contextTokens,
               parkedAt: Date.now(),
             }
@@ -543,9 +547,14 @@ class ClaudeWorker {
     if (event.is_error)
       this.noteFailure(event.api_error_status, resultErrorText(event));
     const usage = (event as { usage?: Record<string, unknown> }).usage;
-    if (usage)
+    if (usage) {
+      // The result's usage sums every API call of the query; the context a fork would
+      // read is the last call's input.
+      const calls = Array.isArray(usage.iterations) ? (usage.iterations as Record<string, unknown>[]) : [];
+      const last = calls.at(-1) ?? usage;
       this.contextTokens = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-        .reduce((sum, key) => sum + (typeof usage[key] === "number" ? (usage[key] as number) : 0), 0);
+        .reduce((sum, key) => sum + (typeof last[key] === "number" ? (last[key] as number) : 0), 0);
+    }
     recordUsage(event, {
       requestId: this.turn.requestId,
       workerId: this.workerId,

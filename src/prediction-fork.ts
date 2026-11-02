@@ -15,10 +15,12 @@
  * thread's pin or Claude's transcripts; Codex and Today never see the fork.
  */
 import { readFileSync } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { accountEnv, isUnavailable, type Account } from "./accounts";
 import { STRIPPED_ENV } from "./claude-env";
-import { resumeCheckpoint, stateDir } from "./sessions";
+import { stateDir } from "./sessions";
 
 export const FORK_PREDICTION_PROMPT = `<composer_prediction>
 This message is from Today, not from Alex, and Alex never sees it. Your answer is thrown away unless it is shown to him as a suggestion in his message box.
@@ -52,6 +54,8 @@ export type ForkSource = {
   args: readonly string[];
   sessionId: string;
   account: Account;
+  /** The final answer the worker parked with: the fork must resume exactly there. */
+  answer: string;
   /** Input tokens of the worker's last request, cached or not: the fork's context size. */
   contextTokens: number;
   parkedAt: number;
@@ -136,7 +140,14 @@ export type ForkUsage = {
 export type ForkOutcome = (
   | { kind: "suggested"; text: string; usage?: ForkUsage }
   | { kind: "declined"; usage?: ForkUsage }
-  | { kind: "failed"; reason: string; usage?: ForkUsage }
+  | {
+      kind: "failed";
+      reason: string;
+      usage?: ForkUsage;
+      /** A fork that ran but reported no usage (cancelled, late, broken) may still have
+       * read its whole context: the chat's last context size, an upper bound. */
+      unmeteredContextTokens?: number;
+    }
 ) & { account?: string };
 
 const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
@@ -170,7 +181,70 @@ export function parseForkResult(event: Record<string, unknown>): ForkOutcome {
 
 /** Larger chats are slow to answer even from cache; they keep Haiku (measured 2026-11-02). */
 const maxContextTokens = () => Number(process.env.PREDICTION_FORK_MAX_CONTEXT_TOKENS ?? 300_000);
-const forkEffort = () => process.env.PREDICTION_FORK_EFFORT ?? "low";
+/** Unset keeps the chat's own effort: on 2026-11-02 a forced low effort was no faster
+ * at the median and had a far longer tail (p90 10.3 s against 4.1 s). */
+const forkEffort = () => process.env.PREDICTION_FORK_EFFORT || undefined;
+
+/** Bytes read from a transcript's end for the checkpoint; the answer is its last entries. */
+const CHECKPOINT_TAIL_BYTES = 1 << 20;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Whether the daemon's context for the completed turn ends with this parked answer. */
+function endsWithAnswer(context: string | undefined, answer: string): boolean {
+  const tail = answer.trim().slice(-2000);
+  return !!tail && !!context && context.trimEnd().endsWith(tail);
+}
+
+/**
+ * The transcript entry to resume at: the accepted StructuredOutput result of `answer`,
+ * found in the last MiB of the transcript without blocking the event loop. Anything
+ * else (a later answer, a cut line, no transcript) gives undefined, so no fork runs.
+ */
+async function answerCheckpoint(sessionId: string, answer: string): Promise<string | undefined> {
+  if (!UUID.test(sessionId)) return undefined;
+  const projects = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "projects");
+  let names: string[];
+  try {
+    names = await readdir(projects);
+  } catch {
+    return undefined;
+  }
+  for (const name of names) {
+    const path = join(projects, name, `${sessionId}.jsonl`);
+    let size: number;
+    try {
+      size = (await stat(path)).size;
+    } catch {
+      continue;
+    }
+    const start = Math.max(0, size - CHECKPOINT_TAIL_BYTES);
+    const lines = (await Bun.file(path).slice(start, size).text()).split("\n");
+    if (start > 0) lines.shift(); // Cut in the middle.
+    const outputs = new Map<string, string>();
+    let last: { uuid: string; text: string } | undefined;
+    for (const line of lines) {
+      let entry: any;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const content = entry?.message?.content;
+      if (!Array.isArray(content)) continue;
+      if (entry.type === "assistant" && !entry.isApiErrorMessage) {
+        for (const block of content)
+          if (block?.type === "tool_use" && block.name === "StructuredOutput")
+            outputs.set(block.id, typeof block.input?.text === "string" ? block.input.text : "");
+      } else if (entry.type === "user" && typeof entry.uuid === "string" && UUID.test(entry.uuid)) {
+        for (const block of content)
+          if (block?.type === "tool_result" && !block.is_error && outputs.has(block.tool_use_id))
+            last = { uuid: entry.uuid, text: outputs.get(block.tool_use_id)! };
+      }
+    }
+    return last && last.text.trim() === answer.trim() ? last.uuid : undefined;
+  }
+  return undefined;
+}
 
 /**
  * Predict Alex's next message in `threadId` (Codex's thread id, the requests'
@@ -180,17 +254,27 @@ export async function forkPrediction(
   threadId: string,
   signal: AbortSignal,
   deadlineMs: number,
+  /** The daemon's recent context of the completed turn; it must end with the parked answer. */
+  context?: string,
 ): Promise<ForkOutcome> {
   const source = forkSource(threadId);
   if (!source) return { kind: "failed", reason: "no session" };
+  // A newer turn may have finished on another proxy copy: fork only the answer Alex saw.
+  if (!endsWithAnswer(context, source.answer)) return { kind: "failed", reason: "stale" };
   if (isUnavailable(source.account)) return { kind: "failed", reason: "account unavailable" };
   if (source.contextTokens > maxContextTokens()) return { kind: "failed", reason: "context too large" };
+  const checkpoint = await answerCheckpoint(source.sessionId, source.answer);
+  if (!checkpoint) return { kind: "failed", reason: "no checkpoint" };
+  // Checked after the last await: runFork adds its abort listener before awaiting anything.
   if (signal.aborted) return { kind: "failed", reason: "cancelled" };
   if (deadlineMs <= Date.now()) return { kind: "failed", reason: "timed out" };
-  const checkpoint = resumeCheckpoint(source.sessionId);
-  if (!checkpoint) return { kind: "failed", reason: "no checkpoint" };
   const outcome = await runFork(source, checkpoint, signal, deadlineMs);
-  return { ...outcome, account: source.account.name };
+  const unmetered = outcome.kind === "failed" && !outcome.usage && outcome.reason !== "spawn";
+  return {
+    ...outcome,
+    ...(unmetered ? { unmeteredContextTokens: source.contextTokens } : {}),
+    account: source.account.name,
+  };
 }
 
 async function runFork(

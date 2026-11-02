@@ -28,27 +28,64 @@ instead of Haiku. It is off until switched on: `PREDICTION_SOURCE=fork`, or a
 `fork`. The file is read on every request, so turning it on or off needs no
 restart. Anything else means Haiku.
 
-When a worker parks after a final answer (no tool calls) it records its launch
-arguments, session, account and context size under the chat's
-`prompt_cache_key`. A tool-call park clears the record, and it expires after ten
-minutes. The daemon sends that key as `engineThreadId` (Today's own thread id
-differs for chats Today made). The fork runs the same Claude Code binary with
-the worker's arguments, but with `--resume <session> --fork-session
---no-session-persistence --resume-session-at <last accepted answer>` and
-`--effort low` (`PREDICTION_FORK_EFFORT`). Model, system prompt file and output
-schema stay the same, so the request reads the chat's prompt cache; effort is
-outside the cached prefix (measured: a low-effort fork of a high-effort chat
-read 651k cached tokens). One user message asks for Alex's likely next
-message. The first result ends the process, which is then killed.
+When a worker parks after a final answer (no tool calls), it records its
+launch arguments, session, account, answer and context size under the chat's
+`prompt_cache_key`. The context size is the last API call's input. Any turn
+that starts on the chat clears the record, including corrections and
+compactions, and the record expires after ten minutes. The daemon sends that
+key as `engineThreadId` (Today's own thread id differs for chats Today made),
+with its recent context.
+
+A fork runs only when that context ends with the recorded answer. Otherwise it
+is `stale`: a newer turn finished elsewhere, for example on the other proxy
+copy. The resume point is the transcript entry that accepted that same answer,
+found in the transcript's last MiB without blocking the event loop.
+
+The fork runs the same Claude Code binary with the worker's arguments, swapping
+in `--resume <session> --fork-session --no-session-persistence
+--resume-session-at <that entry>`. Model, effort, system prompt file and output
+schema stay the chat's own, so the fork reads the chat's prompt cache.
+`PREDICTION_FORK_EFFORT` can override the effort, which is outside the cached
+prefix: a low-effort fork of a high-effort chat read 651k cached tokens.
+Measured 2026-11-02, forcing low was no faster at the median, and its p90 was
+10.3 s against 4.1 s. One user message asks for Alex's likely next message.
+The first result ends the process, which is then killed.
 
 What makes it invisible: the fork bypasses `runClaude`, so it writes no
 usage.jsonl row, session map row, pin, hygiene accounting or transcript, and
-Codex and Today never see it. The route logs one `prediction-usage.jsonl` line:
-`threadId` and `turnId` (Today's), `model` (`fork` or `haiku`), `fallback`
-(why the fork did not answer), `elapsedMs`, `forkMs`, `forkAccount`, and
-`forkUsage` and `haikuUsage` (uncached input, cache read, cache write and
-output tokens). It never logs text. The reply says `source` (`fork` or
-`haiku`), and Today's journal says per attempt whether Alex accepted it.
+Codex and Today never see it.
+
+Haiku answers instead, with the time the fork leaves it, when:
+- the request has no `engineThreadId` (an older daemon);
+- no fresh final-answer record exists on this proxy copy (`no session`), or
+  the context ends on another answer (`stale`);
+- the chat's account is unavailable or over its weekly cap;
+- the last call's input was over `PREDICTION_FORK_MAX_CONTEXT_TOKENS`
+  (300,000);
+- the transcript tail has no accepted entry for the answer (`no checkpoint`);
+- the fork errs, calls a tool, answers more than one short line, or its text
+  fails the scrubber;
+- the fork is not done 5.5 s before the deadline, which leaves Haiku its p90.
+
+If the fork answers with empty text, nothing is predictable, and Haiku is not
+asked. Cancelling the request kills the fork. The fork uses no corpus examples:
+it already has the chat's own words.
+
+Each request writes one `prediction-usage.jsonl` line under its own attempt
+id, so a duplicate the service refused can never take another request's
+record. The line holds, never text:
+- `threadId` and `turnId` (Today's);
+- `model`: `fork`, `haiku`, or `skipped` for a duplicate, busy or invalid
+  request;
+- `fallback`: why the fork did not answer;
+- `elapsedMs`, `forkMs` and `forkAccount`;
+- `forkUsage` and `haikuUsage`: uncached input, cache read, cache write and
+  output tokens;
+- `forkUnmeteredContextTokens`: for a fork that ran but reported no usage
+  (cancelled or late), its context, an upper bound on what it read.
+
+The reply says `source` (`fork`, `haiku` or `skipped`), and Today's journal
+says per attempt whether Alex accepted the suggestion.
 
 ### The trial
 
@@ -68,32 +105,21 @@ Haiku too. Every other machine has its own state directory, with no switch
 file. The daemon must be one that sends `engineThreadId`; an older one gets
 Haiku with `fallback: "no engine thread"`.
 
-`bun scripts/prediction-trial-report.ts [SINCE]` prints, per path:
+`bun scripts/prediction-trial-report.ts [SINCE]` prints three groups: fork
+answered, fork tried then Haiku answered (end to end), and Haiku only. For
+each it gives:
 - attempts, suggestions and accepted suggestions, read from Today's
   `generated_origin` on the chat's next message;
 - latency p50 and p90;
-- why Haiku answered;
-- tokens, and an estimate of each account's weekly share.
+- why Haiku answered.
+
+It then counts the skipped requests and gives the latency of every fork that
+ran. Last, it gives each path's tokens and an estimate of each account's
+weekly share, metered, and with unmetered forks as an upper bound.
 
 The baseline before the trial was 1 accepted of 62 Haiku suggestions on Forge
-(2026-11-01 to 2026-11-02).
-
-Haiku answers instead, with the time the fork leaves it, when:
-- the request has no `engineThreadId` (an older daemon);
-- no fresh final-answer record exists (the chat ran on another proxy copy, or
-  the turn ended in a compaction);
-- the chat's account is unavailable or over its weekly cap;
-- the last request was over `PREDICTION_FORK_MAX_CONTEXT_TOKENS` (300,000;
-  large chats answer too slowly even from cache);
-- the transcript has no accepted answer to resume at;
-- the fork errs, calls a tool, answers more than one short line, or its text
-  fails the scrubber;
-- the fork is not done 5.5 s before the deadline, which leaves Haiku its p90.
-
-If the fork answers with empty text, nothing is predictable, and Haiku is not
-asked. Cancelling the request kills the fork. The fork uses no corpus examples:
-it already has the chat's own words. Measurements and the decision record are
-in Tayshun, `tooling/today-predictions/2026-11-02-prediction-fork.md`.
+(2026-11-01 to 2026-11-02). Measurements and the decision record are in
+Tayshun, `tooling/today-predictions/2026-11-02-prediction-fork.md`.
 
 ## Private index
 

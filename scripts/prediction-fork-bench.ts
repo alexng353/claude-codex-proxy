@@ -14,9 +14,18 @@
  * BENCH_EFFORT (override the fork's effort, to test what that does to the cache).
  */
 import { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { accountEnv, listAccounts, type Account } from "../src/accounts";
 import { STRIPPED_ENV } from "../src/claude-env";
 import { FORK_PREDICTION_PROMPT, forkArgs, parseForkResult, type ForkOutcome } from "../src/prediction-fork";
@@ -25,6 +34,22 @@ import { closePredictionModel, prewarmPredictionModel } from "../src/prediction-
 import { closePredictionPreparation, guardPredictionReply } from "../src/prediction-preparation";
 
 const out = process.env.BENCH_OUTPUT ?? join(homedir(), ".cache/composer-predictions/fork-bench.jsonl");
+
+/** Raw chat text only ever goes to a 0600 file in a 0700 directory, whatever was there. */
+function privateFile(path: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  chmodSync(dirname(path), 0o700);
+  if (!existsSync(path)) writeFileSync(path, "", { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+function privateAppend(path: string, text: string): void {
+  privateFile(path);
+  appendFileSync(path, text);
+}
+function privateWrite(path: string, text: string): void {
+  privateFile(path);
+  writeFileSync(path, text);
+}
 const maxPoints = Number(process.env.BENCH_MAX ?? 24);
 const windowMs = Number(process.env.BENCH_WINDOW_MS ?? 55 * 60_000);
 const effortOverride = process.env.BENCH_EFFORT;
@@ -322,7 +347,7 @@ async function measure(point: Point, label: string) {
   // The same point again at low effort, to compare latency on one context.
   const forkLow = process.env.BENCH_PAIR_LOW ? await runFork(point, "low") : undefined;
   const haiku = await runHaiku(point);
-  appendFileSync(
+  privateAppend(
     out,
     JSON.stringify({
       at: Date.now(),
@@ -340,7 +365,6 @@ async function measure(point: Point, label: string) {
       forkLow,
       haiku,
     }) + "\n",
-    { mode: 0o600 },
   );
   console.error(
     `bench ${label}: ${point.human ? "human" : "agent"} fork ${Math.round(fork.totalMs)} ms read ${fork.usage?.cacheReadTokens} write ${fork.usage?.cacheWriteTokens} in ${fork.usage?.inputTokens} ${fork.text ? "suggested" : "none"}${forkLow ? `; low ${Math.round(forkLow.totalMs)} ms read ${forkLow.usage?.cacheReadTokens}` : ""}; haiku ${Math.round(haiku.totalMs)} ms ctx ${haiku.contextChars} ${haiku.text ? "suggested" : "none"}`,
@@ -358,7 +382,22 @@ async function coldQuality() {
   const { fitReplay, replayTokens } = await import("../src/budget");
   const { conversationRequest, prepareClaudePrompt, leadingContextCount } = await import("../src/request");
   const { buildClaudeArgs } = await import("../src/claude");
-  const { threadAccount } = await import("../src/sessions");
+  const { stateDir } = await import("../src/sessions");
+  // Pins are read through a read-only connection; prompt files go to a scratch state dir.
+  const pins = new Database(join(stateDir(), "sessions.sqlite"), { readonly: true });
+  const pinOf = (thread: string) =>
+    (pins.query("SELECT account FROM thread_accounts WHERE thread_id = ?").get(thread) as { account: string } | null)?.account;
+  const scratchState = mkdtempSync(join(tmpdir(), "prediction-bench-state-"));
+  const launchArgs = (request: Parameters<typeof buildClaudeArgs>[0]) => {
+    const live = process.env.PROXY_STATE_DIR;
+    process.env.PROXY_STATE_DIR = scratchState;
+    try {
+      return buildClaudeArgs(request);
+    } finally {
+      if (live === undefined) delete process.env.PROXY_STATE_DIR;
+      else process.env.PROXY_STATE_DIR = live;
+    }
+  };
   const since = Date.now() - Number(process.env.BENCH_COLD_HOURS ?? 48) * 3_600_000;
   const budget = Number(process.env.BENCH_COLD_BUDGET ?? 120_000);
   const perThread = Number(process.env.BENCH_COLD_PER_THREAD ?? 3);
@@ -452,12 +491,12 @@ async function coldQuality() {
     }
     const prepared = await prepareClaudePrompt(conversationRequest(fitted.request));
     const accounts = listAccounts();
-    const account = accounts.find((a) => a.name === threadAccount(engine)) ?? accounts.find((a) => a.isDefault)!;
+    const account = accounts.find((a) => a.name === pinOf(engine)) ?? accounts.find((a) => a.isDefault)!;
     const env = { ...process.env } as Record<string, string>;
     for (const key of STRIPPED_ENV) delete env[key];
     delete env.CLAUDE_CODE_EFFORT_LEVEL;
     const started = performance.now();
-    const child = Bun.spawn([process.env.CLAUDE_BIN ?? join(homedir(), ".local/share/claude/versions/2.1.302"), ...buildClaudeArgs(fitted.request)], {
+    const child = Bun.spawn([process.env.CLAUDE_BIN ?? join(homedir(), ".local/share/claude/versions/2.1.302"), ...launchArgs(fitted.request)], {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
@@ -500,7 +539,7 @@ async function coldQuality() {
     } catch {}
     taken.set(reply.thread_id, (taken.get(reply.thread_id) ?? 0) + 1);
     done++;
-    appendFileSync(
+    privateAppend(
       out,
       JSON.stringify({
         at: Date.now(),
@@ -515,7 +554,6 @@ async function coldQuality() {
         cold: { kind: outcome.kind, reason: outcome.kind === "failed" ? outcome.reason : undefined, text, usage: outcome.usage, totalMs: performance.now() - started },
         haiku: { text: haiku, totalMs: performance.now() - haikuStarted, contextChars: haikuContext.length },
       }) + "\n",
-      { mode: 0o600 },
     );
     console.error(`cold ${done}: ${reply.thread_id.slice(0, 8)} replay ${fitted.tokens} tokens; fork ${outcome.kind}${text ? "" : " (no text)"}; haiku ${haiku ? "suggested" : "none"}`);
   }
@@ -526,7 +564,7 @@ if (process.env.BENCH_JOIN) {
   // Fill in Alex's reply for watched points, once he has written it.
   const rows = readFileSync(out, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const joined = rows.map((row) => ({ ...row, reference: row.reference ?? reference(row.thread, row.cutoff) }));
-  writeFileSync(process.env.BENCH_JOIN, joined.map((row) => JSON.stringify(row)).join("\n") + "\n", { mode: 0o600 });
+  privateWrite(process.env.BENCH_JOIN, joined.map((row) => JSON.stringify(row)).join("\n") + "\n");
   console.error(`joined ${joined.filter((row) => row.reference).length} of ${joined.length} with Alex's reply`);
   process.exit(0);
 }

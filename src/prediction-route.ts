@@ -61,14 +61,15 @@ export type PredictionAttempt = {
   forkMs?: number;
   fork?: ForkOutcome["usage"];
   forkAccount?: string;
+  forkUnmeteredContextTokens?: number;
   haiku?: PredictionTokens;
 };
+/** Each admitted request's record, by an id only that request knows: a duplicate the
+ * service skipped never runs, so it can neither make nor take one. */
 const attempts = new Map<string, PredictionAttempt>();
-const attemptKey = (threadId: unknown, turnId: unknown) => JSON.stringify([threadId, turnId]);
-function takeAttempt(threadId: unknown, turnId: unknown): PredictionAttempt | undefined {
-  const key = attemptKey(threadId, turnId);
-  const attempt = attempts.get(key);
-  attempts.delete(key);
+function takeAttempt(id: string): PredictionAttempt | undefined {
+  const attempt = attempts.get(id);
+  attempts.delete(id);
   return attempt;
 }
 /** Single guarded model boundary for production and the paired holdout. Raw fields
@@ -151,8 +152,10 @@ export function createPredictionService(
     async (input, signal) => {
       if (input.corpusEnabled === true) dependencies.refresh();
       const attempt: PredictionAttempt = { source: "haiku" };
-      attempts.set(attemptKey(input.threadId, input.turnId), attempt);
-      if (attempts.size > 64) attempts.delete(attempts.keys().next().value!);
+      if (typeof input.attemptId === "string") {
+        attempts.set(input.attemptId, attempt);
+        if (attempts.size > 64) attempts.delete(attempts.keys().next().value!);
+      }
       if (dependencies.source() === "fork") {
         if (typeof input.engineThreadId !== "string") attempt.fallback = "no engine thread";
         else {
@@ -161,11 +164,13 @@ export function createPredictionService(
             input.engineThreadId,
             signal,
             input.deadlineMs! - HAIKU_RESERVE_MS,
+            input.context,
           );
-          signal.throwIfAborted();
           attempt.forkMs = Date.now() - started;
           attempt.fork = outcome.usage;
           attempt.forkAccount = outcome.account;
+          if (outcome.kind === "failed") attempt.forkUnmeteredContextTokens = outcome.unmeteredContextTokens;
+          signal.throwIfAborted();
           if (outcome.kind === "declined") {
             attempt.source = "fork";
             return null;
@@ -216,6 +221,10 @@ export async function handlePredictionRoute(
     }
     text += decoder.decode();
     const value = JSON.parse(text);
+    // This request's own key for its usage record (see `attempts`).
+    const attemptId = crypto.randomUUID();
+    const withAttempt =
+      value && typeof value === "object" && !Array.isArray(value) ? { ...value, attemptId } : value;
     const disconnected = new AbortController();
     const signal = AbortSignal.any([request.signal, disconnected.signal]);
     const stream = new ReadableStream<Uint8Array>({
@@ -224,9 +233,9 @@ export async function handlePredictionRoute(
         // Returning the response immediately makes Bun own the stream lifetime;
         // request.signal alone does not observe disconnects while fetch awaits.
         void (engine ?? localService())
-          .predict(value, signal)
+          .predict(withAttempt, signal)
           .then((prediction) => {
-            const attempt = takeAttempt(value?.threadId, value?.turnId);
+            const attempt = takeAttempt(attemptId);
             appendFileSync(
               join(dirname(predictionIndexPath()), "prediction-usage.jsonl"),
               JSON.stringify({
@@ -235,12 +244,16 @@ export async function handlePredictionRoute(
                 // Ids only, so the trial can join Today's accepted line: never text.
                 ...(typeof value?.threadId === "string" ? { threadId: value.threadId } : {}),
                 ...(typeof value?.turnId === "string" ? { turnId: value.turnId } : {}),
-                // Which model answered: the chat's own (fork) or Haiku.
-                model: attempt?.source === "fork" ? "fork" : "haiku",
+                // Which model answered: the chat's own (fork) or Haiku; skipped when the
+                // service refused the request (a duplicate, busy, or invalid).
+                model: attempt ? attempt.source : "skipped",
                 ...(attempt?.fallback ? { fallback: attempt.fallback } : {}),
                 ...(attempt?.forkMs !== undefined ? { forkMs: attempt.forkMs } : {}),
                 ...(attempt?.fork ? { forkUsage: attempt.fork } : {}),
                 ...(attempt?.forkAccount ? { forkAccount: attempt.forkAccount } : {}),
+                ...(attempt?.forkUnmeteredContextTokens !== undefined
+                  ? { forkUnmeteredContextTokens: attempt.forkUnmeteredContextTokens }
+                  : {}),
                 ...(attempt?.haiku ? { haikuUsage: attempt.haiku } : {}),
                 elapsedMs: Date.now() - started,
                 suggested: prediction !== null,
@@ -251,7 +264,7 @@ export async function handlePredictionRoute(
             if (!signal.aborted) {
               controller.enqueue(
                 new TextEncoder().encode(
-                  JSON.stringify({ prediction, source: attempt?.source ?? "haiku" }),
+                  JSON.stringify({ prediction, source: attempt?.source ?? "skipped" }),
                 ),
               );
               controller.close();

@@ -20,12 +20,13 @@ type Row = {
   at: number;
   threadId?: string;
   turnId?: string;
-  model: "fork" | "haiku";
+  model: "fork" | "haiku" | "skipped";
   fallback?: string;
   elapsedMs: number;
   forkMs?: number;
   forkUsage?: Tokens;
   forkAccount?: string;
+  forkUnmeteredContextTokens?: number;
   haikuUsage?: Tokens;
   suggested: boolean;
   cancelled: boolean;
@@ -110,33 +111,60 @@ const calibration = weeklyCalibration();
 const first = rows[0]?.at;
 const last = rows.at(-1)?.at;
 console.log(`attempts ${rows.length}${first ? ` from ${new Date(first).toISOString()} to ${new Date(last!).toISOString()}` : ""}`);
-for (const path of ["fork", "haiku"] as const) {
-  const mine = rows.filter((row) => row.model === path);
+
+/** Rows in the order a reader compares them. Haiku after a fork includes the fork's wait. */
+const groups: Array<[string, (row: Row) => boolean]> = [
+  ["fork answered", (row) => row.model === "fork"],
+  ["fork tried, Haiku answered (end-to-end, fork wait included)", (row) => row.model === "haiku" && !!row.fallback],
+  ["Haiku only (switch off)", (row) => row.model === "haiku" && !row.fallback],
+];
+for (const [name, member] of groups) {
+  const mine = rows.filter(member);
+  if (!mine.length) continue;
   const suggested = mine.filter((row) => row.suggested && !row.cancelled);
   const settled = suggested.map((row) => accepted(row.threadId!, row.turnId!)).filter((x) => x !== undefined);
   const yes = settled.filter(Boolean).length;
   const latency = mine.filter((row) => !row.cancelled).map((row) => row.elapsedMs);
-  console.log(`\n${path}: ${mine.length} attempts, ${suggested.length} suggested, accepted ${yes}/${settled.length} answered` +
+  console.log(`\n${name}: ${mine.length} attempts (${mine.filter((row) => row.cancelled).length} cancelled), ${suggested.length} suggested, accepted ${yes}/${settled.length} answered` +
     (settled.length ? ` (${((100 * yes) / settled.length).toFixed(1)}%)` : ""));
   console.log(`  latency p50 ${pct(latency, 0.5) ?? "-"} ms, p90 ${pct(latency, 0.9) ?? "-"} ms`);
-  if (path === "haiku") {
+  if (mine.some((row) => row.fallback)) {
     const reasons = new Map<string, number>();
-    for (const row of mine) reasons.set(row.fallback ?? "switch off", (reasons.get(row.fallback ?? "switch off") ?? 0) + 1);
-    console.log(`  why Haiku: ${[...reasons].map(([why, n]) => `${why} ${n}`).join(", ")}`);
+    for (const row of mine) if (row.fallback) reasons.set(row.fallback, (reasons.get(row.fallback) ?? 0) + 1);
+    console.log(`  why: ${[...reasons].map(([why, n]) => `${why} ${n}`).join(", ")}`);
   }
-  const tokens = { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
-  const byAccount = new Map<string, number>();
-  // A fork that fell back to Haiku still spent its tokens: count every fork run.
+}
+const skipped = rows.filter((row) => row.model === "skipped").length;
+if (skipped) console.log(`\nskipped (duplicate, busy or invalid): ${skipped}`);
+
+// Every fork that ran, answered or not: its own latency, and what it spent.
+const forks = rows.filter((row) => row.forkUsage || row.forkUnmeteredContextTokens !== undefined);
+const forkLatency = forks.map((row) => row.forkMs).filter((ms): ms is number => ms !== undefined);
+console.log(`\nforks run: ${forks.length}, fork latency p50 ${pct(forkLatency, 0.5) ?? "-"} ms, p90 ${pct(forkLatency, 0.9) ?? "-"} ms`);
+const total = (pick: (row: Row) => Tokens | undefined) => {
+  const sum = { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
   for (const row of rows) {
-    const usage = path === "fork" ? row.forkUsage : row.haikuUsage;
-    if (!usage) continue;
-    for (const key of Object.keys(tokens) as Array<keyof Tokens>) tokens[key] += usage[key];
-    if (path === "fork" && row.forkAccount) byAccount.set(row.forkAccount, (byAccount.get(row.forkAccount) ?? 0) + units(usage));
+    const usage = pick(row);
+    if (usage) for (const key of Object.keys(sum) as Array<keyof Tokens>) sum[key] += usage[key];
   }
-  console.log(`  tokens: uncached input ${tokens.inputTokens}, cache read ${tokens.cacheReadTokens}, cache write ${tokens.cacheWriteTokens}, output ${tokens.outputTokens}`);
-  for (const [account, spent] of byAccount) {
-    const per1 = calibration.get(account);
-    console.log(`  ${account}: ${Math.round(spent)} units` + (per1 ? ` = ~${(spent / per1).toFixed(3)}% of its weekly window (estimate from this proxy's log)` : ""));
-  }
+  return sum;
+};
+for (const [name, tokens] of [["fork", total((row) => row.forkUsage)], ["haiku", total((row) => row.haikuUsage)]] as const)
+  console.log(`${name} tokens: uncached input ${tokens.inputTokens}, cache read ${tokens.cacheReadTokens}, cache write ${tokens.cacheWriteTokens}, output ${tokens.outputTokens}`);
+const unmetered = rows.filter((row) => row.forkUnmeteredContextTokens !== undefined);
+if (unmetered.length)
+  console.log(`unmetered forks (ran, no usage reported): ${unmetered.length}, up to ${unmetered.reduce((sum, row) => sum + row.forkUnmeteredContextTokens!, 0)} context tokens, counted below as cache reads`);
+const byAccount = new Map<string, { metered: number; bound: number }>();
+for (const row of forks) {
+  if (!row.forkAccount) continue;
+  const spent = byAccount.get(row.forkAccount) ?? { metered: 0, bound: 0 };
+  if (row.forkUsage) spent.metered += units(row.forkUsage);
+  else spent.bound += row.forkUnmeteredContextTokens! * WEIGHT.read;
+  byAccount.set(row.forkAccount, spent);
+}
+for (const [account, spent] of byAccount) {
+  const per1 = calibration.get(account);
+  const share = (value: number) => (per1 ? `~${(value / per1).toFixed(3)}%` : "?%");
+  console.log(`  ${account}: ${Math.round(spent.metered)} units metered (${share(spent.metered)} of its weekly window), up to ${Math.round(spent.metered + spent.bound)} with unmetered forks (${share(spent.metered + spent.bound)}); estimates from this proxy's log`);
 }
 db.close();
