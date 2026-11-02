@@ -504,8 +504,9 @@ export async function gateRequest(request: ResponsesRequest, origin: GateOrigin 
     const state = loadState();
     const turn = classifyTurn(request, state.extraGatedTriggers);
     if (turn.type !== "human") return forward(reapply(request, state));
-    // Never lock a turn on a gym miss from a stale read of Uplifting.
-    await refreshIfDeciding(gymHost, state.gym).catch(() => {});
+    // Read Uplifting first if a gym deadline has passed, bounded to 5 s in all.
+    // Skipped while a photo is checked: the instant "checking" reply comes first.
+    if (!photoChecking(statePath())) await refreshIfDeciding(gymHost, state.gym);
     const checking = checkingReply(request, turn, loadState(), origin);
     if (checking) return checking;
     return await serialized(() => decideHumanTurn(request, turn, origin));
@@ -674,7 +675,23 @@ async function mutateGym<T>(edit: (gym: GymState, now: number) => { changed: boo
 
 export const gymHost: GymSyncHost = {
   now: () => deps.now(),
-  hasGym: () => !gateDisabled() && !remoteGate() && !!loadState().gym?.plans.length,
+  hasGym: () => {
+    try {
+      return !gateDisabled() && !remoteGate() && !!loadState().gym?.plans.length;
+    } catch {
+      return false;
+    }
+  },
+  neededSince: () => {
+    try {
+      const gym = loadState().gym;
+      const early = gymSettings(gym).earlyMin * 60_000;
+      const open = evaluateGym(gym, deps.now()).filter((r) => r.status === "missed" || r.status === "upcoming" || r.status === "in-progress");
+      return open.length ? Math.min(...open.map((r) => Date.parse(r.plan.start) - early)) : null;
+    } catch {
+      return null;
+    }
+  },
   apply: (edit) => mutateGym((gym, now) => ({ changed: edit(gym, now), result: undefined }), "gym session"),
 };
 
@@ -744,7 +761,8 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   if (path === "/plans") {
     const start = text(body.start, 40);
     if (!start) return Response.json({ error: "start (ISO time) is required" }, { status: 400 });
-    const grace = body.grace_min === undefined ? undefined : Number(body.grace_min);
+    // Models often send null for an omitted optional: treat it as "use the default".
+    const grace = typeof body.grace_min === "number" ? body.grace_min : body.grace_min == null ? undefined : NaN;
     return plan({ action: "add", start, graceMin: grace, note, by });
   }
   const edit = /^\/plans\/([A-Za-z0-9-]+)\/(move|cancel)$/.exec(path);
@@ -755,7 +773,7 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     return plan({ action: "move", id: edit[1], start, note, by });
   }
   if (path === "/settings") {
-    const grace = Number(body.grace_min);
+    const grace = typeof body.grace_min === "number" ? body.grace_min : NaN;
     if (!Number.isInteger(grace) || grace < 0 || grace > 360)
       return Response.json({ error: "grace_min must be a whole number of minutes, 0-360" }, { status: 400 });
     const settings = await mutateGym((gym) => {
@@ -769,7 +787,9 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     return Response.json(gymReport());
   }
   // Hand credit for a session verified outside the gate (e.g. the first night,
-  // before Uplifting reported locations). Kept off the MCP tool on purpose.
+  // before Uplifting reported locations). Kept off the MCP tool so a chat isn't
+  // offered it; like every /hygiene route it is a trusted local route, not a
+  // security boundary (the state file is editable too).
   if (path === "/sessions/credit") {
     const reason = text(body.reason, 300);
     const startMs = Date.parse(String(body.start));
@@ -777,6 +797,7 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     if (!by || !reason) return Response.json({ error: "by and reason are required" }, { status: 400 });
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs)
       return Response.json({ error: "start and end must be ISO times, end after start" }, { status: 400 });
+    if (endMs > deps.now()) return Response.json({ error: "a credited session must already have ended" }, { status: 400 });
     const session = await mutateGym((gym, now) => {
       const id = text(body.workout_id, 80) ?? `manual:${gym.sessions.filter((s) => s.manual).length + 1}`;
       if (gym.sessions.some((s) => s.id === id)) gym.sessions = gym.sessions.filter((s) => s.id !== id);

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_GYM_SETTINGS, type UpliftingFeed } from "../src/gym";
-import { setGymFetcher } from "../src/gym-sync";
+import { refreshIfDeciding, setGymFetcher, startGymSync } from "../src/gym-sync";
 import { zonedTime } from "../src/hygiene";
 import { gateRequest, handleHygieneRoute, resetGateCache, setGateDeps } from "../src/hygiene-gate";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
@@ -160,6 +160,11 @@ describe("gym on the gate", () => {
     await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
     clock = at(DAY, "18:31");
     expect(await reply("hi")).toContain("gate armed");
+    // A session that hasn't ended yet can't be credited.
+    expect(
+      (await route("/hygiene/gym/sessions/credit", { by: "cli", reason: "x", start: iso(at(DAY, "18:40")), end: iso(at(DAY, "19:40")) })).body,
+    ).toEqual({ error: "a credited session must already have ended" });
+    clock = at(DAY, "19:45");
     expect((await route("/hygiene/gym/sessions/credit", { by: "cli", start: iso(at(DAY, "18:40")), end: iso(at(DAY, "19:40")) })).status).toBe(400);
     const credited = await route("/hygiene/gym/sessions/credit", {
       by: "cli",
@@ -169,7 +174,61 @@ describe("gym on the gate", () => {
       workout_id: "w-hand",
     });
     expect(credited.body).toMatchObject({ ok: true, session: { id: "w-hand", manual: { by: "cli" } } });
-    clock = at(DAY, "19:45");
     expect(await reply("hi")).toBe("forwarded");
+  });
+
+  test("a failed read after a miss stops the gym lock (fail open), photos untouched", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    clock = at(DAY, "18:31");
+    expect(await reply("hi")).toContain("gate armed");
+    uplifting = new Error("Uplifting answered 502");
+    clock = at(DAY, "18:35");
+    await route("/hygiene/gym/sync", {});
+    expect(await reply("hi")).toBe("forwarded");
+    expect((await route("/hygiene/gym")).body.plans[0].status).toBe("missed");
+  });
+
+  test("a read older than 10 minutes can't lock", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")) });
+    clock = at(DAY, "18:31");
+    await route("/hygiene/gym/sync", {});
+    // Uplifting stops answering in time; the refresh gives up after 5 s.
+    setGymFetcher(() => new Promise(() => {}));
+    clock = at(DAY, "18:42");
+    const started = Date.now();
+    expect(await reply("hi")).toBe("forwarded");
+    expect(Date.now() - started).toBeLessThan(6_500);
+  }, 10_000);
+
+  test("grace_min null means the default, not zero", async () => {
+    const added = await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), grace_min: null });
+    expect(added.body).toMatchObject({ ok: true, plan: { graceMin: 30 } });
+    expect((await route("/hygiene/gym/settings", { grace_min: null })).status).toBe(400);
+    expect((await route("/hygiene/gym/plans", { start: iso(at(DAY, "19:00")), grace_min: "10" })).status).toBe(400);
+  });
+
+  test("the poller never throws on a broken state file", async () => {
+    await writeFile(process.env.HYGIENE_GATE_STATE!, "{broken");
+    resetGateCache();
+    const { gymHost } = await import("../src/hygiene-gate");
+    let stop: (() => Promise<void>) | undefined;
+    expect(() => {
+      stop = startGymSync(gymHost, 60_000);
+    }).not.toThrow();
+    await stop!();
+    expect(gymHost.neededSince()).toBeNull();
+  });
+
+  test("the decision refresh is bounded even when saving waits on the gate's lock", async () => {
+    const now = at(DAY, "18:40");
+    const host = { now: () => now, hasGym: () => true, neededSince: () => null, apply: () => new Promise<void>(() => {}) };
+    const gym = {
+      plans: [{ id: "p", start: iso(at(DAY, "18:00")), graceMin: 30, status: "planned" as const, createdAt: iso(at(DAY, "12:00")), log: [] }],
+      sessions: [],
+      checkins: [],
+    };
+    const started = Date.now();
+    await refreshIfDeciding(host, gym, 60_000, 200);
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

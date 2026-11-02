@@ -11,6 +11,8 @@ import { stateDir } from "./sessions";
 
 export const DEFAULT_UPLIFTING_URL = "https://uplifting-api-mobile-production.up.railway.app";
 const LOOKBACK_MS = 14 * 86_400_000;
+/** Uplifting's feed answers at most this far back (uplifting apps/api/src/routes/gate.ts). */
+const MAX_LOOKBACK_MS = 60 * 86_400_000;
 
 export type FeedFetcher = (fromIso: string, signal: AbortSignal) => Promise<UpliftingFeed>;
 
@@ -40,6 +42,8 @@ export const httpFetcher: FeedFetcher = async (fromIso, signal) => {
 export type GymSyncHost = {
   now: () => number;
   hasGym: () => boolean;
+  /** Start of the oldest window a still-unresolved plan needs, or null. */
+  neededSince: () => number | null;
   /** Saves under the gate's lock and releases held chats when the gate opens. */
   apply: (edit: (gym: GymState, now: number) => boolean) => Promise<void>;
 };
@@ -63,11 +67,15 @@ export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
   if (inflight) return inflight;
   const started = host.now();
   lastAttempt = started;
+  // Reach back to the oldest unresolved plan, so a long outage can't turn a
+  // session outside the default window into a miss.
+  const needed = host.neededSince();
+  const from = Math.max(started - MAX_LOOKBACK_MS, Math.min(started - LOOKBACK_MS, needed ?? Infinity));
   inflight = (async () => {
     let feed: UpliftingFeed | null = null;
     let error: string | null = null;
     try {
-      feed = await fetcher(new Date(started - LOOKBACK_MS).toISOString(), AbortSignal.timeout(timeoutMs));
+      feed = await fetcher(new Date(from).toISOString(), AbortSignal.timeout(timeoutMs));
     } catch (e) {
       error = (e as Error).name === "TimeoutError" ? "Uplifting timed out" : (e as Error).message.slice(0, 200);
     }
@@ -91,7 +99,9 @@ export function syncGym(host: GymSyncHost, timeoutMs = 15_000): Promise<void> {
 
 /**
  * Read now if a plan's deadline has passed and the last read is older than
- * `maxAgeMs`, so a turn is never locked on a stale copy. Bounded by `timeoutMs`.
+ * `maxAgeMs`. The whole wait, including the gate's lock, is bounded by
+ * `timeoutMs`; after that the turn is decided on what the gate has, and a
+ * stale copy can't lock (gym.ts FRESH_READ_MS). Never throws.
  */
 export async function refreshIfDeciding(
   host: GymSyncHost,
@@ -106,19 +116,30 @@ export async function refreshIfDeciding(
   );
   const fresh = gym.syncedAt && now - Date.parse(gym.syncedAt) < maxAgeMs;
   if (!pending || fresh || now - lastAttempt < maxAgeMs / 4) return;
-  await syncGym(host, timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    syncGym(host, timeoutMs).catch(() => {}),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+  clearTimeout(timer);
 }
 
-/** Polls while there are plans. Returns a stop function. */
+/** Polls while there are plans. Never throws: the gate fails open. Returns a stop function. */
 export function startGymSync(host: GymSyncHost, intervalMs = 2 * 60_000): () => Promise<void> {
   const tick = () => {
-    if (host.hasGym()) void syncGym(host);
+    try {
+      if (host.hasGym()) syncGym(host).catch((e) => console.error("gym-sync: poll failed:", (e as Error).message));
+    } catch (e) {
+      console.error("gym-sync: poll failed:", (e as Error).message);
+    }
   };
   tick();
   const timer = setInterval(tick, intervalMs);
   timer.unref();
   return async () => {
     clearInterval(timer);
-    await inflight;
+    await inflight?.catch(() => {});
   };
 }

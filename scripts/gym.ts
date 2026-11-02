@@ -52,11 +52,11 @@ async function main() {
       const [id, when] = positional;
       if (!id) fail("move needs a plan id");
       const start = parseStart(when ?? "") ?? fail("move needs a new start");
-      return show(await gymCall(`/plans/${id}/move`, { start, by, note }));
+      return show(await gymCall(`/plans/${encodeURIComponent(id)}/move`, { start, by, note }));
     }
     case "cancel":
       if (!positional[0]) fail("cancel needs a plan id");
-      return show(await gymCall(`/plans/${positional[0]}/cancel`, { by, note }));
+      return show(await gymCall(`/plans/${encodeURIComponent(positional[0])}/cancel`, { by, note }));
     case "grace": {
       const r = await gymCall("/settings", { grace_min: Number(positional[0]) });
       if (r.status >= 400) fail(r.body?.error ?? `failed (${r.status})`);

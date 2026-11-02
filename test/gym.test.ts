@@ -97,8 +97,34 @@ describe("plans and the deadline", () => {
     feed(gym, at(DAY, "18:10"), { checkins: [checkin("c1", "start", at(DAY, "18:05"))] });
     feed(gym, at(DAY, "22:04"), {});
     expect(statusAt(gym, at(DAY, "22:04"))).toEqual(["in-progress"]);
+    // Past the 4 hours, but the last read is from before then: no evidence yet.
+    expect(statusAt(gym, at(DAY, "22:06"))).toEqual(["upcoming"]);
     feed(gym, at(DAY, "22:06"), {});
     expect(evaluateGym(gym, at(DAY, "22:06"))[0]).toMatchObject({ status: "missed", reason: "started, never finished" });
+  });
+
+  test("a new plan can't take the session that made up an older miss", () => {
+    const { gym } = planned();
+    feed(gym, at(DAY, "18:31"), {});
+    const later = at("2026-11-06", "19:05");
+    feed(gym, later, {
+      checkins: [checkin("c2", "start", at("2026-11-06", "18:00")), checkin("c2", "finish", at("2026-11-06", "19:00"))],
+      workouts: [workout("w2", "c2", at("2026-11-06", "18:00"), at("2026-11-06", "19:00"))],
+    });
+    expect(statusAt(gym, later)).toEqual(["made-up"]);
+    // Planned at 19:05 for 20:05: the 18:00 session is in its early window but predates it.
+    editPlan(gym, { action: "add", start: iso(at("2026-11-06", "20:05")) }, later);
+    expect(statusAt(gym, later)).toEqual(["made-up", "upcoming"]);
+  });
+
+  test("a stale or failed read never locks, though the plan shows as missed", () => {
+    const { gym } = planned();
+    feed(gym, at(DAY, "18:31"), {});
+    expect(gymOutstanding(gym, at(DAY, "18:31"))).toHaveLength(1);
+    expect(gymOutstanding(gym, at(DAY, "18:42"))).toEqual([]);
+    gym.syncError = "Uplifting timed out";
+    expect(gymOutstanding(gym, at(DAY, "18:32"))).toEqual([]);
+    expect(statusAt(gym, at(DAY, "18:32"))).toEqual(["missed"]);
   });
 
   test("a qualifying session later makes up a miss; one session never counts twice", () => {
@@ -219,6 +245,23 @@ describe("Uplifting feed", () => {
     expect(pruneGym(gym, later)).toBe(true);
     expect(gym.sessions).toEqual([]);
     expect(evaluateGym(gym, later)[0]).toMatchObject({ status: "kept", sessionId: "w1" });
+  });
+
+  test("pruning a session that started before its plan settles the plan first", () => {
+    const { gym } = planned();
+    // Arrived early: Start at 17:50 for the 18:00 plan.
+    feed(gym, at(DAY, "19:30"), {
+      checkins: [checkin("c1", "start", at(DAY, "17:50")), checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("w1", "c1", at(DAY, "17:50"), at(DAY, "19:00"))],
+    });
+    // Step through the window where the session is past the cutoff but the plan isn't.
+    for (const minutes of [0, 5, 10]) {
+      const now = at(DAY, "17:50") + 60 * 86_400_000 + minutes * 60_000;
+      gym.syncedAt = iso(now);
+      pruneGym(gym, now);
+      expect(evaluateGym(gym, now)[0]).toMatchObject({ status: "kept", sessionId: "w1" });
+    }
+    expect(gym.plans[0].settled).toMatchObject({ status: "kept", sessionId: "w1" });
   });
 });
 

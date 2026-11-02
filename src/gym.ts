@@ -160,14 +160,26 @@ function checkinFor(gym: GymState, clientId: string, kind: "start" | "finish"): 
 
 const atGym = (gym: GymState, c: GymCheckin) => c.distanceM !== null && c.distanceM <= gymSettings(gym).gym.radiusM;
 
+/** When the plan last took its current start (its add or latest move). */
+function plannedAt(plan: GymPlan): number {
+  const edit = [...plan.log].reverse().find((e) => e.action === "add" || e.action === "move");
+  return edit ? ms(edit.at) : ms(plan.createdAt);
+}
+
 /**
  * Every plan's status at `now`, oldest first. A session keeps at most one
  * plan. A plan is kept by a qualifying session that starts between `earlyMin`
- * before it and its deadline; a Start at the gym in that window holds it open
- * until the Finish arrives (or `maxOpenMin` passes). Missed plans are then made
- * up, oldest first, by unused qualifying sessions that started after the
- * plan's window opened. A cancel recorded after the planned start changes
- * nothing: the plan stands, so skipping it is a miss.
+ * before it and its deadline, and after the plan was made or last moved (so a
+ * new plan can't take a session that already made up an older miss); a Start
+ * at the gym in that window holds it open until the Finish arrives (or
+ * `maxOpenMin` passes). Missed plans are then made up, oldest first, by unused
+ * qualifying sessions that started after the plan's window opened. A cancel
+ * recorded after the planned start changes nothing: the plan stands, so
+ * skipping it is a miss.
+ *
+ * A miss needs evidence: a read of Uplifting from after the moment the plan
+ * failed (its deadline, or the end of an unfinished Start's 4 hours). Without
+ * one the plan waits. `gymOutstanding` also refuses to lock on a stale read.
  */
 export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[] {
   if (!gym) return [];
@@ -191,7 +203,8 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       continue;
     }
     const opens = start - s.earlyMin * MIN;
-    const inWindow = (iso: string) => ms(iso) >= opens && ms(iso) <= deadline;
+    const from = Math.max(opens, plannedAt(plan));
+    const inWindow = (iso: string) => ms(iso) >= from && ms(iso) <= deadline;
     const keeper = checks.find((c) => c.qualifies && !used.has(c.session.id) && inWindow(c.session.start));
     if (keeper) {
       used.add(keeper.session.id);
@@ -201,14 +214,15 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
     const started = gym.checkins
       .filter((c) => c.kind === "start" && atGym(gym, c) && inWindow(c.at) && ms(c.at) <= now)
       .sort((a, b) => ms(a.at) - ms(b.at));
-    const open = started.find((c) => !finishedClients.has(c.clientId) && now < ms(c.at) + s.maxOpenMin * MIN);
+    const unfinished = started.filter((c) => !finishedClients.has(c.clientId));
+    const open = unfinished.find((c) => now < ms(c.at) + s.maxOpenMin * MIN);
     if (open) {
       results.push({ plan, status: "in-progress", deadline });
       continue;
     }
-    // A miss needs evidence: Uplifting read after the deadline. While it can't
-    // be reached the plan waits, so an outage never locks the gate.
-    if (now < deadline || !(gym.syncedAt && ms(gym.syncedAt) >= deadline)) {
+    // Evidence of a miss: a read from after the moment the plan failed.
+    const failedAt = Math.max(deadline, ...unfinished.map((c) => ms(c.at) + s.maxOpenMin * MIN));
+    if (now < deadline || !(gym.syncedAt && ms(gym.syncedAt) >= failedAt)) {
       results.push({ plan, status: "upcoming", deadline });
       continue;
     }
@@ -258,8 +272,16 @@ export type GymRequirement = { slot: string; kind: "gym"; label: string };
 
 export const gymSlot = (planId: string) => `gym/${planId}`;
 
-/** Missed plans not yet made up: these lock the gate. */
+/** Polls run every 2 minutes; a read older than this can't lock the gate. */
+export const FRESH_READ_MS = 10 * MIN;
+
+/**
+ * Missed plans not yet made up: these lock the gate, but only on a fresh,
+ * successful read of Uplifting. A failed or stale read fails open for the gym
+ * (a make-up could have happened since), never for the photo checks.
+ */
 export function gymOutstanding(gym: GymState | undefined, now: number): GymRequirement[] {
+  if (!gym?.syncedAt || gym.syncError || now - ms(gym.syncedAt) > FRESH_READ_MS) return [];
   return evaluateGym(gym, now)
     .filter((r) => r.status === "missed")
     .map((r) => ({
@@ -432,9 +454,13 @@ export function mergeFeed(gym: GymState, feed: UpliftingFeed, now: number): bool
 export function pruneGym(gym: GymState, now: number): boolean {
   const cutoff = now - KEEP_DAYS * 86_400_000;
   const results = evaluateGym(gym, now);
+  const sessionStart = new Map(gym.sessions.map((x) => [x.id, ms(x.start)]));
   let changed = false;
   for (const r of results) {
-    if ((r.status === "kept" || r.status === "made-up") && !r.plan.settled && ms(r.plan.start) < cutoff) {
+    if (r.status !== "kept" && r.status !== "made-up") continue;
+    if (r.plan.settled) continue;
+    // Settle before pruning either the plan's day or its session (which can start before the plan).
+    if (Math.min(ms(r.plan.start), sessionStart.get(r.sessionId!) ?? Infinity) < cutoff) {
       r.plan.settled = { status: r.status, sessionId: r.sessionId!, at: new Date(now).toISOString() };
       changed = true;
     }
