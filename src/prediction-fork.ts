@@ -269,6 +269,22 @@ async function findAnswerCheckpoint(sessionId: string, answer: string): Promise<
   return undefined;
 }
 
+/** Test seam: runs between the checkpoint read and the spawn. */
+export const forkTestHooks: { afterCheckpoint?: () => void } = {};
+
+/**
+ * Whether `source` is still this chat's record and its worker the last to park the chat
+ * on any proxy copy. The same words can end two turns, so the digest alone is not enough.
+ */
+function stillCurrent(threadId: string, source: ForkSource): boolean {
+  if (sources.get(threadId) !== source) return false;
+  try {
+    return threadParkSession(threadId) === source.sessionId;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Predict Alex's next message in `threadId` (Codex's thread id, the requests'
  * `prompt_cache_key`) from a fork of its parked session. Never throws.
@@ -285,21 +301,16 @@ export async function forkPrediction(
   // A newer turn may have finished on another proxy copy: fork only the answer Alex saw.
   if (!answerSha256 || !source.answer.trim() || answerSha256 !== answerDigest(source.answer))
     return { kind: "failed", reason: "stale" };
-  // The same words can end two turns: also require that no worker, on this proxy copy
-  // or the other, has parked the chat since this one did.
-  let latest: string | undefined;
-  try {
-    latest = threadParkSession(threadId);
-  } catch {
-    latest = undefined;
-  }
-  if (latest !== source.sessionId) return { kind: "failed", reason: "stale" };
+  if (!stillCurrent(threadId, source)) return { kind: "failed", reason: "stale" };
   if (isUnavailable(source.account)) return { kind: "failed", reason: "account unavailable" };
   if (source.contextTokens > maxContextTokens()) return { kind: "failed", reason: "context too large" };
   // No StructuredOutput this turn (claude.ts fell back to the result text): nothing to resume at.
   if (source.checkpointText === undefined) return { kind: "failed", reason: "no checkpoint" };
   const checkpoint = await answerCheckpoint(source.sessionId, source.checkpointText);
   if (!checkpoint) return { kind: "failed", reason: "no checkpoint" };
+  forkTestHooks.afterCheckpoint?.();
+  // The read awaited: the worker may have started a turn (for this chat or another) since.
+  if (!stillCurrent(threadId, source)) return { kind: "failed", reason: "stale" };
   // Checked after the last await: runFork adds its abort listener before awaiting anything.
   if (signal.aborted) return { kind: "failed", reason: "cancelled" };
   if (deadlineMs <= Date.now()) return { kind: "failed", reason: "timed out" };

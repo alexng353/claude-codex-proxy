@@ -239,7 +239,25 @@ test("a worker that moves on to another chat retires the first chat's fork recor
     });
     expect((await lines(join(root, "launches.jsonl"))).filter((launch) => !launch.fork)).toHaveLength(1);
     // The first chat's record named that session, whose transcript has moved on.
-    expect(await forkPrediction(first, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed" });
+    expect(await forkPrediction(first, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "no session" });
+    expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
+  });
+});
+
+test("a record retired while its checkpoint is being read makes no fork", async () => {
+  await withProxyState({ text: "ship it", tool_calls: [] }, async (root) => {
+    const { runClaude } = await import("../src/claude");
+    const { forkPrediction, forkTestHooks, retireForkSourcesOf } = await import("../src/prediction-fork");
+    const thread = crypto.randomUUID();
+    await runClaude({ model: "sonnet", input: "go", prompt_cache_key: thread });
+    const [worker] = await lines(join(root, "launches.jsonl"));
+    // The worker starts another turn (for another chat) while the transcript is read.
+    forkTestHooks.afterCheckpoint = () => retireForkSourcesOf(worker.argv[worker.argv.indexOf("--session-id") + 1]);
+    try {
+      expect(await forkPrediction(thread, new AbortController().signal, Date.now() + 5000, DONE)).toMatchObject({ kind: "failed", reason: "stale" });
+    } finally {
+      forkTestHooks.afterCheckpoint = undefined;
+    }
     expect((await lines(join(root, "launches.jsonl"))).some((launch) => launch.fork)).toBe(false);
   });
 });

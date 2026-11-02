@@ -46,13 +46,16 @@ const out = process.env.BENCH_OUTPUT ?? join(homedir(), ".cache/composer-predict
  */
 function privateFd(path: string, truncate = false): number {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const { O_WRONLY, O_CREAT, O_APPEND, O_TRUNC, O_NOFOLLOW } = constants;
-  const fd = openSync(path, O_WRONLY | O_CREAT | O_NOFOLLOW | (truncate ? O_TRUNC : O_APPEND), 0o600);
-  if (!fstatSync(fd).isFile()) {
+  // O_NONBLOCK: a FIFO with no reader fails at once (ENXIO) instead of hanging the open.
+  const { O_WRONLY, O_CREAT, O_APPEND, O_TRUNC, O_NOFOLLOW, O_NONBLOCK } = constants;
+  const fd = openSync(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | (truncate ? O_TRUNC : O_APPEND), 0o600);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error(`bench output ${path} is not a regular file`);
+    fchmodSync(fd, 0o600);
+  } catch (error) {
     closeSync(fd);
-    throw new Error(`bench output ${path} is not a regular file`);
+    throw error;
   }
-  fchmodSync(fd, 0o600);
   return fd;
 }
 function privateFile(path: string): void {

@@ -43,9 +43,13 @@ A fork runs only when both of these hold:
   copy, which `thread_parks` in the shared `sessions.sqlite` records.
 
 Otherwise the fork is `stale`. Either a newer turn finished elsewhere, even
-one that ended with the same words, or the daemon sent no digest. During a
-deploy that mixes in a copy without `thread_parks`, that copy's turns are not
-recorded there.
+one that ended with the same words, or the daemon sent no digest. The record
+is checked again after the transcript read, because the worker may have
+started another turn meanwhile.
+
+Both proxy slots must run this code while the switch is on. A copy without
+`thread_parks` does not record its turns there, so after an answer with the
+same words the other copy could fork an older turn.
 
 The resume point is the transcript entry that accepted that same answer, as the
 model wrote it, before the proxy's rewrites. It is found in the transcript's
