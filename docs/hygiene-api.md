@@ -100,6 +100,16 @@ Cairn's app shield sends this when Alex taps "Emergency, 15 min", possibly long 
 - **Clear gate:** nothing opens and no debt is made (`applied: false`, `debt_id: null`).
 - **Response 200:** `{ ok: true, applied, duplicate, until: ISO | null, debt_id: string | null, gate: <same shape as GET /status> }`. **400** `{error}` for bad input, **401/403** for auth, **503** while the gate is disabled.
 
+## Phone wake (proxy to Cairn relay)
+
+The proxy wakes Cairn on the phone when the shield should change, so the Screen Time shield follows the gate without Alex opening the app (`src/phone-wake.ts`, added 2026-11-02).
+
+- **What triggers it:** every 15 s the authority proxy reads its shield signature, `state` from GET /status plus `bypass.active_until`. When that differs from the last one the relay accepted, it sends a wake. Followers never send.
+- **The call:** `POST $CAIRN_GATE_WAKE_URL` (default `https://truenas-scale.taildf19.ts.net:8787/v1/gate/wake`) with body `{}` and `Authorization: Bearer <token>`. The token is read at call time from `$CAIRN_GATE_WAKE_TOKEN_FILE` (default `~/.config/cairn/gate-wake.token`). With no file, wakes are off and that is logged once. The push carries nothing; the phone reads GET /status.
+- **Answers:** 2xx records the signature as sent. 429 waits `Retry-After` seconds (1-600; anything else counts as a failure). Any other status or no answer backs off 30 s, doubling to 10 min, and retries with the newest signature.
+- **Two copies during a handoff** share `phone-wake.json` beside the gate state under a lock, with a 15 s send claim, so only one sends.
+- `HYGIENE_PHONE_WAKE=off` turns it off. A failed wake never changes the gate; the phone also refreshes on open and on its own schedule.
+
 ## GET /photos?from=YYYY-MM-DD&to=YYYY-MM-DD
 
 Accepted proofs grouped by day, newest day first. This feeds the "photo a day" view. `to` defaults to today and `from` to 29 days before `to`.

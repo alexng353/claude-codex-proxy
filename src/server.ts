@@ -4,7 +4,7 @@ import { startAuthWarnings } from "./auth-health";
 import { handleRequest } from "./app";
 import { drainBlockedTasks } from "./blocked-tasks";
 import { remoteGate, startPhotoRetries } from "./hygiene-remote";
-import { startGymPolling, startWakeRetries } from "./hygiene-gate";
+import { startGymPolling, startPhoneWakes, startWakeRetries } from "./hygiene-gate";
 import { pinsToken } from "./pins";
 import { closeIdleWorkers } from "./claude";
 import { healthInfo, isDraining, runningCommit, setDraining } from "./handoff";
@@ -53,6 +53,8 @@ const stopPhotoRetries = startPhotoRetries(remoteGate() ?? `http://127.0.0.1:${p
 const stopWakeRetries = startWakeRetries();
 // Reads gym sessions from Uplifting while there are plans (gym-sync.ts).
 const stopGym = startGymPolling();
+// Wakes Cairn on the phone when the gate locks or clears, for the Screen Time shield (phone-wake.ts).
+const stopPhoneWakes = startPhoneWakes();
 const stopWeights = startWeightWorker();
 // Runtime Intl vs the system zone database for Vancouver: logs, pages once (zone-check.ts).
 const stopZoneCheck = startZoneCheck();
@@ -73,6 +75,7 @@ async function drain(signal: string): Promise<void> {
   const photosDone = stopPhotoRetries();
   const wakesDone = stopWakeRetries();
   const gymDone = stopGym();
+  const phoneWakesDone = stopPhoneWakes();
   stopZoneCheck();
   let weightsDone = false;
   void stopWeights().finally(() => (weightsDone = true));
@@ -96,6 +99,7 @@ async function drain(signal: string): Promise<void> {
   await photosDone;
   await wakesDone;
   await gymDone;
+  await phoneWakesDone;
   // Requests are done, so no new recording starts; finish the ones (and pages) in flight.
   await drainBlockedTasks();
   console.log("Drained: every request finished");

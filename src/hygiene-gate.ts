@@ -91,6 +91,7 @@ import {
   whileChecking,
   type WakeSender,
 } from "./hygiene-wake";
+import { relaySender, startPhoneWake, wakeFilePath, type PhoneWakeSender } from "./phone-wake";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -754,6 +755,28 @@ export const gymHost: GymSyncHost = {
 export function startGymPolling(intervalMs?: number): () => Promise<void> {
   if (remoteGate()) return async () => {};
   return startGymSync(gymHost, intervalMs);
+}
+
+/**
+ * What the phone's shield depends on: whether the gate is armed, and when a
+ * bypass ends (the phone schedules its own re-lock from it). A change here
+ * wakes Cairn (phone-wake.ts).
+ */
+export function shieldSignature(): string {
+  const status = gateStatus();
+  return `${status.state}|${status.bypass.activeUntil ?? ""}`;
+}
+
+/** Wakes Cairn when the shield signature changes (authority only; never under tests). */
+export function startPhoneWakes(send: PhoneWakeSender = relaySender(), intervalMs?: number): () => Promise<void> {
+  if (remoteGate() || process.env.NODE_ENV === "test") return async () => {};
+  return startPhoneWake(
+    () => wakeFilePath(statePath()),
+    () => (remoteGate() ? null : shieldSignature()),
+    () => deps.now(),
+    send,
+    intervalMs,
+  );
 }
 
 /** Plans with their status, recent sessions and whether each counted. */
