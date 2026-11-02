@@ -478,13 +478,37 @@ const SHIELD_MAX_AGE_MS = 24 * 3_600_000;
 const SHIELD_KEEP_MS = 7 * 86_400_000;
 
 /**
+ * A shield tap at `anchor` cost nothing, judged only from facts with times:
+ * - a bypass that had already started covered it (the newest bypass started
+ *   at or before the tap and its end is after it), or
+ * - nothing locks the gate now (evaluated at the present, where every check
+ *   is exact, so the gym still fails open without a fresh read) and nothing
+ *   that could have cleared a lock happened after the tap: no proof accepted,
+ *   no penance paid, no gym session seen, no DELAY started.
+ */
+function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
+  const starts = state.bypass.history.map(Date.parse).filter(Number.isFinite);
+  const newest = starts.length ? Math.max(...starts) : Number.POSITIVE_INFINITY;
+  if (newest <= anchor && bypassActive(state, anchor)) return true;
+  if (outstanding(state, now).length) return false;
+  const after = (iso: string | null | undefined) => !!iso && Date.parse(iso) > anchor;
+  if (state.images.some((r) => r.verdict === "accepted" && after(r.at))) return false;
+  if (state.debts.some((d) => after(d.penance?.paidAt))) return false;
+  if (state.gym?.sessions.some((s) => after(s.seenAt))) return false;
+  if (state.delay.until && Date.parse(state.delay.until) - DELAY_MS > anchor) return false;
+  return true;
+}
+
+/**
  * The "Emergency" button on Cairn's app shield: a BYPASS for `minutes`, sent
  * when the phone is back online. The window is anchored to the tap, never to
  * the report, so a late report can't grant a fresh window, and a repeat of the
- * same source + tap time returns the first answer. The charge is judged at the
- * tap too: a tap while the gate was armed (locked, no bypass open) opens a debt
- * the model rules on, as BYPASS does; a tap while it was clear or already
- * bypassed (a stale shield on the phone) costs nothing and opens nothing.
+ * same source + tap time returns the first answer.
+ *
+ * Every tap is charged (a debt the model rules on, as BYPASS) unless the gate
+ * can show it cost nothing (shieldTapFree). The gate keeps no full history, so
+ * it cannot replay its state at the tap; when in doubt it charges, and "the
+ * shield was stale" is an answer the model can accept.
  */
 export async function shieldBypass(input: { minutes: number; source: string; at: string }): Promise<ShieldBypassResult> {
   const tap = Date.parse(input.at);
@@ -507,11 +531,13 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
     const until = anchor + input.minutes * 60_000;
     let debtId: string | null = null;
     let applied = false;
-    if (armed(state, anchor)) {
+    if (!shieldTapFree(state, anchor, now)) {
       // Numbered from the debts themselves: shield records are trimmed, debts are not.
       const prefix = `${localTime(anchor).day}-shield-`;
       debtId = `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`;
-      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped: outstanding(state, anchor).map((r) => r.label), status: "open" });
+      // What locks the gate now; empty when a lock was cleared after the tap.
+      const skipped = outstanding(state, now).map((r) => r.label);
+      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped: skipped.length ? skipped : ["a lock cleared after the tap"], status: "open" });
       if (until > now) {
         applied = true;
         state.bypass.count += 1;

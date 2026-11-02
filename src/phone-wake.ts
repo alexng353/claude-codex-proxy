@@ -72,10 +72,7 @@ function updateWake<T>(path: string, edit: (file: WakeFile) => T): T {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   return withLock(`${path}.lock`, () => {
     const file = readWake(path);
-    const before = JSON.stringify(file);
     const result = edit(file);
-    // Most polls change nothing: skip the write.
-    if (JSON.stringify(file) === before && existsSync(path)) return result;
     const temporary = `${path}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
     renameSync(temporary, path);

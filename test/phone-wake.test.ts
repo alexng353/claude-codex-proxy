@@ -224,6 +224,8 @@ describe("startPhoneWake", () => {
       calls++;
       inFlight++;
       most = Math.max(most, inFlight);
+      // Past the cross-copy claim: only the in-process guard can stop a second send.
+      clock += 20_000;
       await Bun.sleep(25);
       inFlight--;
       return { kind: "accepted" };

@@ -114,13 +114,46 @@ describe("shield bypass", () => {
     expect(after.debts).toEqual([]);
   });
 
-  test("the charge is judged at the tap: clear then, locked by the time it arrives, costs nothing", async () => {
+  test("a late report while the gate is locked is charged; the model rules on it", async () => {
     clock = at(DAY, "06:30");
-    // The gate first arms at 05:00 (startsAt): a 04:30 tap was taken while it was clear.
     const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "04:30")) });
-    expect(r.body).toMatchObject({ applied: false, until: null, debt_id: null });
+    expect(r.body).toMatchObject({ applied: false, until: null, debt_id: `${DAY}-shield-1` });
     expect(r.body.gate.state).toBe("armed");
-    expect((await state()).debts).toEqual([]);
+    expect((await state()).debts).toMatchObject([{ skipped: ["morning teeth photo"], status: "open" }]);
+  });
+
+  test("proof accepted after the tap does not make the tap free", async () => {
+    const s = await state();
+    s.filled = { [`${DAY}/morning-teeth`]: iso(at(DAY, "06:20")) };
+    s.images = [{ at: iso(at(DAY, "06:20")), verdict: "accepted", kind: "teeth", slot: `${DAY}/morning-teeth`, sha256: "a".repeat(64) }];
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    clock = at(DAY, "06:30");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:10")) });
+    expect(r.body.gate.state).toBe("clear");
+    expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+    expect((await state()).debts).toMatchObject([{ skipped: ["a lock cleared after the tap"] }]);
+  });
+
+  test("a BYPASS typed after the tap does not make the tap free", async () => {
+    const s = await state();
+    s.bypass = { count: 1, until: iso(at(DAY, "07:30")), history: [iso(at(DAY, "07:00"))] };
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    clock = at(DAY, "07:05");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:40")) });
+    expect(r.body).toMatchObject({ applied: false, debt_id: `${DAY}-shield-1` });
+    expect((await state()).bypass.count).toBe(1);
+  });
+
+  test("a DELAY typed after the tap does not make the tap free", async () => {
+    const s = await state();
+    s.delay = { count: 1, until: iso(at(DAY, "08:10")), day: DAY, history: [DAY] };
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    clock = at(DAY, "06:20");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:05")) });
+    expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
   });
 
   test("a tap from a fast phone clock is anchored to the receive time", async () => {
