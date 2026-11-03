@@ -48,6 +48,8 @@ export type GymSession = {
   seenAt: string;
   /** Credited by hand (verified outside the gate), e.g. the first night. */
   manual?: { by: string; reason: string };
+  /** The gym Uplifting tagged the workout with (a gym name, never coordinates). */
+  gymTag?: string;
 };
 
 /** Where the phone was when Alex tapped Start or Finish. Distance only; no coordinates kept. */
@@ -63,6 +65,22 @@ export type GymCheckin = {
   dhash?: string;
 };
 
+/**
+ * A stretch with no gym gate (Alex, 2026-11-02: Jakarta Nov 14 to Dec 3, no
+ * Gold's there). Plans can't start inside it and nothing gym-related locks
+ * while it runs. `from`/`to` are instants; `to` is exclusive.
+ */
+export type GymPause = {
+  id: string;
+  from: string;
+  to: string;
+  reason: string;
+  at: string;
+  by?: string;
+  /** Ended early: `to` was moved to this time. */
+  endedAt?: string;
+};
+
 export type GymSettings = {
   graceMin: number;
   minMinutes: number;
@@ -71,6 +89,19 @@ export type GymSettings = {
   maxOpenMin: number;
   /** A session may start this long before the plan and still keep it. */
   earlyMin: number;
+  /** A fix less precise than this (iOS reports kilometres with Precise Location off) counts as no location. */
+  maxAccuracyM: number;
+  /**
+   * How a session proves it was at the gym. "checkins": Uplifting's Start and
+   * Finish locations (or a gym photo). "workout-tag": while Alex's phone runs
+   * an Uplifting build that sends no check-ins (2026-11-02), a workout tagged
+   * with a gym matching `tagPattern` counts, and a plan is missed only once
+   * start + grace + maxOpenMin has passed with no such workout, so a missing
+   * Start can't lock him mid-workout.
+   */
+  proof: "checkins" | "workout-tag";
+  /** Case-insensitive text a workout's gym tag must contain in workout-tag mode. */
+  tagPattern: string;
   gym: { name: string; lat: number; lon: number; radiusM: number };
 };
 
@@ -79,6 +110,7 @@ export type GymState = {
   plans: GymPlan[];
   sessions: GymSession[];
   checkins: GymCheckin[];
+  pauses?: GymPause[];
   /** Last successful Uplifting read, and the last error since. */
   syncedAt?: string;
   syncError?: string;
@@ -98,6 +130,9 @@ export const DEFAULT_GYM_SETTINGS: GymSettings = {
   minSets: 6,
   maxOpenMin: 4 * 60,
   earlyMin: 3 * 60,
+  maxAccuracyM: 500,
+  proof: "checkins",
+  tagPattern: "gold",
   gym: { name: "Gold's Gym West Broadway", lat: 49.26346, lon: -123.12054, radiusM: 150 },
 };
 
@@ -128,7 +163,9 @@ export type PlanStatus =
   | "missed"
   /** Missed, then cleared by a later qualifying session. */
   | "made-up"
-  | "cancelled";
+  | "cancelled"
+  /** Starts inside a travel pause: never a miss. */
+  | "paused";
 
 export type PlanResult = {
   plan: GymPlan;
@@ -203,18 +240,26 @@ function sessionsAround(gym: GymState, photo: GymCheckin): GymSession[] {
 }
 
 /** Everything about a session except the photo: fails with a reason, or passes, maybe needing a photo for a missing location. */
-function baseCheck(gym: GymState, session: GymSession): { ok: false; reason: string } | { ok: true; needsPhoto: "start" | "finish" | null } {
+function baseCheck(
+  gym: GymState,
+  session: GymSession,
+): { ok: false; reason: string } | { ok: true; needsPhoto: "start" | "finish" | null; approxM?: number } {
   const s = gymSettings(gym);
   const minutes = (ms(session.end) - ms(session.start)) / MIN;
   if (!(minutes >= s.minMinutes)) return { ok: false, reason: `${Math.round(minutes)} min, under ${s.minMinutes}` };
   if (session.sets < s.minSets) return { ok: false, reason: `${session.sets} sets, under ${s.minSets}` };
   const kinds = ["start", "finish"] as const;
   const fixes = kinds.map((kind) => (session.clientId ? checkinFor(gym, session.clientId, kind) : undefined));
-  // Uplifting's own evidence of being away always wins, whichever end it is.
+  // Uplifting's own evidence of being away always wins, whichever end it is: the whole
+  // uncertainty circle of the fix lies outside the gym.
   for (const [i, fix] of fixes.entries())
-    if (fix && fix.distanceM !== null && fix.distanceM > s.gym.radiusM)
-      return { ok: false, reason: `${Math.round(fix.distanceM)} m from the gym at ${kinds[i]}` };
-  return { ok: true, needsPhoto: kinds.find((_, i) => !fixes[i] || fixes[i]!.distanceM === null) ?? null };
+    if (fix && readFix(gym, fix) === "away")
+      return { ok: false, reason: `${Math.round(fix.distanceM!)} m from the gym at ${kinds[i]}` };
+  // No fix, or one too approximate to tell (Precise Location off): a gym photo has to stand in.
+  const missing = kinds.findIndex((_, i) => !fixes[i] || readFix(gym, fixes[i]!) === "unknown");
+  if (missing < 0) return { ok: true, needsPhoto: null };
+  const approx = fixes[missing]?.distanceM != null ? fixes[missing]!.accuracyM : null;
+  return { ok: true, needsPhoto: kinds[missing], ...(approx != null ? { approxM: approx } : {}) };
 }
 
 /** Whether a finished session counts, and why not when it doesn't. */
@@ -223,15 +268,46 @@ export function checkSession(gym: GymState, session: GymSession, photos: PhotoMa
   const base = baseCheck(gym, session);
   if (!base.ok) return { session, qualifies: false, reason: base.reason };
   // No location from Uplifting (an old build, GPS off): this session's gym photo stands in.
-  if (base.needsPhoto && !photos.bySession.has(session.id)) return { session, qualifies: false, reason: `no location at ${base.needsPhoto}` };
+  const s = gymSettings(gym);
+  // Workout-tag mode: the old Uplifting build sends no check-ins; its gym tag stands in.
+  if (base.needsPhoto && s.proof === "workout-tag" && tagMatches(s, session.gymTag)) return { session, qualifies: true };
+  if (base.needsPhoto && !photos.bySession.has(session.id))
+    return {
+      session,
+      qualifies: false,
+      reason:
+        base.approxM != null
+          ? `location too approximate at ${base.needsPhoto} (within ${Math.round(base.approxM)} m; turn on Precise Location for Uplifting, or send a gym photo)`
+          : s.proof === "workout-tag"
+            ? `not tagged at the gym in Uplifting (tag: ${session.gymTag ?? "none"})`
+            : `no location at ${base.needsPhoto}`,
+    };
   return { session, qualifies: true };
 }
+
+export const tagMatches = (s: GymSettings, tag: string | undefined) =>
+  !!tag && !!s.tagPattern && tag.toLowerCase().includes(s.tagPattern.toLowerCase());
 
 function checkinFor(gym: GymState, clientId: string, kind: "start" | "finish"): GymCheckin | undefined {
   return gym.checkins.find((c) => c.clientId === clientId && c.kind === kind);
 }
 
-const atGym = (gym: GymState, c: GymCheckin) => c.distanceM !== null && c.distanceM <= gymSettings(gym).gym.radiusM;
+/**
+ * What a fix says: at the gym (inside the radius and precise enough), away
+ * (its whole uncertainty circle outside the radius), or unknown (no fix, or
+ * too approximate to tell; iOS with Precise Location off reports a fix blurred
+ * by kilometres). A fix with no reported accuracy is taken as exact.
+ */
+export function readFix(gym: GymState, c: GymCheckin): "at" | "away" | "unknown" {
+  if (c.distanceM === null) return "unknown";
+  const s = gymSettings(gym);
+  const accuracy = c.accuracyM ?? 0;
+  if (c.distanceM <= s.gym.radiusM && accuracy <= s.maxAccuracyM) return "at";
+  if (c.distanceM - accuracy > s.gym.radiusM) return "away";
+  return "unknown";
+}
+
+const atGym = (gym: GymState, c: GymCheckin) => readFix(gym, c) === "at";
 
 /** When the plan last took its current start (its add or latest move). */
 function plannedAt(plan: GymPlan): number {
@@ -290,6 +366,10 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       results.push({ plan, status: "cancelled", deadline });
       continue;
     }
+    if (pauseAt(gym, start)) {
+      results.push({ plan, status: "paused", deadline });
+      continue;
+    }
     const opens = start - s.earlyMin * MIN;
     const inWindow = (iso: string) => ms(iso) >= opens && ms(iso) <= deadline;
     const madeAt = plannedAt(plan);
@@ -311,14 +391,20 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       continue;
     }
     // Evidence of a miss: a read from after the moment the plan failed.
-    const failedAt = Math.max(deadline, ...unfinished.map((c) => ms(c.at) + s.maxOpenMin * MIN));
-    if (now < deadline || !(gym.syncedAt && ms(gym.syncedAt) >= failedAt)) {
+    // Workout-tag mode has no Start to see, so the workout gets maxOpenMin to finish and sync.
+    const failedAt = Math.max(
+      s.proof === "workout-tag" ? deadline + s.maxOpenMin * MIN : deadline,
+      ...unfinished.map((c) => ms(c.at) + s.maxOpenMin * MIN),
+    );
+    if (now < failedAt || !(gym.syncedAt && ms(gym.syncedAt) >= failedAt)) {
       results.push({ plan, status: "upcoming", deadline });
       continue;
     }
     // For the reason only: a photo inside just a warm-up names that warm-up.
     const failed = started.map((c) => sessionFor(c) ?? (isPhoto(c) ? sessionsAround(gym, c)[0] : undefined)).find(Boolean);
     const failedCheck = failed && checks.find((c) => c.session.id === failed.id);
+    // Also for the reason: a workout in the window that didn't count (too approximate, away, untagged).
+    const inWindowFail = checks.find((c) => !c.qualifies && !c.session.manual && inWindow(c.session.start));
     const reason = failed
       ? failedCheck?.qualifies
         ? ms(failed.end) < madeAt
@@ -327,7 +413,11 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
         : `session didn't count: ${failedCheck?.reason ?? "did not qualify"}`
       : started.length
         ? "started, never finished"
-        : `no Start at the gym by ${clockLabel(deadline)}`;
+        : inWindowFail
+          ? `session didn't count: ${inWindowFail.reason ?? "did not qualify"}`
+          : s.proof === "workout-tag"
+            ? `no workout tagged at the gym starting by ${clockLabel(deadline)}`
+            : `no Start at the gym by ${clockLabel(deadline)}`;
     results.push({ plan, status: "missed", deadline, reason, failedAt });
   }
 
@@ -401,8 +491,11 @@ export const missLocks = (r: PlanResult, now: number) => now < (r.failedAt ?? r.
  */
 export function gymOutstanding(gym: GymState | undefined, now: number): GymRequirement[] {
   if (!gym?.syncedAt || gym.syncError || now - ms(gym.syncedAt) > FRESH_READ_MS) return [];
+  // During a travel pause nothing gym-related locks, except a miss that was already locking
+  // when the pause was made: a pause is for travel, not a way out of a live lock.
+  const pause = pauseAt(gym, now);
   return evaluateGym(gym, now)
-    .filter((r) => r.status === "missed" && missLocks(r, now))
+    .filter((r) => r.status === "missed" && missLocks(r, now) && (!pause || (r.failedAt ?? r.deadline) <= ms(pause.at)))
     .map((r) => ({
       slot: gymSlot(r.plan.id),
       kind: "gym" as const,
@@ -450,6 +543,8 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
     const start = Date.parse(edit.start);
     if (!Number.isFinite(start)) return { ok: false, error: "start must be an ISO time" };
     if (start <= now) return { ok: false, error: "start must be in the future" };
+    const paused = pauseAt(gym, start);
+    if (paused) return { ok: false, error: pausedError(paused) };
     const grace = edit.graceMin ?? gymSettings(gym).graceMin;
     if (!Number.isInteger(grace) || grace < 0 || grace > MAX_GRACE_MIN)
       return { ok: false, error: `grace must be a whole number of minutes, 0-${MAX_GRACE_MIN}` };
@@ -477,6 +572,8 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
     const start = Date.parse(edit.start);
     if (!Number.isFinite(start)) return { ok: false, error: "start must be an ISO time" };
     if (start <= now) return { ok: false, error: "start must be in the future" };
+    const paused = pauseAt(gym, start);
+    if (paused) return { ok: false, error: pausedError(paused) };
     const iso = new Date(start).toISOString();
     plan.log.push({ at: nowIso, action: "move", from: plan.start, to: iso, ...by, ...(note ? { note } : {}) });
     plan.start = iso;
@@ -500,6 +597,74 @@ function nextId(gym: GymState, start: number): string {
   return `${base}-${n}`;
 }
 
+// ---- Travel pauses ----
+
+/** The pause running at `at`, if any. */
+export function pauseAt(gym: GymState | undefined, at: number): GymPause | undefined {
+  return gym?.pauses?.find((p) => ms(p.from) <= at && at < ms(p.to));
+}
+
+const pauseLabel = (p: GymPause) => `${p.id} (${when(p.from)} to ${when(p.to)}: ${p.reason})`;
+const pausedError = (p: GymPause) => `that time is inside the travel pause ${pauseLabel(p)}; end the pause first if plans should resume`;
+
+/** Longest pause: a long trip is fine, a pause that quietly never ends is not. */
+const MAX_PAUSE_MS = 62 * 86_400_000;
+
+export type PauseResult = { ok: true; pause: GymPause; message: string } | { ok: false; error: string };
+
+/**
+ * Adds a pause. It may start now or later but can't reach back over a plan
+ * that has already started, so it never erases a miss; plans already inside
+ * a future window become "paused" (logged on the pause).
+ */
+export function addPause(gym: GymState, input: { from: string; to: string; reason: string; by?: string }, now: number): PauseResult {
+  const from = Date.parse(input.from);
+  const to = Date.parse(input.to);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return { ok: false, error: "from and to must be ISO times" };
+  if (to <= from) return { ok: false, error: "to must be after from" };
+  if (to <= now) return { ok: false, error: "the pause must end in the future" };
+  if (to - from > MAX_PAUSE_MS) return { ok: false, error: "a pause can last at most 62 days" };
+  const reason = input.reason.trim().slice(0, 200);
+  if (!reason) return { ok: false, error: "a pause needs a reason" };
+  const effectiveFrom = Math.max(from, now);
+  // A plan that already started inside the asked window stays judged as it is.
+  const started = gym.plans.find(
+    (p) => !(p.status === "cancelled" && !cancelledLate(p)) && from <= ms(p.start) && ms(p.start) <= now && ms(p.start) < to,
+  );
+  if (started) return { ok: false, error: `plan ${started.id} (${when(started.start)}) has already started; a pause can't reach back over it` };
+  const overlap = (gym.pauses ?? []).find((p) => ms(p.from) < to && effectiveFrom < ms(p.to));
+  if (overlap) return { ok: false, error: `overlaps ${pauseLabel(overlap)}` };
+  let n = 1;
+  while ((gym.pauses ?? []).some((p) => p.id === `pause-${n}`)) n++;
+  const pause: GymPause = {
+    id: `pause-${n}`,
+    from: new Date(effectiveFrom).toISOString(),
+    to: new Date(to).toISOString(),
+    reason,
+    at: new Date(now).toISOString(),
+    ...(input.by ? { by: input.by.slice(0, 80) } : {}),
+  };
+  (gym.pauses ??= []).push(pause);
+  const inside = gym.plans.filter((p) => p.status === "planned" && ms(p.start) >= effectiveFrom && ms(p.start) < to);
+  return {
+    ok: true,
+    pause,
+    message: `paused the gym gate ${when(pause.from)} to ${when(pause.to)} (${reason})${inside.length ? `; ${inside.length} plan(s) inside it no longer count: ${inside.map((p) => p.id).join(", ")}` : ""}`,
+  };
+}
+
+/** Ends a pause now (or drops it if it hasn't started). Plans that started inside it stay paused. */
+export function endPause(gym: GymState, id: string, now: number, by?: string): PauseResult {
+  const pause = gym.pauses?.find((p) => p.id === id);
+  if (!pause) return { ok: false, error: `no pause ${id}` };
+  if (ms(pause.to) <= now) return { ok: false, error: `${id} has already ended` };
+  const endAt = Math.max(now, ms(pause.from));
+  pause.to = new Date(endAt).toISOString();
+  pause.endedAt = new Date(now).toISOString();
+  if (by) pause.by = `${pause.by ? `${pause.by}, ` : ""}ended by ${by.slice(0, 80)}`;
+  return { ok: true, pause, message: `ended ${id}; plans count again from ${when(pause.to)}` };
+}
+
 // ---- Uplifting data ----
 
 /** What Uplifting's gate route returns (uplifting apps/api/src/routes/gate.ts). */
@@ -519,6 +684,8 @@ export type UpliftingFeed = {
     end_time: string | null;
     kind: string;
     set_count: number;
+    /** The gym the workout was tagged with in Uplifting (added 2026-11-02; absent from older APIs). */
+    gym_location?: string | null;
   }>;
 };
 
@@ -599,6 +766,7 @@ export function mergeFeed(gym: GymState, feed: UpliftingFeed, now: number): bool
       end: new Date(Date.parse(w.end_time)).toISOString(),
       sets: Number.isFinite(w.set_count) ? w.set_count : 0,
       seenAt: nowIso,
+      ...(typeof w.gym_location === "string" && w.gym_location.trim() ? { gymTag: w.gym_location.trim().slice(0, 100) } : {}),
     });
     changed = true;
   }

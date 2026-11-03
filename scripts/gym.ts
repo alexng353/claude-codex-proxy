@@ -11,8 +11,17 @@
  *   bun scripts/gym.ts sync                 (read Uplifting now)
  *   bun scripts/gym.ts credit --start T --end T --reason TEXT --by NAME [--workout ID] [--sets N]
  *                                           (hand credit for a session verified outside the gate)
+ *   bun scripts/gym.ts pause --from 2026-11-14 --to 2026-12-03 --reason TEXT [--by NAME]
+ *                                           (travel pause; plain dates are whole Vancouver days, to inclusive)
+ *   bun scripts/gym.ts pause-end ID [--by NAME]
+ *   bun scripts/gym.ts proof checkins|workout-tag [--tag TEXT]
+ *                                           (workout-tag: a synced workout tagged at the gym counts; for
+ *                                            Uplifting builds that send no check-ins)
  */
 import { describeReport, gymCall, parseStart } from "../src/gym-client";
+import { addDays } from "../src/hygiene";
+
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 function flags(args: string[]): { positional: string[]; named: Record<string, string> } {
   const positional: string[] = [];
@@ -78,6 +87,22 @@ async function main() {
       });
       if (r.status >= 400) fail(r.body?.error ?? `failed (${r.status})`);
       return console.log(`credited ${r.body.session.id}: ${r.body.session.start} to ${r.body.session.end}`);
+    }
+    case "pause": {
+      const from = parseStart(DATE.test(named.from ?? "") ? `${named.from} 00:00` : (named.from ?? "")) ?? fail("pause needs --from (YYYY-MM-DD or a time)");
+      const to = parseStart(DATE.test(named.to ?? "") ? `${addDays(named.to!, 1)} 00:00` : (named.to ?? "")) ?? fail("pause needs --to (YYYY-MM-DD, inclusive, or a time)");
+      if (!named.reason) fail("pause needs --reason");
+      return show(await gymCall("/pauses", { from, to, reason: named.reason, by }));
+    }
+    case "pause-end":
+      if (!positional[0]) fail("pause-end needs a pause id");
+      return show(await gymCall(`/pauses/${encodeURIComponent(positional[0])}/end`, { by }));
+    case "proof": {
+      const mode = positional[0];
+      if (mode !== "checkins" && mode !== "workout-tag") fail("proof needs checkins or workout-tag");
+      const r = await gymCall("/settings", { proof: mode, ...(named.tag ? { tag_pattern: named.tag } : {}) });
+      if (r.status >= 400) fail(r.body?.error ?? `failed (${r.status})`);
+      return console.log(`proof is now ${r.body.settings.proof} (tag must contain "${r.body.settings.tagPattern}")`);
     }
     default:
       fail("usage: gym.ts status | add WHEN | move ID WHEN | cancel ID | grace MIN | sync | credit --start --end --reason --by");

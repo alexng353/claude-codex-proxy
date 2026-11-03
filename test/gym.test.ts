@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_GYM_SETTINGS,
+  addPause,
+  checkSession,
   editPlan,
   emptyGym,
+  endPause,
   evaluateGym,
   gymDueToday,
   gymOutstanding,
@@ -44,6 +47,7 @@ function feed(gym: GymState, now: number, f: Partial<UpliftingFeed>) {
   gym.syncedAt = iso(now);
 }
 const statusAt = (gym: GymState, now: number) => evaluateGym(gym, now).map((r) => r.status);
+const checkSessionReason = (gym: GymState, id: string) => checkSession(gym, gym.sessions.find((s) => s.id === id)!).reason ?? "";
 
 describe("plans and the deadline", () => {
   test("no Start at the gym by start + 30 min locks, but only once Uplifting was read after the deadline", () => {
@@ -264,6 +268,151 @@ describe("edits", () => {
 });
 
 describe("Uplifting feed", () => {
+  test("an approximate fix is 'no location', not 'away'; a gym photo then stands in", () => {
+    const blurred = { lat: GOLDS.lat + 0.0225, lon: GOLDS.lon }; // about 2.5 km off
+    const approx = (kind: "start" | "finish", t: number) => ({ ...checkin("c1", kind, t, blurred), accuracy_m: 3000 });
+    const run = (photo: boolean) => {
+      const { gym } = planned();
+      if (photo) recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:05") });
+      feed(gym, at(DAY, "19:10"), {
+        checkins: [approx("start", at(DAY, "18:00")), approx("finish", at(DAY, "19:00"))],
+        workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+      });
+      return evaluateGym(gym, at(DAY, "19:10"))[0];
+    };
+    const without = run(false);
+    expect(without.status).toBe("missed");
+    expect(without.reason).toContain("location too approximate at start");
+    expect(without.reason).toContain("Precise Location");
+    expect(run(true)).toMatchObject({ status: "kept", sessionId: "w1" });
+  });
+
+  test("a precise far fix is away; a precise near fix counts", () => {
+    const far = { lat: GOLDS.lat + 0.0054, lon: GOLDS.lon }; // about 600 m
+    const { gym } = planned();
+    feed(gym, at(DAY, "19:10"), {
+      checkins: [{ ...checkin("c1", "start", at(DAY, "18:00"), far), accuracy_m: 30 }, checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+    });
+    expect(evaluateGym(gym, at(DAY, "19:10"))[0].reason).toContain("m from the gym at start");
+    const { gym: near } = planned();
+    feed(near, at(DAY, "19:10"), {
+      checkins: [{ ...checkin("c1", "start", at(DAY, "18:00")), accuracy_m: 10 }, checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+    });
+    expect(statusAt(near, at(DAY, "19:10"))).toEqual(["kept"]);
+  });
+
+  describe("workout-tag mode (old Uplifting build, no check-ins)", () => {
+    const tagged = (tag: string | null, start = at(DAY, "18:05"), end = at(DAY, "19:00"), sets = 12) => ({
+      ...workout("w1", "x", start, end, sets),
+      client_id: null,
+      gym_location: tag,
+    });
+    const tagMode = () => {
+      const { gym } = planned();
+      gym.settings = { proof: "workout-tag" };
+      return gym;
+    };
+
+    test("a workout tagged at Gold's keeps the plan with no check-ins", () => {
+      const gym = tagMode();
+      feed(gym, at(DAY, "19:10"), { workouts: [tagged("Gold's Gym Broadway")] });
+      expect(evaluateGym(gym, at(DAY, "19:10"))[0]).toMatchObject({ status: "kept", sessionId: "w1" });
+      expect(gym.sessions[0].gymTag).toBe("Gold's Gym Broadway");
+    });
+
+    test("no lock mid-workout: a plan can only miss once start + grace + 4 h has passed", () => {
+      const gym = tagMode();
+      for (const t of ["18:31", "20:00", "22:29"]) {
+        feed(gym, at(DAY, t), {});
+        expect(statusAt(gym, at(DAY, t))).toEqual(["upcoming"]);
+        expect(gymOutstanding(gym, at(DAY, t))).toEqual([]);
+      }
+      feed(gym, at(DAY, "22:31"), {});
+      const [r] = evaluateGym(gym, at(DAY, "22:31"));
+      expect(r).toMatchObject({ status: "missed", reason: "no workout tagged at the gym starting by 18:30" });
+      expect(gymOutstanding(gym, at(DAY, "22:31"))).toHaveLength(1);
+    });
+
+    test("a workout tagged elsewhere, untagged, short or late doesn't count", () => {
+      for (const [w, why] of [
+        [tagged("Home"), "not tagged at the gym"],
+        [tagged(null), "not tagged at the gym"],
+        [tagged("Gold's", at(DAY, "18:05"), at(DAY, "18:30")), "under 45"],
+        [tagged("Gold's", at(DAY, "18:05"), at(DAY, "19:00"), 3), "sets, under 6"],
+      ] as const) {
+        const gym = tagMode();
+        feed(gym, at(DAY, "22:31"), { workouts: [w] });
+        const [r] = evaluateGym(gym, at(DAY, "22:31"));
+        expect(r.status).toBe("missed");
+        expect(gym.sessions.map((s) => checkSessionReason(gym, s.id))[0]).toContain(why);
+      }
+      const late = tagMode();
+      feed(late, at(DAY, "22:31"), { workouts: [tagged("Gold's", at(DAY, "18:45"), at(DAY, "19:45"))] });
+      expect(statusAt(late, at(DAY, "22:31"))).toEqual(["made-up"]);
+    });
+
+    test("check-in mode ignores the tag", () => {
+      const { gym } = planned();
+      feed(gym, at(DAY, "19:10"), { workouts: [tagged("Gold's Gym Broadway")] });
+      expect(evaluateGym(gym, at(DAY, "19:10"))[0].status).toBe("missed");
+    });
+  });
+
+  describe("travel pause", () => {
+    const jkt = { from: iso(at("2026-11-14", "00:00")), to: iso(at("2026-12-03", "23:59")), reason: "Jakarta", by: "test" };
+
+    test("plans can't start inside it; a plan already inside it never misses or locks", () => {
+      const gym = emptyGym();
+      const inside = editPlan(gym, { action: "add", start: iso(at("2026-11-16", "09:00")), by: "t" }, at(DAY, "12:00"));
+      expect(inside.ok).toBe(true);
+      const p = addPause(gym, jkt, at(DAY, "13:00"));
+      expect(p.ok && p.message).toContain("2026-11-16-1");
+      expect(editPlan(gym, { action: "add", start: iso(at("2026-11-20", "09:00")), by: "t" }, at(DAY, "14:00")).ok).toBe(false);
+      const later = at("2026-11-17", "12:00");
+      feed(gym, later, {});
+      expect(statusAt(gym, later)).toEqual(["paused"]);
+      expect(gymOutstanding(gym, later)).toEqual([]);
+      const after = editPlan(gym, { action: "add", start: iso(at("2026-12-05", "09:00")), by: "t" }, at(DAY, "14:00"));
+      expect(after.ok).toBe(true);
+    });
+
+    test("it can't reach back over a started plan, and a miss already locking still locks", () => {
+      const { gym } = planned();
+      feed(gym, at(DAY, "18:31"), {});
+      expect(gymOutstanding(gym, at(DAY, "18:31"))).toHaveLength(1);
+      const back = addPause(gym, { from: iso(at(DAY, "00:00")), to: iso(at("2026-11-10", "00:00")), reason: "r" }, at(DAY, "18:40"));
+      expect(back.ok).toBe(false);
+      const now = addPause(gym, { from: iso(at(DAY, "18:40")), to: iso(at("2026-11-10", "00:00")), reason: "r" }, at(DAY, "18:40"));
+      expect(now.ok).toBe(true);
+      feed(gym, at(DAY, "18:45"), {});
+      expect(gymOutstanding(gym, at(DAY, "18:45"))).toHaveLength(1);
+    });
+
+    test("limits, overlap and ending early", () => {
+      const gym = emptyGym();
+      expect(addPause(gym, { ...jkt, to: iso(at("2027-02-01", "00:00")) }, at(DAY, "12:00")).ok).toBe(false);
+      expect(addPause(gym, { ...jkt, reason: " " }, at(DAY, "12:00")).ok).toBe(false);
+      const p = addPause(gym, jkt, at(DAY, "12:00"));
+      if (!p.ok) throw new Error(p.error);
+      expect(addPause(gym, jkt, at(DAY, "12:00")).ok).toBe(false);
+      expect(endPause(gym, p.pause.id, at("2026-11-20", "12:00")).ok).toBe(true);
+      expect(editPlan(gym, { action: "add", start: iso(at("2026-11-21", "09:00")), by: "t" }, at("2026-11-20", "13:00")).ok).toBe(true);
+    });
+
+    test("a miss just before the trip locks until the pause starts, not during it", () => {
+      const gym = emptyGym();
+      const r = editPlan(gym, { action: "add", start: iso(at("2026-11-13", "22:00")), by: "t" }, at(DAY, "12:00"));
+      if (!r.ok) throw new Error(r.error);
+      expect(addPause(gym, jkt, at(DAY, "13:00")).ok).toBe(true);
+      feed(gym, at("2026-11-13", "22:31"), {});
+      expect(gymOutstanding(gym, at("2026-11-13", "22:31"))).toHaveLength(1);
+      feed(gym, at("2026-11-14", "00:01"), {});
+      expect(gymOutstanding(gym, at("2026-11-14", "00:01"))).toEqual([]);
+    });
+  });
+
   test("a miss locks for 24 h at most, stays missed, and can still be made up", () => {
     const { gym } = planned();
     feed(gym, at(DAY, "18:31"), {});

@@ -48,6 +48,10 @@ export function describeReport(report: any): string {
     `Uplifting: ${report.syncError ? `error (${report.syncError})` : report.syncedAt ? `read ${report.syncedAt}` : "never read"}${report.token ? "" : ", no token configured"}`,
   );
   lines.push(`Defaults: grace ${report.settings.graceMin} min, at least ${report.settings.minMinutes} min and ${report.settings.minSets} sets, within ${report.settings.gym.radiusM} m of ${report.settings.gym.name}`);
+  if (report.settings.proof === "workout-tag")
+    lines.push(`Proof: a synced Uplifting workout tagged with a gym containing "${report.settings.tagPattern}" (no check-ins needed)`);
+  for (const p of report.pauses ?? [])
+    if (Date.parse(p.to) > Date.parse(report.now)) lines.push(`Paused ${p.from} to ${p.to}: ${p.reason} (${p.id})`);
   // Plans cancelled before their start no longer matter; a late cancel shows as missed.
   const plans = (report.plans ?? []).filter((p: any) => p.status !== "cancelled");
   if (!plans.length) lines.push("No plans.");
