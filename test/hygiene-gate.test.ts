@@ -1120,21 +1120,44 @@ describe("Cairn API", () => {
     expect(await reviews.json()).toMatchObject({ reviews: [], pending: 1 });
   });
 
-  test("a penance photo sent from Cairn pays the penance; with none open it's not due", async () => {
+  test("a penance photo sent from Cairn pays the penance; a revised one isn't due", async () => {
     const path = process.env.HYGIENE_GATE_STATE!;
     const raw = JSON.parse(await readFile(path, "utf8"));
     const ruled = new Date(clock - 3_600_000).toISOString();
-    raw.debts = [{ id: "d1", at: ruled, skipped: [], status: "penance", ruledAt: ruled, penance: { description: "walk photo outside", setAt: ruled } }];
+    raw.debts = [
+      { id: "d1", at: ruled, skipped: [], status: "penance", ruledAt: ruled, penance: { description: "walk photo outside", setAt: ruled } },
+      { id: "d2", at: ruled, skipped: [], status: "penance", ruledAt: ruled, penance: { description: "ten pushups", setAt: ruled } },
+    ];
     await writeFile(path, JSON.stringify(raw));
     resetGateCache();
+    let asked: unknown;
+    setGateDeps({
+      now: () => clock,
+      dhash: async () => null,
+      captureTime: async (bytes) => exif[bytes.toString("utf8")] ?? null,
+      classify: async (_image, wanted) => {
+        asked = wanted;
+        return verdicts.shift()!;
+      },
+    });
     exif["penance-photo"] = clock - 60_000;
     verdicts.push({ kind: "penance", confidence: 0.95, reason: "outdoors" });
     const paid = (await (await submit("penance", "penance-photo")).json()) as any;
     expect(paid).toMatchObject({ result: "pass", verdict: "accepted", slot: "penance/d1" });
-    expect(paid.gate.open_debts).toEqual([]);
+    // Judged against the oldest open penance's own description, and nothing else filled.
+    expect(asked).toEqual({ kinds: ["penance"], penance: "walk photo outside" });
+    expect(paid.gate.open_debts.map((d: any) => d.id)).toEqual(["d2"]);
     const state = JSON.parse(readFileSync(path, "utf8"));
     expect(state.debts[0].penance.paidAt).toBeString();
+    expect(Object.keys(state.filled).filter((s) => !s.startsWith("penance/"))).toEqual(
+      Object.keys(raw.filled ?? {}).filter((s) => !s.startsWith("penance/")),
+    );
 
+    // Revised away: no penance is open, so another photo is not due.
+    const revised = await handleRequest(
+      new Request("http://localhost/hygiene/debt/d2/revise", { method: "POST", body: JSON.stringify({ verdict: "justified", reason: "new facts" }) }),
+    );
+    expect(revised.status).toBe(200);
     exif["penance-again"] = clock - 60_000;
     const again = (await (await submit("penance", "penance-again")).json()) as any;
     expect(again.result).toBe("fail");

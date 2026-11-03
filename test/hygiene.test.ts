@@ -194,6 +194,9 @@ describe("requirements", () => {
     expect(both).toContain('- "creatine": creatine being taken');
     expect(both).toContain('answer "penance" even when it also matches another kind');
     expect(both).toContain("images with no person that match none of the kinds above.");
+    const penanceOnly = classifierPrompt({ kinds: ["penance"], penance: "a photo of the sunrise" });
+    expect(penanceOnly).toContain("images with no person that match none of the kinds above.");
+    expect(penanceOnly).not.toContain("or images with no person.");
     expect(parseVerdict({ kind: "walk", confidence: 0.8, reason: "street", reading: "" }).kind).toBe("walk");
   });
 });

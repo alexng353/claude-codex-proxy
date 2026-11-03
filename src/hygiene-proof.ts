@@ -235,8 +235,10 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
       `- "penance": the photo shows this: ${JSON.stringify(wanted.penance)}`,
       'If the photo matches the penance, answer "penance" even when it also matches another kind.',
     );
-  // Creatine and walk photos have no person in them; only the other kinds need one.
-  const personless = wanted.kinds.includes("creatine") || wanted.kinds.includes("walk");
+  // Creatine and walk photos have no person in them; only the other kinds need one. A penance
+  // says what its photo shows, which may have nobody in it (comb, Nov 3).
+  const personless =
+    wanted.kinds.includes("creatine") || wanted.kinds.includes("walk") || !!wanted.penance;
   lines.push(
     personless
       ? '- "none": anything else, including screenshots, photos of a screen, photos of printed photos, or images with no person that match none of the kinds above.'
