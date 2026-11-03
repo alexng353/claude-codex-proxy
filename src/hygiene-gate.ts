@@ -352,8 +352,9 @@ async function checkImageRecorded(
   const result = outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
   if (!gym) return result;
   let record = result.record;
-  // Nothing hygiene-related was due (no record, no line, no retry): keep a record so the
-  // photo can't later be passed off as a hygiene proof. A checker error stays retryable.
+  // Nothing hygiene-related was due (no record, no line, no retry): keep a gymOnly record as
+  // the photo's trace. It never proved hygiene, so it is left out of the copy checks; an exact
+  // resend is stale for hygiene after 30 minutes anyway. A checker error stays retryable.
   if (!record && !result.line && !result.retry && gym.recorded) {
     record = {
       sha256: gym.hash,
@@ -408,8 +409,8 @@ async function gymPhoto(
   // 12 h, so the same mirror and pose on another day still counts. Real hygiene proofs (even one
   // that was also a gym photo) stay in for all time.
   const proofs = state.images.filter((r) => (r.verdict === "accepted" || r.verdict === "unneeded") && !r.gymOnly);
-  // An exact copy of a hygiene proof is a replay, a near copy never counts (a photo already
-  // recorded for the gym is not in `proofs`; recordGymPhoto calls its resend a replay).
+  // An exact copy of a hygiene proof (a dual-purpose gym photo included) is a replay, a near
+  // copy never counts. A gym-only photo's resend is called a replay by recordGymPhoto.
   const exactProof = proofs.some((r) => r.sha256 === hash);
   const reused = proofs.some((r) => r.sha256 !== hash && r.dhash && dhash && near(r.dhash, dhash));
   const at = Math.min(taken, now);

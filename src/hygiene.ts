@@ -402,7 +402,8 @@ export function gateEvents(state: GateState, since: number, until: number): Gate
   const out: GateEvent[] = [];
   for (const r of state.images) {
     // Hand-seeded records were verified outside the gate; nothing happened now.
-    if (r.manual || !within(Date.parse(r.at))) continue;
+    // Gym-only photos were never hygiene proofs; the gym report lists them.
+    if (r.manual || r.gymOnly || !within(Date.parse(r.at))) continue;
     const passed = r.verdict === "accepted" || r.verdict === "unneeded";
     if (!passed && !attemptedProof(r)) continue;
     const what = r.kind && r.kind !== "none" ? `${r.kind} photo` : "photo";

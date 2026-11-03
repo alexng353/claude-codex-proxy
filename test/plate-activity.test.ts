@@ -290,6 +290,8 @@ describe("hygiene gate events", () => {
       { ...base, sha256: "c", at: "2026-10-08T06:44:00Z", kind: "shower", verdict: "duplicate" },
       { ...base, sha256: "d", at: "2026-10-08T06:45:00Z", kind: "shower", verdict: "accepted", slot: "2026-10-07/shower", manual: { verifier: "x" } },
       { ...base, sha256: "e", at: "2026-10-01T06:45:00Z", kind: "shower", verdict: "accepted", slot: "2026-09-30/shower" },
+      // A gym-only photo was never a hygiene proof: not listed.
+      { ...base, sha256: "f", at: "2026-10-08T06:46:00Z", kind: null, verdict: "unneeded", reason: "gym photo", gymOnly: true },
     );
     state.bypass.history.push("2026-10-08T06:50:00Z");
     state.debts.push({ id: "d1", at: "2026-10-08T06:50:00Z", skipped: ["shower (Oct 7)"], status: "open" });
