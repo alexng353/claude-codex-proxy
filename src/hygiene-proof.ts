@@ -305,7 +305,10 @@ export function parseVerdict(value: unknown): Verdict {
 }
 
 const CLASSIFIER_MODEL = process.env.HYGIENE_CLASSIFIER_MODEL ?? "haiku";
-const CLASSIFIER_TIMEOUT_MS = 60_000;
+/** Read at call time so a test can shorten it. */
+const classifierTimeoutMs = () => Number(process.env.HYGIENE_CLASSIFIER_TIMEOUT_MS) || 60_000;
+/** After the timeout's SIGTERM, how long a child gets before SIGKILL and the try is given up. */
+const CLASSIFIER_KILL_GRACE_MS = 2_000;
 /**
  * Accounts tried for one photo, and the time all tries together may take: under the follower
  * gate's 85 s wait, and short because the gate's state lock is held meanwhile (comb).
@@ -335,7 +338,7 @@ export const claudeClassifier: Classifier = async (image, wanted) => {
     const left = deadline - Date.now();
     if (last && left < CLASSIFIER_MIN_TRY_MS) break;
     try {
-      return await classifyOn(account, image, wanted, Math.min(CLASSIFIER_TIMEOUT_MS, left));
+      return await classifyOn(account, image, wanted, Math.min(classifierTimeoutMs(), left));
     } catch (error) {
       if (!(error instanceof ClassifierCallError)) throw error;
       last = error;
@@ -397,18 +400,44 @@ async function classifyOn(
       ],
     },
   };
-  // Before the write: a CLI that stalls reading a large image is cut off too (comb).
+  // Before the write: a CLI that stalls reading a large image is cut off too (comb). A child
+  // that ignores SIGTERM gets SIGKILL, and the try gives up regardless after the grace, since a
+  // grandchild holding stdout open would otherwise keep the read waiting (comb r2).
   let timedOut = false;
+  const timedOutError = () =>
+    new ClassifierCallError(`classifier timed out after ${Math.round(timeoutMs / 1000)} s`);
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let giveUp: () => void = () => {};
+  const gaveUp = new Promise<never>((_, reject) => {
+    giveUp = () => reject(timedOutError());
+  });
+  gaveUp.catch(() => {});
   const timer = setTimeout(() => {
     timedOut = true;
     child.kill();
+    killTimer = setTimeout(() => {
+      child.kill("SIGKILL");
+      giveUp();
+    }, CLASSIFIER_KILL_GRACE_MS);
   }, timeoutMs);
-  try {
-    child.stdin.write(`${JSON.stringify(message)}\n`);
-    await child.stdin.end();
+  const run = async () => {
+    try {
+      await child.stdin.write(`${JSON.stringify(message)}\n`);
+      await child.stdin.end();
+    } catch (error) {
+      // EPIPE after the timeout's kill, or a CLI that exited early: another account may do.
+      if (timedOut) throw timedOutError();
+      throw new ClassifierCallError(`classifier stdin failed: ${(error as Error)?.message ?? error}`);
+    }
     const output = await new Response(child.stdout).text();
     await child.exited;
-    if (timedOut) throw new ClassifierCallError(`classifier timed out after ${Math.round(timeoutMs / 1000)} s`);
+    return output;
+  };
+  try {
+    const running = run();
+    running.catch(() => {}); // given up on: its later failure is nobody's
+    const output = await Promise.race([running, gaveUp]);
+    if (timedOut) throw timedOutError();
     type Event = {
       type?: string;
       is_error?: boolean;
@@ -440,6 +469,7 @@ async function classifyOn(
     return parseVerdict(result.structured_output ?? JSON.parse(result.result ?? "null"));
   } finally {
     clearTimeout(timer);
+    clearTimeout(killTimer);
   }
 }
 

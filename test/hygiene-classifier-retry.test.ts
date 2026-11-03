@@ -25,13 +25,20 @@ function setup(names: string[]) {
   resetAccountState();
 }
 
-/** Each launch prints the next scripted stream-json lines and records the account's token. */
-function script(replies: unknown[][]) {
+/**
+ * Each launch prints the next scripted stream-json lines and records the account's token. A
+ * string reply is the child's own code instead.
+ */
+function script(replies: (unknown[] | string)[]) {
   const tokens: string[] = [];
   (Bun as any).spawn = (_args: string[], options: any) => {
     tokens.push(options.env.CLAUDE_CODE_OAUTH_TOKEN);
-    const lines = (replies.shift() ?? []).map((l) => JSON.stringify(l)).join("\n");
-    return spawn([process.execPath, "-e", `process.stdin.resume();process.stdin.on("end",()=>{console.log(${JSON.stringify(lines)})})`], {
+    const reply = replies.shift() ?? [];
+    const code =
+      typeof reply === "string"
+        ? reply
+        : `process.stdin.resume();process.stdin.on("end",()=>{console.log(${JSON.stringify(reply.map((l) => JSON.stringify(l)).join("\n"))})})`;
+    return spawn([process.execPath, "-e", code], {
       ...options,
       env: { PATH: process.env.PATH },
     });
@@ -108,9 +115,48 @@ test("a 429 status or a limit in errors[] marks the account; a rejected rate_lim
 
   setup(["first", "second"]);
   const reset = Math.floor(Date.now() / 1000) + 3600;
-  script([[{ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: reset } }, ...limited], verdict]);
+  // The result itself isn't a limit text: only the event can mark the account.
+  script([
+    [
+      { type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: reset } },
+      { type: "result", is_error: true, result: "API Error: 500" },
+    ],
+    verdict,
+  ]);
   await claudeClassifier(image, { kinds: ["creatine"] });
   expect(limitedNow("first")).toBe(true);
+});
+
+// Never answers and ignores SIGTERM, as a wedged CLI might.
+const wedged = `process.on("SIGTERM",()=>{});process.stdin.resume();setInterval(()=>{},1000)`;
+
+test("a try that times out moves to the next account", async () => {
+  setup(["first", "second"]);
+  process.env.HYGIENE_CLASSIFIER_TIMEOUT_MS = "300";
+  const tokens = script([`process.stdin.resume();setInterval(()=>{},1000)`, verdict]);
+  expect((await claudeClassifier(image, { kinds: ["creatine"] })).kind).toBe("creatine");
+  expect(tokens).toEqual(["fake-token-first", "fake-token-second"]);
+});
+
+test("a child that ignores SIGTERM is killed and the call still ends", async () => {
+  setup(["only"]);
+  process.env.HYGIENE_CLASSIFIER_TIMEOUT_MS = "300";
+  const tokens = script([wedged, verdict]);
+  const started = Date.now();
+  expect((await claudeClassifier(image, { kinds: ["creatine"] })).kind).toBe("creatine");
+  // SIGTERM at 0.3 s, SIGKILL and give-up 2 s later, then the next account answers.
+  expect(Date.now() - started).toBeLessThan(5_000);
+  expect(tokens[0]).toBe("fake-token-only");
+  expect(tokens).toHaveLength(2);
+}, 10_000);
+
+test("a child that exits before reading its input is a retryable failure", async () => {
+  setup(["first", "second"]);
+  // A large image so the write can't all fit in the pipe before the child is gone.
+  const big = { mediaType: "image/jpeg", bytes: Buffer.alloc(4 * 1024 * 1024, 7) };
+  const tokens = script([`process.exit(1)`, verdict]);
+  expect((await claudeClassifier(big, { kinds: ["creatine"] })).kind).toBe("creatine");
+  expect(tokens).toEqual(["fake-token-first", "fake-token-second"]);
 });
 
 test("a launch that throws fails at once; limited accounts aren't retried", async () => {
