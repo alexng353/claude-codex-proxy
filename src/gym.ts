@@ -9,7 +9,7 @@
  * Decided by Alex 2026-11-02 04:04-04:05: send the location, plans come from
  * him, lock on the schedule, enforce from today.
  */
-import { clockLabel, localTime } from "./hygiene";
+import { clockLabel, inTransit, localTime, zoneNote } from "./hygiene";
 
 export type GymPlanEvent = {
   at: string;
@@ -471,7 +471,8 @@ export const when = (iso: string) => {
     month: "short",
     day: "numeric",
   });
-  return `${date} ${clockLabel(at)}`;
+  const zone = zoneNote(at);
+  return `${date} ${clockLabel(at)}${zone ? ` ${zone}` : ""}`;
 };
 
 export type GymRequirement = { slot: string; kind: "gym"; label: string };
@@ -495,7 +496,14 @@ export function gymOutstanding(gym: GymState | undefined, now: number): GymRequi
   // when the pause was made: a pause is for travel, not a way out of a live lock.
   const pause = pauseAt(gym, now);
   return evaluateGym(gym, now)
-    .filter((r) => r.status === "missed" && missLocks(r, now) && (!pause || (r.failedAt ?? r.deadline) <= ms(pause.at)))
+    // A plan whose deadline fell on a travel day (a zone change) doesn't lock either.
+    .filter(
+      (r) =>
+        r.status === "missed" &&
+        missLocks(r, now) &&
+        !inTransit(r.deadline) &&
+        (!pause || (r.failedAt ?? r.deadline) <= ms(pause.at)),
+    )
     .map((r) => ({
       slot: gymSlot(r.plan.id),
       kind: "gym" as const,

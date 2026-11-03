@@ -87,7 +87,7 @@ export async function remoteGateRequest(base: string, request: ResponsesRequest)
 export async function passThrough(base: string, request: Request, url: URL): Promise<Response> {
   if (request.headers.has(HOP_HEADER)) return loopResponse();
   const headers: Record<string, string> = url.pathname.startsWith("/hygiene/api/") ? { [HOP_HEADER]: "1" } : authorityHeaders();
-  for (const name of ["authorization", "content-type"]) {
+  for (const name of ["authorization", "content-type", "x-device-time-zone"]) {
     const value = request.headers.get(name);
     if (value) headers[name] = value;
   }

@@ -54,6 +54,10 @@ import {
   walkStartedAt,
   WALK_MS,
   zonedTime,
+  knownZone,
+  setZoneHistory,
+  zoneAt,
+  TIME_ZONE,
   type Debt,
   type GateState,
   type ImageRecord,
@@ -89,6 +93,7 @@ import {
   type PlanEdit,
 } from "./gym";
 import { refreshIfDeciding, startGymSync, syncGym, upliftingToken, type GymSyncHost } from "./gym-sync";
+import { parseStart } from "./gym-client";
 import {
   flushWakes as flushWakeQueue,
   heldNoteText,
@@ -174,7 +179,10 @@ export function loadState(): GateState {
   try {
     mtimeMs = statSync(path).mtimeMs;
   } catch {}
-  if (cache && cache.path === path && cache.mtimeMs === mtimeMs) return cache.state;
+  if (cache && cache.path === path && cache.mtimeMs === mtimeMs) {
+    setZoneHistory(cache.state.zones);
+    return cache.state;
+  }
   let state: GateState;
   if (mtimeMs < 0) state = emptyState(defaultStartsAt(deps.now()));
   else {
@@ -183,6 +191,7 @@ export function loadState(): GateState {
     state = { ...emptyState(raw.startsAt ?? defaultStartsAt(deps.now())), ...raw } as GateState;
   }
   cache = { path, mtimeMs, state };
+  setZoneHistory(state.zones);
   return state;
 }
 
@@ -198,6 +207,54 @@ function saveState(state: GateState): void {
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, path);
   cache = { path, mtimeMs: statSync(path).mtimeMs, state };
+  setZoneHistory(state.zones);
+}
+
+/** Refresh `seenAt` for an unchanged zone at most this often (it costs a state write). */
+const ZONE_SEEN_EVERY_MS = 3_600_000;
+const unknownZonesLogged = new Set<string>();
+
+/**
+ * Records the phone's zone from Cairn's status read (X-Device-Time-Zone). An
+ * unknown zone is logged once and ignored: the last good one stays. A change
+ * is logged and can open the gate (a travel day), so held chats are released.
+ */
+export async function noteDeviceZone(raw: string): Promise<void> {
+  const zone = raw.trim();
+  if (!knownZone(zone)) {
+    if (!unknownZonesLogged.has(zone.slice(0, 64))) {
+      unknownZonesLogged.add(zone.slice(0, 64));
+      console.error(`hygiene-gate: ignored unknown device time zone ${JSON.stringify(zone.slice(0, 64))}; keeping ${zoneAt(deps.now())}`);
+    }
+    return;
+  }
+  const needed = (state: GateState, now: number) => {
+    const last = state.zones?.at(-1);
+    // The first report starts the record (Vancouver included), so a later change knows when the old zone was last seen.
+    if (!last) return true;
+    if (last.zone !== zone) return true;
+    return now - Date.parse(last.seenAt ?? last.from) >= ZONE_SEEN_EVERY_MS;
+  };
+  // Most reads change nothing: skip the lock.
+  if (!needed(loadState(), deps.now())) return;
+  await serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    if (!needed(state, now)) return;
+    const nowIso = new Date(now).toISOString();
+    const zones = (state.zones ??= []);
+    const last = zones.at(-1);
+    if (last && last.zone === zone) last.seenAt = nowIso;
+    else {
+      if (last) console.error(`hygiene-gate: device time zone ${last.zone} -> ${zone}`);
+      zones.push({ zone, from: nowIso, seenAt: nowIso });
+    }
+    // Keep a year of history, plus the entry in effect before it.
+    const cutoff = now - RETAIN_MS;
+    while (zones.length > 1 && Date.parse(zones[1].from) < cutoff) zones.shift();
+    saveState(state);
+    if (last?.zone !== zone) release(state, now, "time zone changed");
+  });
 }
 
 /** For tests: forget the cached state so a new HYGIENE_GATE_STATE takes effect. */
@@ -1028,8 +1085,9 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     return Response.json(result, { status: result.ok ? 200 : 400 });
   };
   if (path === "/plans") {
-    const start = text(body.start, 40);
-    if (!start) return Response.json({ error: "start (ISO time) is required" }, { status: 400 });
+    // Wall times ("YYYY-MM-DD HH:MM") are read here, in the phone's current zone.
+    const start = parseStart(text(body.start, 40) ?? "");
+    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" (local) or ISO with an offset' }, { status: 400 });
     // Models often send null for an omitted optional: treat it as "use the default".
     const grace = typeof body.grace_min === "number" ? body.grace_min : body.grace_min == null ? undefined : NaN;
     return plan({ action: "add", start, graceMin: grace, note, by });
@@ -1037,8 +1095,8 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   const edit = /^\/plans\/([A-Za-z0-9-]+)\/(move|cancel)$/.exec(path);
   if (edit) {
     if (edit[2] === "cancel") return plan({ action: "cancel", id: edit[1], note, by });
-    const start = text(body.start, 40);
-    if (!start) return Response.json({ error: "start (ISO time) is required" }, { status: 400 });
+    const start = parseStart(text(body.start, 40) ?? "");
+    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" (local) or ISO with an offset' }, { status: 400 });
     return plan({ action: "move", id: edit[1], start, note, by });
   }
   if (path === "/settings") {
@@ -1064,8 +1122,8 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     return Response.json({ ok: true, settings, note: grace !== undefined ? "grace applies to plans added from now on" : "applies now" });
   }
   if (path === "/pauses") {
-    const from = text(body.from, 40);
-    const to = text(body.to, 40);
+    const from = parseStart(text(body.from, 40) ?? "");
+    const to = parseStart(text(body.to, 40) ?? "");
     const reason = text(body.reason) ?? "";
     if (!from || !to) return Response.json({ error: "from and to (ISO times) are required" }, { status: 400 });
     const result = await mutateGym((gym, now) => {
@@ -1092,8 +1150,8 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   // security boundary (the state file is editable too).
   if (path === "/sessions/credit") {
     const reason = text(body.reason, 300);
-    const startMs = Date.parse(String(body.start));
-    const endMs = Date.parse(String(body.end));
+    const startMs = Date.parse(parseStart(String(body.start ?? "")) ?? "");
+    const endMs = Date.parse(parseStart(String(body.end ?? "")) ?? "");
     if (!by || !reason) return Response.json({ error: "by and reason are required" }, { status: 400 });
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs)
       return Response.json({ error: "start and end must be ISO times, end after start" }, { status: 400 });
@@ -1129,6 +1187,7 @@ export function gateStatus() {
     armed: !disabled && due.length > 0 && !bypass,
     state: disabled ? "disabled" : due.length === 0 ? "clear" : bypass ? "bypassed" : "armed",
     now: new Date(now).toISOString(),
+    zone: zoneAt(now),
     startsAt: state.startsAt,
     outstanding: due.map(({ slot, kind, label }) => ({ slot, kind, label })),
     dueToday: dueToday(state, now).map(({ slot, kind, label }) => ({ slot, kind, label })),

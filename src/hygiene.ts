@@ -27,7 +27,7 @@
 import { createHash } from "node:crypto";
 import { gymDueToday, gymOutstanding, type GymState } from "./gym";
 import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from "./types";
-import { wallTime } from "./zone";
+import { wallTime, zoneSource } from "./zone";
 
 export const TIME_ZONE = "America/Vancouver";
 export const MORNING_MINUTE = 5 * 60;
@@ -139,6 +139,13 @@ export type GateState = {
    * (normally exempt). Leave empty in normal use.
    */
   extraGatedTriggers: string[];
+  /**
+   * The phone's time zone over time, as Cairn reports it (X-Device-Time-Zone on
+   * GET /hygiene/api/v1/status). Oldest first; before the first entry, and
+   * when absent, the gate runs on Vancouver time. `seenAt` is the last report
+   * of that zone (refreshed at most hourly).
+   */
+  zones?: ZoneChange[];
   /** Planned gym sessions and what Uplifting reported (gym.ts). Absent until the first plan. */
   gym?: GymState;
   /**
@@ -175,11 +182,77 @@ export function emptyState(startsAt: string): GateState {
 
 // ---- Time ----
 
-// Vancouver's offset comes from the system zone database (src/zone.ts), not
-// from Intl: bun's bundled ICU still had BC falling back to PST on
-// 2026-11-01, an hour off Alex's clock.
+// ---- The phone's zone (Alex travels: Jakarta Nov 14 to Dec 3, 2026) ----
+
+/** One recorded zone; see GateState.zones. */
+export type ZoneChange = { zone: string; from: string; seenAt?: string };
+
+/** No slot armed this long after a recorded zone change is enforced (a travel day). */
+export const TRANSIT_MS = 24 * 3_600_000;
+/** A gap with no report before a change is forgiven too, but never more than this. */
+const TRANSIT_GAP_MAX_MS = 48 * 3_600_000;
+/** Zone changes closer together than this don't grant another travel day: flipping the phone's zone is not a way out. */
+export const TRANSIT_COOLDOWN_MS = 7 * 86_400_000;
+
+type ZoneEntry = { zone: string; from: number; seenAt: number };
+let zoneHistory: ZoneEntry[] = [];
+let transitWindows: Array<[number, number]> = [];
+
+/** Whether `name` is a zone the system zone database has (never Intl's guess). */
+export function knownZone(name: string): boolean {
+  if (!/^[A-Za-z][A-Za-z0-9_+\-]*(\/[A-Za-z0-9_+\-]+){0,2}$/.test(name) || name.length > 64) return false;
+  const kind = zoneSource(name).kind;
+  return kind === "tzif" || kind === "stale";
+}
+
+/**
+ * Sets the zone history every time and day below follows. The gate calls it
+ * whenever it loads or saves its state; tests call it directly.
+ */
+export function setZoneHistory(zones: ZoneChange[] | undefined): void {
+  zoneHistory = (zones ?? [])
+    .map((z) => ({ zone: z.zone, from: Date.parse(z.from), seenAt: Date.parse(z.seenAt ?? z.from) }))
+    .filter((z) => typeof z.zone === "string" && Number.isFinite(z.from) && Number.isFinite(z.seenAt))
+    .sort((a, b) => a.from - b.from);
+  transitWindows = [];
+  let previous = { zone: TIME_ZONE, seenAt: Number.NEGATIVE_INFINITY };
+  let granted = Number.NEGATIVE_INFINITY;
+  for (const entry of zoneHistory) {
+    if (entry.zone !== previous.zone && entry.from - granted >= TRANSIT_COOLDOWN_MS) {
+      // From the last report of the old zone (the flight had no signal), at most 48 h back.
+      const start = Math.max(Math.min(previous.seenAt, entry.from), entry.from - TRANSIT_GAP_MAX_MS);
+      transitWindows.push([start, entry.from + TRANSIT_MS]);
+      granted = entry.from;
+    }
+    previous = entry;
+  }
+}
+
+/** The zone in effect at `ms`: the newest recorded change at or before it, else Vancouver. */
+export function zoneAt(ms: number): string {
+  let zone = TIME_ZONE;
+  for (const entry of zoneHistory) {
+    if (entry.from > ms) break;
+    zone = entry.zone;
+  }
+  return zone;
+}
+
+/** A travel day: a slot armed now isn't enforced. */
+export function inTransit(ms: number): boolean {
+  return transitWindows.some(([from, to]) => from < ms && ms < to);
+}
+
+// Offsets come from the system zone database (src/zone.ts), not from Intl:
+// bun's bundled ICU still had BC falling back to PST on 2026-11-01, an hour
+// off Alex's clock. The zone follows the phone (zoneAt).
 function wallClock(ms: number) {
-  return wallTime(ms, TIME_ZONE);
+  return wallTime(ms, zoneAt(ms));
+}
+
+/** The zone's abbreviation at `ms` when it isn't Vancouver (e.g. "WIB"), else "". */
+export function zoneNote(ms: number): string {
+  return zoneAt(ms) === TIME_ZONE ? "" : wallTime(ms, zoneAt(ms)).abbrev;
 }
 
 /** Local calendar day ("YYYY-MM-DD") and minutes since local midnight. */
@@ -261,6 +334,8 @@ const OPT_IN: Record<string, (state: GateState) => string | undefined> = {
 
 function enforced(state: GateState, slotName: string): boolean {
   if (armMs(slotName) < Date.parse(state.startsAt)) return false;
+  // A travel day: no slot armed in the 24 h after a zone change (or the silent flight before it) locks.
+  if (inTransit(armMs(slotName))) return false;
   const optIn = OPT_IN[slotName.split("/")[1]];
   if (!optIn) return true;
   const from = optIn(state);

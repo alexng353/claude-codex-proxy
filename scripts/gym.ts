@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Gym plans on the hygiene gate (src/gym.ts). Times are Vancouver wall time
- * ("2026-11-04 18:00") or ISO with an offset.
+ * Gym plans on the hygiene gate (src/gym.ts). Times are wall times in the
+ * phone's current zone ("2026-11-04 18:00", read by the gate) or ISO with an offset.
  *
  *   bun scripts/gym.ts status
  *   bun scripts/gym.ts add "2026-11-04 18:00" [--grace 30] [--note TEXT] [--by NAME]
@@ -18,7 +18,7 @@
  *                                           (workout-tag: a synced workout tagged at the gym counts; for
  *                                            Uplifting builds that send no check-ins)
  */
-import { describeReport, gymCall, parseStart } from "../src/gym-client";
+import { describeReport, gymCall, startArg } from "../src/gym-client";
 import { addDays } from "../src/hygiene";
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -54,14 +54,14 @@ async function main() {
     case "sync":
       return show(await gymCall("/sync", {}));
     case "add": {
-      const start = parseStart(positional[0] ?? "") ?? fail('add needs a start: "YYYY-MM-DD HH:MM" (Vancouver) or ISO with an offset');
+      const start = startArg(positional[0] ?? "") ?? fail('add needs a start: "YYYY-MM-DD HH:MM" (phone zone) or ISO with an offset');
       if (named.grace !== undefined && !/^\d+$/.test(named.grace)) fail("--grace must be a whole number of minutes");
       return show(await gymCall("/plans", { start, by, note, ...(named.grace !== undefined ? { grace_min: Number(named.grace) } : {}) }));
     }
     case "move": {
       const [id, when] = positional;
       if (!id) fail("move needs a plan id");
-      const start = parseStart(when ?? "") ?? fail("move needs a new start");
+      const start = startArg(when ?? "") ?? fail("move needs a new start");
       return show(await gymCall(`/plans/${encodeURIComponent(id)}/move`, { start, by, note }));
     }
     case "cancel":
@@ -74,8 +74,8 @@ async function main() {
       return console.log(`default grace is now ${r.body.settings.graceMin} min (${r.body.note})`);
     }
     case "credit": {
-      const start = parseStart(named.start ?? "") ?? fail("credit needs --start");
-      const end = parseStart(named.end ?? "") ?? fail("credit needs --end");
+      const start = startArg(named.start ?? "") ?? fail("credit needs --start");
+      const end = startArg(named.end ?? "") ?? fail("credit needs --end");
       if (!named.reason || !named.by) fail("credit needs --reason and --by");
       const r = await gymCall("/sessions/credit", {
         start,
@@ -89,8 +89,8 @@ async function main() {
       return console.log(`credited ${r.body.session.id}: ${r.body.session.start} to ${r.body.session.end}`);
     }
     case "pause": {
-      const from = parseStart(DATE.test(named.from ?? "") ? `${named.from} 00:00` : (named.from ?? "")) ?? fail("pause needs --from (YYYY-MM-DD or a time)");
-      const to = parseStart(DATE.test(named.to ?? "") ? `${addDays(named.to!, 1)} 00:00` : (named.to ?? "")) ?? fail("pause needs --to (YYYY-MM-DD, inclusive, or a time)");
+      const from = startArg(DATE.test(named.from ?? "") ? `${named.from} 00:00` : (named.from ?? "")) ?? fail("pause needs --from (YYYY-MM-DD or a time)");
+      const to = startArg(DATE.test(named.to ?? "") ? `${addDays(named.to!, 1)} 00:00` : (named.to ?? "")) ?? fail("pause needs --to (YYYY-MM-DD, inclusive, or a time)");
       if (!named.reason) fail("pause needs --reason");
       return show(await gymCall("/pauses", { from, to, reason: named.reason, by }));
     }

@@ -11,7 +11,7 @@ import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, type ProofKind } from "./hygiene";
-import { gateDisabled, gateStatus, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { gateDisabled, gateStatus, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -108,6 +108,7 @@ function status() {
     enabled: s.enabled,
     state: s.state,
     now: s.now,
+    zone: s.zone,
     today: localTime(Date.parse(s.now)).day,
     outstanding: s.outstanding,
     due_today: s.dueToday,
@@ -129,7 +130,12 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
 
   if (path === "/weight-reviews" && request.method === "GET") return json(weightReviews());
 
-  if (path === "/status" && request.method === "GET") return json(status());
+  if (path === "/status" && request.method === "GET") {
+    // Cairn sends the phone's IANA zone; the gate's days follow it (Alex travels).
+    const zone = request.headers.get("x-device-time-zone");
+    if (zone) await noteDeviceZone(zone);
+    return json(status());
+  }
 
   // Cairn's app-shield "Emergency" button (see shieldBypass).
   if (path === "/bypass" && request.method === "POST") {
