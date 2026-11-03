@@ -372,6 +372,52 @@ describe("BYPASS, debt and penance", () => {
     expect(JSON.stringify(next)).not.toContain("hygiene-gate-note");
   });
 
+  test("a penance can be revised to justified within 12 h, with a reason; the old verdict is kept", async () => {
+    const post = (path: string, body: unknown) =>
+      handleRequest(new Request(`http://localhost/hygiene/debt/${path}`, { method: "POST", body: JSON.stringify(body) }));
+    await decide(request([env, user("BYPASS")]));
+    // Nothing to revise yet: an open debt is ruled with resolve.
+    expect((await post("2026-10-08-1/revise", { verdict: "justified", reason: "x" })).status).toBe(409);
+    expect((await post("2026-10-08-1/resolve", { verdict: "unjustified", reason: "too cold", penance: "photo outside on Broadway" })).status).toBe(200);
+    clock = at(DAY, "07:30");
+    expect(text(await decide(request([env, user("hi")])))).toContain("penance photo: photo outside on Broadway");
+
+    // Leniency only, and a reason is required.
+    expect((await post("2026-10-08-1/revise", { verdict: "unjustified", reason: "x", penance: "y" })).status).toBe(400);
+    expect((await post("2026-10-08-1/revise", { verdict: "justified" })).status).toBe(400);
+    expect((await post("2026-10-08-1/revise", { verdict: "justified", reason: "   " })).status).toBe(400);
+    expect((await post("nope/revise", { verdict: "justified", reason: "x" })).status).toBe(404);
+
+    const revised = await post("2026-10-08-1/revise", { verdict: "justified", reason: "sunrise 08:03, cough" });
+    expect(revised.status).toBe(200);
+    const debt = (await revised.json()).debt;
+    expect(debt).toMatchObject({ status: "justified", reason: "sunrise 08:03, cough" });
+    expect(debt.penance).toBeUndefined();
+    expect(debt.history).toEqual([
+      expect.objectContaining({ status: "penance", reason: "too cold", penance: expect.objectContaining({ description: "photo outside on Broadway" }) }),
+    ]);
+    expect(gateStatus().openDebts).toEqual([]);
+    expect(text(await decide(request([env, user({ photo: "teeth" })])))).not.toContain("penance");
+    // Once justified it can't be revised again.
+    expect((await post("2026-10-08-1/revise", { verdict: "justified", reason: "again" })).status).toBe(409);
+  });
+
+  test("a ruling older than 12 h can't be revised", async () => {
+    await decide(request([env, user("BYPASS")]));
+    await handleRequest(
+      new Request("http://localhost/hygiene/debt/2026-10-08-1/resolve", {
+        method: "POST",
+        body: JSON.stringify({ verdict: "unjustified", reason: "lazy", penance: "walk photo" }),
+      }),
+    );
+    clock += 12 * 3_600_000 + 60_000;
+    const late = await handleRequest(
+      new Request("http://localhost/hygiene/debt/2026-10-08-1/revise", { method: "POST", body: JSON.stringify({ verdict: "justified", reason: "late" }) }),
+    );
+    expect(late.status).toBe(409);
+    expect(gateStatus().openDebts.map((d: { status: string }) => d.status)).toEqual(["penance"]);
+  });
+
   test("accepted photos are archived privately; the state file holds no image data", async () => {
     await decide(request([env, user("not a proof", { photo: "rejected-pixels" })]));
     verdicts.push({ kind: "teeth", confidence: 0.9, reason: "ok" });
@@ -1173,6 +1219,7 @@ describe("Cairn API", () => {
     for (const [path, method] of [
       ["/hygiene/status", "GET"],
       ["/hygiene/debt/x/resolve", "POST"],
+      ["/hygiene/debt/x/revise", "POST"],
       ["/hygiene/gate", "POST"],
       ["/v1/responses", "POST"],
       ["/accounts", "GET"],

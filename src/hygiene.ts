@@ -111,6 +111,14 @@ export type Debt = {
   reason?: string;
   ruledAt?: string;
   penance?: { description: string; setAt: string; paidAt?: string };
+  /** Earlier verdicts a revision replaced, oldest first (POST /hygiene/debt/:id/revise). */
+  history?: Array<{
+    status: Debt["status"];
+    reason?: string;
+    ruledAt?: string;
+    penance?: { description: string; setAt: string; paidAt?: string };
+    revisedAt: string;
+  }>;
 };
 
 export type HiddenNote = { thread: string; key: string; debtId: string; text: string };

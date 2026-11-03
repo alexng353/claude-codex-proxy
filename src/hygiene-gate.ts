@@ -1261,6 +1261,52 @@ export async function resolveDebt(
   });
 }
 
+/** A ruling can be revised toward leniency for this long after it was made. */
+export const REVISE_WINDOW_MS = 12 * 3_600_000;
+
+/**
+ * Revise a ruling toward leniency only: an unpaid penance becomes justified, within 12 h of
+ * the ruling, with a reason. The old verdict is kept in `history`, and the gate opens if the
+ * penance was what held it. Nov 3: a ruling was withdrawn after new facts (sunrise 08:03, a
+ * cough) but resolve refuses a ruled debt, so Alex stayed locked under it.
+ */
+export async function reviseDebt(
+  id: string,
+  body: { verdict?: unknown; reason?: unknown },
+): Promise<{ status: number; body: unknown }> {
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const debt = state.debts.find((d) => d.id === id);
+    if (!debt) return { status: 404, body: { error: "no such debt" } };
+    if (body.verdict !== "justified")
+      return { status: 400, body: { error: 'a revision can only be toward leniency: verdict must be "justified"' } };
+    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    if (!reason || reason.length > 300) return { status: 400, body: { error: "a revision needs a reason (1-300 chars)" } };
+    if (debt.status !== "penance") return { status: 409, body: { error: `only a penance can be revised; debt is ${debt.status}` } };
+    if (debt.penance?.paidAt) return { status: 409, body: { error: "the penance is already paid" } };
+    const now = deps.now();
+    const ruled = Date.parse(debt.ruledAt ?? "");
+    if (!Number.isFinite(ruled) || now - ruled > REVISE_WINDOW_MS)
+      return { status: 409, body: { error: "a ruling can only be revised within 12 h of it" } };
+    const revisedAt = new Date(now).toISOString();
+    (debt.history ??= []).push({
+      status: debt.status,
+      reason: debt.reason,
+      ruledAt: debt.ruledAt,
+      penance: debt.penance,
+      revisedAt,
+    });
+    debt.status = "justified";
+    debt.reason = reason;
+    debt.ruledAt = revisedAt;
+    delete debt.penance;
+    saveState(state);
+    console.error(`hygiene-gate: debt ${id} revised to justified: ${reason.slice(0, 120)}`);
+    release(state, now, "ruling revised");
+    return { status: 200, body: { ok: true, debt } };
+  });
+}
+
 /** /hygiene/* routes. Returns null for paths that are not ours. */
 export async function handleHygieneRoute(request: Request, url: URL): Promise<Response | null> {
   if (!url.pathname.startsWith("/hygiene/")) return null;
@@ -1307,6 +1353,17 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
       return Response.json({ error: "body must be JSON" }, { status: 400 });
     }
     const result = await resolveDebt(ruling[1], body);
+    return Response.json(result.body, { status: result.status });
+  }
+  const revision = /^\/hygiene\/debt\/([A-Za-z0-9-]+)\/revise$/.exec(url.pathname);
+  if (revision && request.method === "POST") {
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return Response.json({ error: "body must be JSON" }, { status: 400 });
+    }
+    const result = await reviseDebt(revision[1], body);
     return Response.json(result.body, { status: result.status });
   }
   return null;
