@@ -1120,6 +1120,27 @@ describe("Cairn API", () => {
     expect(await reviews.json()).toMatchObject({ reviews: [], pending: 1 });
   });
 
+  test("a penance photo sent from Cairn pays the penance; with none open it's not due", async () => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    const ruled = new Date(clock - 3_600_000).toISOString();
+    raw.debts = [{ id: "d1", at: ruled, skipped: [], status: "penance", ruledAt: ruled, penance: { description: "walk photo outside", setAt: ruled } }];
+    await writeFile(path, JSON.stringify(raw));
+    resetGateCache();
+    exif["penance-photo"] = clock - 60_000;
+    verdicts.push({ kind: "penance", confidence: 0.95, reason: "outdoors" });
+    const paid = (await (await submit("penance", "penance-photo")).json()) as any;
+    expect(paid).toMatchObject({ result: "pass", verdict: "accepted", slot: "penance/d1" });
+    expect(paid.gate.open_debts).toEqual([]);
+    const state = JSON.parse(readFileSync(path, "utf8"));
+    expect(state.debts[0].penance.paidAt).toBeString();
+
+    exif["penance-again"] = clock - 60_000;
+    const again = (await (await submit("penance", "penance-again")).json()) as any;
+    expect(again.result).toBe("fail");
+    expect(again.verdict).toBe("not_due");
+  });
+
   test("auth: no token, unknown token and agent devices are refused; a down relay is 503", async () => {
     expect((await api("/status")).status).toBe(401);
     expect((await api("/status", { token: "nope" })).status).toBe(401);
