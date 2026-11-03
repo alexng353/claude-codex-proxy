@@ -100,7 +100,18 @@ export async function gpsFix(bytes: Buffer): Promise<{ lat: number; lon: number 
   return parseGpsFix(out?.toString("utf8") ?? "");
 }
 
-const EXIFTOOL = process.env.HYGIENE_EXIFTOOL_BIN ?? "exiftool";
+/**
+ * exiftool's path. Arch installs it in /usr/bin/vendor_perl, which a systemd
+ * unit's PATH usually lacks (found live 2026-11-02: every keepsake would have
+ * been dropped), so those Perl directories are searched too.
+ */
+export function exiftoolBin(env: Record<string, string | undefined> = process.env): string | null {
+  if (env.HYGIENE_EXIFTOOL_BIN) return env.HYGIENE_EXIFTOOL_BIN;
+  const path = [env.PATH ?? "", "/usr/bin/vendor_perl", "/usr/bin/site_perl", "/usr/bin/core_perl"].filter(Boolean).join(":");
+  return Bun.which("exiftool", { PATH: path });
+}
+const EXIFTOOL = exiftoolBin();
+if (!EXIFTOOL) console.error("hygiene-proof: exiftool not found; photo keepsakes will not be saved");
 
 /**
  * The same image with its location removed: every EXIF GPS tag and all XMP
@@ -117,6 +128,7 @@ export async function stripGps(image: DecodedImage): Promise<DecodedImage | null
 }
 
 async function exiftool(args: string[], input: Buffer): Promise<Buffer | null> {
+  if (!EXIFTOOL) return null;
   try {
     const child = Bun.spawn([EXIFTOOL, ...args], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
     child.stdin.write(input);

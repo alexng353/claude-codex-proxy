@@ -13,7 +13,7 @@ import {
   zonedTime,
   type GateState,
 } from "../src/hygiene";
-import { captureTime, dhashFromGray, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps } from "../src/hygiene-proof";
+import { captureTime, dhashFromGray, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps, exiftoolBin } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 /** Vancouver wall time on a given day, e.g. at("2026-10-08", "05:00"). */
@@ -439,6 +439,11 @@ describe("proof helpers", () => {
     expect(parseCaptureTime("2026:10:08 05:10:00|")).toBe(Date.parse("2026-10-08T12:10:00Z"));
     expect(parseCaptureTime("|")).toBeNull();
     expect(parseCaptureTime("")).toBeNull();
+  });
+
+  test.skipIf(!Bun.which("exiftool", { PATH: "/usr/bin/vendor_perl" }))("exiftool is found with a service PATH that lacks vendor_perl", () => {
+    expect(exiftoolBin({ PATH: "/usr/local/bin:/usr/bin" })).toBe("/usr/bin/vendor_perl/exiftool");
+    expect(exiftoolBin({ PATH: "/x", HYGIENE_EXIFTOOL_BIN: "/opt/et" })).toBe("/opt/et");
   });
 
   test.skipIf(!Bun.which("exiftool") || !Bun.which("magick"))("stripGps removes EXIF and XMP GPS from a real JPEG and keeps the capture time", async () => {
