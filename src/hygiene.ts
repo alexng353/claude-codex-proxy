@@ -27,7 +27,9 @@
 import { createHash } from "node:crypto";
 import { gymDueToday, gymOutstanding, type GymState } from "./gym";
 import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from "./types";
-import { wallTime, zoneSource } from "./zone";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { offsetAt, wallTime, zoneSource } from "./zone";
 
 export const TIME_ZONE = "America/Vancouver";
 export const MORNING_MINUTE = 5 * 60;
@@ -193,6 +195,13 @@ export const TRANSIT_MS = 24 * 3_600_000;
 const TRANSIT_GAP_MAX_MS = 48 * 3_600_000;
 /** Zone changes closer together than this don't grant another travel day: flipping the phone's zone is not a way out. */
 export const TRANSIT_COOLDOWN_MS = 7 * 86_400_000;
+/**
+ * Only a change that moves the clock this much is a travel day. A same-clock
+ * alias (Canada/Pacific, America/Los_Angeles) or a one-hour hop is not: the
+ * morning still happens at a normal hour, and picking a city by hand on the
+ * phone must not open the gate.
+ */
+export const TRANSIT_MIN_SHIFT_MS = 3 * 3_600_000;
 
 type ZoneEntry = { zone: string; from: number; seenAt: number };
 let zoneHistory: ZoneEntry[] = [];
@@ -201,6 +210,10 @@ let transitWindows: Array<[number, number]> = [];
 /** Whether `name` is a zone the system zone database has (never Intl's guess). */
 export function knownZone(name: string): boolean {
   if (!/^[A-Za-z][A-Za-z0-9_+\-]*(\/[A-Za-z0-9_+\-]+){0,2}$/.test(name) || name.length > 64) return false;
+  // posix/ and right/ are copies of the same zones under another name (right/ also counts leap seconds).
+  if (/^(posix|right)\//.test(name)) return false;
+  // Check the file first, so a made-up name never reaches the zone cache or its Intl fallback.
+  if (!existsSync(join(process.env.TZDIR || "/usr/share/zoneinfo", name))) return false;
   const kind = zoneSource(name).kind;
   return kind === "tzif" || kind === "stale";
 }
@@ -218,7 +231,11 @@ export function setZoneHistory(zones: ZoneChange[] | undefined): void {
   let previous = { zone: TIME_ZONE, seenAt: Number.NEGATIVE_INFINITY };
   let granted = Number.NEGATIVE_INFINITY;
   for (const entry of zoneHistory) {
-    if (entry.zone !== previous.zone && entry.from - granted >= TRANSIT_COOLDOWN_MS) {
+    const shift =
+      entry.zone === previous.zone
+        ? 0
+        : Math.abs(offsetAt(entry.from, entry.zone).offsetMs - offsetAt(entry.from, previous.zone).offsetMs);
+    if (shift >= TRANSIT_MIN_SHIFT_MS && entry.from - granted >= TRANSIT_COOLDOWN_MS) {
       // From the last report of the old zone (the flight had no signal), at most 48 h back.
       const start = Math.max(Math.min(previous.seenAt, entry.from), entry.from - TRANSIT_GAP_MAX_MS);
       transitWindows.push([start, entry.from + TRANSIT_MS]);

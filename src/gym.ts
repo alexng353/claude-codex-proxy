@@ -28,6 +28,13 @@ export type GymPlan = {
   /** Planned start, ISO. */
   start: string;
   graceMin: number;
+  /**
+   * How this plan is judged, saved when it is added (like graceMin), so a later
+   * settings change can't rewrite a plan that already started or failed.
+   * Absent on older plans: those follow the current settings.
+   */
+  proof?: GymSettings["proof"];
+  tagPattern?: string;
   status: "planned" | "cancelled";
   createdAt: string;
   note?: string;
@@ -263,12 +270,17 @@ function baseCheck(
 }
 
 /** Whether a finished session counts, and why not when it doesn't. */
-export function checkSession(gym: GymState, session: GymSession, photos: PhotoMatch = matchPhotos(gym)): SessionCheck {
+export function checkSession(
+  gym: GymState,
+  session: GymSession,
+  photos: PhotoMatch = matchPhotos(gym),
+  settings: GymSettings = gymSettings(gym),
+): SessionCheck {
   if (session.manual) return { session, qualifies: true };
   const base = baseCheck(gym, session);
   if (!base.ok) return { session, qualifies: false, reason: base.reason };
   // No location from Uplifting (an old build, GPS off): this session's gym photo stands in.
-  const s = gymSettings(gym);
+  const s = settings;
   // Workout-tag mode: the old Uplifting build sends no check-ins; its gym tag stands in.
   if (base.needsPhoto && s.proof === "workout-tag" && tagMatches(s, session.gymTag)) return { session, qualifies: true };
   if (base.needsPhoto && !photos.bySession.has(session.id))
@@ -337,7 +349,19 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   if (!gym) return [];
   const s = gymSettings(gym);
   const photos = matchPhotos(gym);
-  const checks = gym.sessions.map((session) => checkSession(gym, session, photos));
+  // Each plan is judged by the proof mode and tag it was added with.
+  const settingsFor = (plan: GymPlan): GymSettings => ({
+    ...s,
+    proof: plan.proof ?? s.proof,
+    tagPattern: plan.tagPattern ?? s.tagPattern,
+  });
+  const checkMemo = new Map<string, SessionCheck[]>();
+  const checksFor = (ps: GymSettings) => {
+    const key = `${ps.proof}\u0000${ps.tagPattern}`;
+    let found = checkMemo.get(key);
+    if (!found) checkMemo.set(key, (found = gym.sessions.map((session) => checkSession(gym, session, photos, ps))));
+    return found;
+  };
   const used = new Set<string>();
   const finishedClients = new Map(gym.sessions.filter((x) => x.clientId).map((x) => [x.clientId!, x]));
   const plans = [...gym.plans].sort((a, b) => ms(a.start) - ms(b.start));
@@ -357,6 +381,8 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   for (const plan of plans) {
     const start = ms(plan.start);
     const deadline = start + plan.graceMin * MIN;
+    const ps = settingsFor(plan);
+    const checks = checksFor(ps);
     if (plan.settled) {
       used.add(plan.settled.sessionId);
       results.push({ plan, status: plan.settled.status, deadline, sessionId: plan.settled.sessionId });
@@ -393,7 +419,7 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
     // Evidence of a miss: a read from after the moment the plan failed.
     // Workout-tag mode has no Start to see, so the workout gets maxOpenMin to finish and sync.
     const failedAt = Math.max(
-      s.proof === "workout-tag" ? deadline + s.maxOpenMin * MIN : deadline,
+      ps.proof === "workout-tag" ? deadline + s.maxOpenMin * MIN : deadline,
       ...unfinished.map((c) => ms(c.at) + s.maxOpenMin * MIN),
     );
     if (now < failedAt || !(gym.syncedAt && ms(gym.syncedAt) >= failedAt)) {
@@ -415,7 +441,7 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
         ? "started, never finished"
         : inWindowFail
           ? `session didn't count: ${inWindowFail.reason ?? "did not qualify"}`
-          : s.proof === "workout-tag"
+          : ps.proof === "workout-tag"
             ? `no workout tagged at the gym starting by ${clockLabel(deadline)}`
             : `no Start at the gym by ${clockLabel(deadline)}`;
     results.push({ plan, status: "missed", deadline, reason, failedAt });
@@ -437,7 +463,7 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   for (const result of misses) {
     const opens = ms(result.plan.start) - s.earlyMin * MIN;
     const madeAt = plannedAt(result.plan);
-    const makeup = checks
+    const makeup = checksFor(settingsFor(result.plan))
       .filter(
         (c) =>
           c.qualifies &&
@@ -492,8 +518,9 @@ export const missLocks = (r: PlanResult, now: number) => now < (r.failedAt ?? r.
  */
 export function gymOutstanding(gym: GymState | undefined, now: number): GymRequirement[] {
   if (!gym?.syncedAt || gym.syncError || now - ms(gym.syncedAt) > FRESH_READ_MS) return [];
-  // During a travel pause nothing gym-related locks, except a miss that was already locking
-  // when the pause was made: a pause is for travel, not a way out of a live lock.
+  // During a travel pause nothing gym-related locks, except a plan that had already started
+  // when the pause was made: a pause is for travel, not a way out of a plan under way or a
+  // live lock.
   const pause = pauseAt(gym, now);
   return evaluateGym(gym, now)
     // A plan whose deadline fell on a travel day (a zone change) doesn't lock either.
@@ -502,7 +529,7 @@ export function gymOutstanding(gym: GymState | undefined, now: number): GymRequi
         r.status === "missed" &&
         missLocks(r, now) &&
         !inTransit(r.deadline) &&
-        (!pause || (r.failedAt ?? r.deadline) <= ms(pause.at)),
+        (!pause || ms(r.plan.start) <= ms(pause.at)),
     )
     .map((r) => ({
       slot: gymSlot(r.plan.id),
@@ -556,11 +583,14 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
     const grace = edit.graceMin ?? gymSettings(gym).graceMin;
     if (!Number.isInteger(grace) || grace < 0 || grace > MAX_GRACE_MIN)
       return { ok: false, error: `grace must be a whole number of minutes, 0-${MAX_GRACE_MIN}` };
+    const { proof, tagPattern } = gymSettings(gym);
     const iso = new Date(start).toISOString();
     const plan: GymPlan = {
       id: nextId(gym, start),
       start: iso,
       graceMin: grace,
+      proof,
+      tagPattern,
       status: "planned",
       createdAt: nowIso,
       ...(note ? { note } : {}),

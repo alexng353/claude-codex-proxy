@@ -9,7 +9,7 @@
 import { describeReport, gymCall, startArg } from "./gym-client";
 
 const WHEN =
-  'Vancouver wall time "YYYY-MM-DD HH:MM" (e.g. "2026-11-04 18:00"), or ISO with an offset. Must be in the future.';
+  'Wall time "YYYY-MM-DD HH:MM" in the phone\'s current zone (e.g. "2026-11-04 18:00"; Vancouver unless Cairn reports another), or with a zone name for a time elsewhere ("2026-12-05 18:00 America/Vancouver"), or ISO with an offset. Must be in the future. The reply shows the zone when it isn\'t Vancouver.';
 
 export const TOOLS = [
   {

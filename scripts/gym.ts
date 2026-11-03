@@ -12,7 +12,7 @@
  *   bun scripts/gym.ts credit --start T --end T --reason TEXT --by NAME [--workout ID] [--sets N]
  *                                           (hand credit for a session verified outside the gate)
  *   bun scripts/gym.ts pause --from 2026-11-14 --to 2026-12-03 --reason TEXT [--by NAME]
- *                                           (travel pause; plain dates are whole Vancouver days, to inclusive)
+ *                                           (travel pause; plain dates are whole days in the phone's zone, to inclusive)
  *   bun scripts/gym.ts pause-end ID [--by NAME]
  *   bun scripts/gym.ts proof checkins|workout-tag [--tag TEXT]
  *                                           (workout-tag: a synced workout tagged at the gym counts; for

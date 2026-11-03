@@ -222,7 +222,8 @@ const unknownZonesLogged = new Set<string>();
 export async function noteDeviceZone(raw: string): Promise<void> {
   const zone = raw.trim();
   if (!knownZone(zone)) {
-    if (!unknownZonesLogged.has(zone.slice(0, 64))) {
+    // Logged once per name, and only for the first few names, so a bad client can't grow the set or the log.
+    if (unknownZonesLogged.size < 32 && !unknownZonesLogged.has(zone.slice(0, 64))) {
       unknownZonesLogged.add(zone.slice(0, 64));
       console.error(`hygiene-gate: ignored unknown device time zone ${JSON.stringify(zone.slice(0, 64))}; keeping ${zoneAt(deps.now())}`);
     }
@@ -253,7 +254,8 @@ export async function noteDeviceZone(raw: string): Promise<void> {
     const cutoff = now - RETAIN_MS;
     while (zones.length > 1 && Date.parse(zones[1].from) < cutoff) zones.shift();
     saveState(state);
-    if (last?.zone !== zone) release(state, now, "time zone changed");
+    // The first report only starts the record; nothing about the gate changed.
+    if (last && last.zone !== zone) release(state, now, "time zone changed");
   });
 }
 
