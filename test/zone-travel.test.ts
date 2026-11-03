@@ -156,6 +156,9 @@ describe("travel: the gate's day follows the phone's zone", () => {
     expect(canonicalZone(CB, Z("2026-11-03T14:47:15Z"))).toBe(VAN);
     // Still Vancouver's clock the month before its DST start: no early flip (comb F1).
     expect(canonicalZone(CB, Z("2027-02-20T12:00:00Z"))).toBe(VAN);
+    // Its DST start, from zdump: the last second on Vancouver's clock, then the first off it.
+    expect(canonicalZone(CB, Z("2027-03-14T08:59:59Z"))).toBe(VAN);
+    expect(canonicalZone(CB, Z("2027-03-14T09:00:00Z"))).toBe(CB);
     expect(canonicalZone(JKT, Z("2026-11-15T01:00:00Z"))).toBe(JKT);
     // Once its clock differs, a report of it is a real (1 h) change.
     expect(canonicalZone(CB, Z("2027-03-20T15:00:00Z"))).toBe(CB);
@@ -173,6 +176,14 @@ describe("travel: the gate's day follows the phone's zone", () => {
     expect(zoneAt(Z("2027-03-20T15:00:00Z"))).toBe(VAN);
     // Mar 20 2027 08:00 Vancouver, not 09:00 as Cambridge_Bay would read it.
     expect(localTime(Z("2027-03-20T15:00:00Z"))).toEqual({ day: "2027-03-20", minutes: 8 * 60 });
+    expect(inTransit(Z("2026-11-03T16:00:00Z"))).toBe(false);
+    // The stored alias alone changes no slot, after Mar 14 too.
+    for (const at of [Z("2026-11-10T14:00:00Z"), Z("2027-03-20T13:30:00Z")]) {
+      setZoneHistory(undefined);
+      const before = slots(state(), at);
+      setZoneHistory(trip.slice(0, 1));
+      expect(slots(state(), at)).toEqual(before);
+    }
 
     setZoneHistory(trip);
     expect(zoneAt(Z("2026-11-20T03:00:00Z"))).toBe(JKT);

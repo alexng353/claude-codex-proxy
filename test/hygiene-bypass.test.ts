@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setZoneHistory, zonedTime } from "../src/hygiene";
+import { inTransit, setZoneHistory, zonedTime } from "../src/hygiene";
 import { handleHygieneApi, setAuthenticator } from "../src/hygiene-api";
 import { resetGateCache, setGateDeps } from "../src/hygiene-gate";
 
@@ -352,5 +352,13 @@ describe("device time zone (X-Device-Time-Zone on GET /status)", () => {
     clock = Date.parse("2027-03-20T15:00:00Z");
     expect((await status(CB)).zone).toBe(CB);
     expect((await state()).zones.map((z: any) => z.zone).at(-1)).toBe(CB);
+    expect(inTransit(Date.parse("2027-03-20T16:00:00Z"))).toBe(false);
+    // Back on Vancouver's clock (Nov 7 2027): a new Vancouver entry, the March record kept.
+    clock = Date.parse("2027-11-10T15:00:00Z");
+    expect((await status(CB)).zone).toBe("America/Vancouver");
+    const later = (await state()).zones;
+    expect(later).toHaveLength(5);
+    expect(later[3].zone).toBe(CB);
+    expect(later[4].zone).toBe("America/Vancouver");
   });
 });

@@ -259,7 +259,7 @@ export async function noteDeviceZone(raw: string): Promise<void> {
       last.zone = zone;
       last.seenAt = nowIso;
     } else {
-      if (last) console.error(`hygiene-gate: device time zone ${last.zone} -> ${zone}${named === zone ? "" : ` (reported ${named})`}`);
+      if (last) console.error(`hygiene-gate: device time zone ${previous ?? last.zone} -> ${zone}${named === zone ? "" : ` (reported ${named})`}`);
       zones.push({ zone, from: nowIso, seenAt: nowIso });
     }
     // Keep a year of history, plus the entry in effect before it.
