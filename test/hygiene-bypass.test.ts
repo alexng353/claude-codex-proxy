@@ -318,4 +318,30 @@ describe("device time zone (X-Device-Time-Zone on GET /status)", () => {
     await status("Asia/Jakarta");
     expect((await state()).zones[1].seenAt).toBe(iso(clock));
   });
+
+  test("a Vancouver-clock alias (America/Cambridge_Bay) is recorded as Vancouver, and a stored one is renamed", async () => {
+    const CB = "America/Cambridge_Bay";
+    const first = await status(CB);
+    expect(first.zone).toBe("America/Vancouver");
+    expect((await state()).zones.map((z: any) => z.zone)).toEqual(["America/Vancouver"]);
+
+    // State written before the fix: the alias as named. It reads as Vancouver, and the next
+    // report renames it in place instead of recording a change.
+    const s = await state();
+    s.zones = [{ zone: CB, from: iso(clock - 3_600_000), seenAt: iso(clock - 3_600_000) }];
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    expect((await status()).zone).toBe("America/Vancouver");
+    clock += 60_000;
+    await status(CB);
+    const zones = (await state()).zones;
+    expect(zones.map((z: any) => z.zone)).toEqual(["America/Vancouver"]);
+    expect(zones[0].seenAt).toBe(iso(clock));
+
+    clock += 60_000;
+    expect((await status("Asia/Jakarta")).zone).toBe("Asia/Jakarta");
+    clock += 60_000;
+    expect((await status(CB)).zone).toBe("America/Vancouver");
+    expect((await state()).zones.map((z: any) => z.zone)).toEqual(["America/Vancouver", "Asia/Jakarta", "America/Vancouver"]);
+  });
 });

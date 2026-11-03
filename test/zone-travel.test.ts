@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { parseStart } from "../src/gym-client";
 import {
+  canonicalZone,
   emptyState,
   inTransit,
   knownZone,
@@ -146,5 +147,44 @@ describe("travel: the gate's day follows the phone's zone", () => {
     }
     expect(knownZone("Asia/Jakarta")).toBe(true);
     for (const bad of ["posix/America/Vancouver", "right/Asia/Jakarta", "Mars/Olympus"]) expect(knownZone(bad)).toBe(false);
+  });
+
+  // Nov 3: Alex's phone reports America/Cambridge_Bay for BC's permanent UTC-7. Same clock
+  // until Mar 14 2027, then an hour ahead: it must read as Vancouver, not drift then.
+  test("Cambridge_Bay with Vancouver's clock is Vancouver; Jakarta switches; the return is Vancouver again", () => {
+    const CB = "America/Cambridge_Bay";
+    expect(canonicalZone(CB, Z("2026-11-03T14:47:15Z"))).toBe(VAN);
+    expect(canonicalZone(JKT, Z("2026-11-15T01:00:00Z"))).toBe(JKT);
+    // Within 30 days of its DST start it no longer keeps Vancouver's clock: kept as named.
+    expect(canonicalZone(CB, Z("2027-02-20T12:00:00Z"))).toBe(CB);
+    // A UTC-8 zone is not Vancouver's clock now.
+    expect(canonicalZone("America/Los_Angeles", Z("2026-11-03T14:47:15Z"))).toBe("America/Los_Angeles");
+
+    // The live state's record (Nov 3 07:47 PST), and the trip with Cambridge_Bay on both ends.
+    const trip: ZoneChange[] = [
+      { zone: CB, from: "2026-11-03T14:47:15Z", seenAt: "2026-11-14T03:00:00Z" },
+      { zone: JKT, from: "2026-11-15T01:00:00Z", seenAt: "2026-12-03T03:00:00Z" },
+      { zone: CB, from: "2026-12-04T04:00:00Z", seenAt: "2026-12-04T04:00:00Z" },
+    ];
+    setZoneHistory(trip.slice(0, 1));
+    expect(zoneAt(Z("2026-11-10T14:00:00Z"))).toBe(VAN);
+    expect(zoneAt(Z("2027-03-20T15:00:00Z"))).toBe(VAN);
+    // Mar 20 2027 08:00 Vancouver, not 09:00 as Cambridge_Bay would read it.
+    expect(localTime(Z("2027-03-20T15:00:00Z"))).toEqual({ day: "2027-03-20", minutes: 8 * 60 });
+    expect(inTransit(Z("2026-11-03T16:00:00Z"))).toBe(false);
+    // The alias alone changes no slot.
+    const at = Z("2026-11-10T14:00:00Z");
+    setZoneHistory(undefined);
+    const before = slots(state(), at);
+    setZoneHistory(trip.slice(0, 1));
+    expect(slots(state(), at)).toEqual(before);
+
+    setZoneHistory(trip);
+    expect(zoneAt(Z("2026-11-20T03:00:00Z"))).toBe(JKT);
+    expect(inTransit(Z("2026-11-15T03:00:00Z"))).toBe(true);
+    expect(zoneAt(Z("2026-12-05T15:00:00Z"))).toBe(VAN);
+    // The return is a real 14 h change: a travel day, as with a Vancouver report.
+    expect(inTransit(Z("2026-12-04T10:00:00Z"))).toBe(true);
+    expect(inTransit(Z("2026-12-06T10:00:00Z"))).toBe(false);
   });
 });

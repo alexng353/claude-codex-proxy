@@ -54,6 +54,7 @@ import {
   walkStartedAt,
   WALK_MS,
   zonedTime,
+  canonicalZone,
   knownZone,
   setZoneHistory,
   zoneAt,
@@ -62,6 +63,7 @@ import {
   type GateState,
   type ImageRecord,
   type ProofKind,
+  type ZoneChange,
 } from "./hygiene";
 import {
   archivePhoto,
@@ -223,20 +225,23 @@ const unknownZonesLogged = new Set<string>();
  * is logged and can open the gate (a travel day), so held chats are released.
  */
 export async function noteDeviceZone(raw: string): Promise<void> {
-  const zone = raw.trim();
-  if (!knownZone(zone)) {
+  const named = raw.trim();
+  if (!knownZone(named)) {
     // Logged once per name, and only for the first few names, so a bad client can't grow the set or the log.
-    if (unknownZonesLogged.size < 32 && !unknownZonesLogged.has(zone.slice(0, 64))) {
-      unknownZonesLogged.add(zone.slice(0, 64));
-      console.error(`hygiene-gate: ignored unknown device time zone ${JSON.stringify(zone.slice(0, 64))}; keeping ${zoneAt(deps.now())}`);
+    if (unknownZonesLogged.size < 32 && !unknownZonesLogged.has(named.slice(0, 64))) {
+      unknownZonesLogged.add(named.slice(0, 64));
+      console.error(`hygiene-gate: ignored unknown device time zone ${JSON.stringify(named.slice(0, 64))}; keeping ${zoneAt(deps.now())}`);
     }
     return;
   }
+  // An alias with Vancouver's clock (America/Cambridge_Bay) is Vancouver: no change, no travel day.
+  const zone = canonicalZone(named, deps.now());
+  const lastZone = (last: ZoneChange | undefined) => last && canonicalZone(last.zone, Date.parse(last.from));
   const needed = (state: GateState, now: number) => {
     const last = state.zones?.at(-1);
     // The first report starts the record (Vancouver included), so a later change knows when the old zone was last seen.
     if (!last) return true;
-    if (last.zone !== zone) return true;
+    if (lastZone(last) !== zone || last.zone !== zone) return true;
     return now - Date.parse(last.seenAt ?? last.from) >= ZONE_SEEN_EVERY_MS;
   };
   // Most reads change nothing: skip the lock.
@@ -248,9 +253,13 @@ export async function noteDeviceZone(raw: string): Promise<void> {
     const nowIso = new Date(now).toISOString();
     const zones = (state.zones ??= []);
     const last = zones.at(-1);
-    if (last && last.zone === zone) last.seenAt = nowIso;
-    else {
-      if (last) console.error(`hygiene-gate: device time zone ${last.zone} -> ${zone}`);
+    const previous = lastZone(last);
+    if (last && previous === zone) {
+      // A stored alias is written back under its Vancouver name.
+      last.zone = zone;
+      last.seenAt = nowIso;
+    } else {
+      if (last) console.error(`hygiene-gate: device time zone ${last.zone} -> ${zone}${named === zone ? "" : ` (reported ${named})`}`);
       zones.push({ zone, from: nowIso, seenAt: nowIso });
     }
     // Keep a year of history, plus the entry in effect before it.
@@ -258,7 +267,7 @@ export async function noteDeviceZone(raw: string): Promise<void> {
     while (zones.length > 1 && Date.parse(zones[1].from) < cutoff) zones.shift();
     saveState(state);
     // A first report of Vancouver only starts the record; nothing about the gate changed.
-    if ((last?.zone ?? TIME_ZONE) !== zone) release(state, now, "time zone changed");
+    if ((previous ?? TIME_ZONE) !== zone) release(state, now, "time zone changed");
   });
 }
 
