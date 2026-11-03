@@ -702,7 +702,8 @@ function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
   if (outstanding(state, now).length || outstanding(atTapView(state), anchor).length) return false;
   const after = (iso: string | null | undefined) => !!iso && Date.parse(iso) > anchor;
   if (state.images.some((r) => r.verdict === "accepted" && after(r.at))) return false;
-  if (state.debts.some((d) => after(d.penance?.paidAt))) return false;
+  // A penance revised away after the tap cleared a lock too, like one paid (comb, Nov 3).
+  if (state.debts.some((d) => after(d.penance?.paidAt) || d.history?.some((h) => after(h.revisedAt)))) return false;
   if (state.gym?.sessions.some((s) => after(s.seenAt))) return false;
   if (state.gym?.checkins.some((c) => after(c.receivedAt))) return false;
   if (state.delay.until && Date.parse(state.delay.until) - DELAY_MS > anchor) return false;
@@ -1363,6 +1364,8 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
     } catch {
       return Response.json({ error: "body must be JSON" }, { status: 400 });
     }
+    if (!body || typeof body !== "object" || Array.isArray(body))
+      return Response.json({ error: "body must be a JSON object" }, { status: 400 });
     const result = await reviseDebt(revision[1], body);
     return Response.json(result.body, { status: result.status });
   }

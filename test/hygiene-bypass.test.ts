@@ -147,6 +147,21 @@ describe("shield bypass", () => {
     expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
   });
 
+  test("a penance revised away after the tap does not make the tap free", async () => {
+    const s = await state();
+    s.filled = { [`${DAY}/morning-teeth`]: iso(at(DAY, "05:30")) };
+    s.debts = [{
+      id: "d0", at: iso(at(DAY, "05:00")), skipped: [], status: "justified", reason: "new facts", ruledAt: iso(at(DAY, "06:20")),
+      history: [{ status: "penance", ruledAt: iso(at(DAY, "05:10")), penance: { description: "walk", setAt: iso(at(DAY, "05:10")) }, revisedAt: iso(at(DAY, "06:20")) }],
+    }];
+    await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+    resetGateCache();
+    clock = at(DAY, "06:30");
+    const r = await bypass({ minutes: 15, source: "cairn-shield", at: iso(at(DAY, "06:10")) });
+    expect(r.body.gate.state).toBe("clear");
+    expect(r.body.debt_id).toBe(`${DAY}-shield-1`);
+  });
+
   describe("gym", () => {
     // Morning photo done, so only the gym can lock. A 07:00 plan misses at 07:30.
     const plan = { id: "p", start: iso(at(DAY, "07:00")), graceMin: 30, status: "planned" as const, createdAt: iso(at(DAY, "01:00")), log: [] };

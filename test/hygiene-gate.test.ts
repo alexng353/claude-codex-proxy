@@ -743,6 +743,33 @@ describe("held messages wake their chat when the gate unlocks", () => {
     expect(wakes).toHaveLength(1);
   });
 
+  test("revising the penance that held a chat wakes it; a paid penance can't be revised", async () => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const s = JSON.parse(await readFile(path, "utf8"));
+    s.filled = { ...(s.filled ?? {}), [`${DAY}/morning-teeth`]: new Date(at(DAY, "05:30")).toISOString() };
+    const ruled = new Date(at(DAY, "06:00")).toISOString();
+    s.debts = [
+      { id: "d1", at: ruled, skipped: [], status: "penance", reason: "too cold", ruledAt: ruled, penance: { description: "walk photo", setAt: ruled } },
+      { id: "d2", at: ruled, skipped: [], status: "paid", ruledAt: ruled, penance: { description: "x", setAt: ruled, paidAt: ruled } },
+    ];
+    await writeFile(path, JSON.stringify(s));
+    resetGateCache();
+    clock = at(DAY, "06:20");
+    const held = await decide(request([env, user("plan my day")], "composer", { prompt_cache_key: OTHER }));
+    expect(text(held)).toContain("penance photo: walk photo");
+    clock = at(DAY, "06:40");
+    const post = (id: string, body: string) =>
+      handleRequest(new Request(`http://localhost/hygiene/debt/${id}/revise`, { method: "POST", body }));
+    expect((await post("d2", JSON.stringify({ verdict: "justified", reason: "x" }))).status).toBe(409);
+    expect((await post("d1", "null")).status).toBe(400);
+    expect((await post("d1", JSON.stringify({ verdict: "justified", reason: "sunrise 08:03" }))).status).toBe(200);
+    expect(gateStatus()).toMatchObject({ state: "clear", openDebts: [] });
+    await flushWakes();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0].thread).toBe(OTHER);
+    expect(wakes[0].text).toContain("plan my day");
+  });
+
   test("an unlock with nothing held posts nothing", async () => {
     verdicts.push(teeth);
     expect((await cairnTeeth("cairn-teeth")).result).toBe("pass");
