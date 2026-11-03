@@ -107,6 +107,8 @@ export type GateDeps = {
   captureTime: (bytes: Buffer) => Promise<number | null>;
   /** EXIF GPS of a photo, for gym photos. */
   gpsFix: (bytes: Buffer) => Promise<{ lat: number; lon: number } | null>;
+  /** A photo without its location tags, for the keepsake; null when that can't be guaranteed. */
+  stripGps: typeof stripGps;
   /** Saves an accepted photo and returns its path. */
   archive: typeof archivePhoto;
   /** Base URL the model uses for the ruling endpoint. */
@@ -123,6 +125,7 @@ const defaults: GateDeps = {
   dhash,
   captureTime,
   gpsFix,
+  stripGps,
   archive: archivePhoto,
   baseUrl: `http://127.0.0.1:${process.env.PORT ?? 3456}`,
   wake: todayWake,
@@ -325,8 +328,12 @@ function release(state: GateState, now: number, reason: string, current?: string
   return released;
 }
 
-/** `gym`: this photo added a gym check-in (save the state; the gate may have opened). */
-type ImageOutcome = { line: string | null; record?: ImageRecord; gym?: boolean };
+/**
+ * `gym`: this photo added a gym check-in (save the state; the gate may have
+ * opened). `retry`: the hygiene check failed and the same photo should be
+ * sent again; nothing about its hygiene verdict was recorded.
+ */
+type ImageOutcome = { line: string | null; record?: ImageRecord; gym?: boolean; retry?: boolean };
 
 /** Restricts a check to one requirement type (Cairn says which proof it sends). */
 export type ProofTarget = { kind: ProofKind; slot: (name: string) => boolean };
@@ -345,9 +352,9 @@ async function checkImageRecorded(
   const result = outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
   if (!gym) return result;
   let record = result.record;
-  // Nothing hygiene-related was due (no record and no line; a checker error has a line and stays
-  // retryable): keep a record, with its dhash, so this photo or a near-copy can't be replayed.
-  if (!record && !result.line && gym.recorded) {
+  // Nothing hygiene-related was due (no record, no line, no retry): keep a record so the
+  // photo can't later be passed off as a hygiene proof. A checker error stays retryable.
+  if (!record && !result.line && !result.retry && gym.recorded) {
     record = {
       sha256: gym.hash,
       dhash: gym.dhash,
@@ -361,15 +368,21 @@ async function checkImageRecorded(
   }
   // "No hygiene proof visible" is noise when the photo was meant for the gym.
   const hygieneLine = record?.verdict === "rejected" && record.kind === "none" ? null : result.line;
-  return { line: hygieneLine ? `${gym.line}\n${hygieneLine}` : gym.line, ...(record ? { record } : {}), gym: gym.recorded };
+  return {
+    line: hygieneLine ? `${gym.line}\n${hygieneLine}` : gym.line,
+    ...(record ? { record } : {}),
+    gym: gym.recorded,
+    ...(result.retry ? { retry: true } : {}),
+  };
 }
 
 /**
  * A photo taken at the gym while a plan could use it (Alex, 2026-11-02: a
  * geotagged photo at Gold's plus the Uplifting log counts if Uplifting's
- * location fails). Needs a fresh camera time, GPS inside the gym radius, and
- * no near copy among earlier photos; it is stored as a Start check-in,
- * distance only. Null when the photo isn't a usable gym photo.
+ * location fails). Needs a fresh camera time and GPS inside the gym radius;
+ * it is stored as a Start check-in with its dhash, distance only. A replay or
+ * a near copy of an earlier gym photo or hygiene proof earns nothing, whatever
+ * the hygiene verdict was. Null when the photo isn't a gym photo.
  */
 async function gymPhoto(
   state: GateState,
@@ -388,16 +401,19 @@ async function gymPhoto(
   if (!(distance <= s.gym.radiusM)) return null;
   const hash = sha256(decoded.bytes);
   const dhash = await deps.dhash(decoded.bytes);
-  const seen = state.images.filter((r) => r.verdict !== "rejected" && r.verdict !== "stale");
-  // A re-encoded copy has new bytes but a near dhash: no gym credit (the hygiene check says why).
-  if (seen.some((r) => r.sha256 !== hash && r.dhash && dhash && hammingDistance(r.dhash, dhash) <= NEAR_DUPLICATE_BITS)) return null;
+  const near = (a: string, b: string) => hammingDistance(a, b) <= NEAR_DUPLICATE_BITS;
+  // An earlier hygiene proof (or its near copy) can't be reused as a gym photo either.
+  const proofs = state.images.filter((r) => r.verdict === "accepted" || r.verdict === "unneeded");
+  const reused = proofs.some((r) => r.sha256 !== hash && r.dhash && dhash && near(r.dhash, dhash));
   const at = Math.min(taken, now);
-  const recorded =
-    !seen.some((r) => r.sha256 === hash) && recordGymPhoto(state.gym, { id: hash.slice(0, 16), distanceM: distance, at, now });
-  const line = recorded
-    ? `💪 gym photo recorded: ${Math.round(distance)} m from ${s.gym.name} at ${clockLabel(at)}. It stands in for Uplifting's location; the session counts once the Uplifting workout it was taken during syncs (at least ${s.minMinutes} min and ${s.minSets} sets).`
-    : "💪 this gym photo was already counted.";
-  return { line, recorded, hash, dhash };
+  const outcome = reused ? "near" : recordGymPhoto(state.gym, { id: hash.slice(0, 16), distanceM: distance, at, now, dhash }, near);
+  const line =
+    outcome === "recorded"
+      ? `💪 gym photo recorded: ${Math.round(distance)} m from ${s.gym.name} at ${clockLabel(at)}. It stands in for Uplifting's location; the session counts once the Uplifting workout it was taken during syncs (at least ${s.minMinutes} min and ${s.minSets} sets).`
+      : outcome === "replay"
+        ? "💪 this gym photo was already counted."
+        : "💪 not counted for the gym: it is a copy of an earlier photo.";
+  return { line, recorded: outcome === "recorded", hash, dhash };
 }
 
 async function checkImage(
@@ -461,7 +477,7 @@ async function checkImage(
   } catch (error) {
     // Not recorded: the same photo can be retried once the checker works.
     console.error("hygiene-gate: classifier failed:", (error as Error).message);
-    return { line: "⚠️ couldn't check the photo (classifier error). Send it again, or reply BYPASS." };
+    return { line: "⚠️ couldn't check the photo (classifier error). Send it again, or reply BYPASS.", retry: true };
   }
   record.kind = verdict.kind;
   record.reason = verdict.reason;
@@ -493,9 +509,9 @@ async function checkImage(
   }
   let file: string | undefined;
   try {
-    // The keepsake never holds a location: a photo with GPS is saved with its GPS tags removed, or not at all.
-    const keep = (await deps.gpsFix(decoded.bytes)) ? await stripGps(decoded) : decoded;
-    if (!keep) throw new Error("could not remove the photo's GPS tags");
+    // The keepsake never holds a location: every photo is saved with its location tags removed, or not at all.
+    const keep = await deps.stripGps(decoded);
+    if (!keep) throw new Error("could not remove the photo's location tags");
     file = deps.archive(keep, verdict.kind, now, hash);
   } catch (error) {
     // The proof still counts; only the keepsake copy is missing.
@@ -1113,7 +1129,7 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
       if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
       if (outcome.record?.verdict === "accepted") release(state, now, "photo accepted");
       else if (outcome.gym) release(state, now, "gym photo");
-      return Response.json({ checked: !outcome.line?.startsWith("⚠") });
+      return Response.json({ checked: !outcome.retry });
     });
   }
   const ruling = /^\/hygiene\/debt\/([A-Za-z0-9-]+)\/resolve$/.exec(url.pathname);

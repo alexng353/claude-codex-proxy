@@ -436,26 +436,36 @@ describe("proof helpers", () => {
     expect(parseGpsFix("|||")).toBeNull();
     expect(parseGpsFix("49/1,15/1,6057/125|X|123/1,7/1,1743/125|W")).toBeNull();
     expect(parseGpsFix("49/0,15/1,1/1|N|123/1,7/1,1/1|W")).toBeNull();
+    expect(parseCaptureTime("2026:10:08 05:10:00|")).toBe(Date.parse("2026-10-08T12:10:00Z"));
+    expect(parseCaptureTime("|")).toBeNull();
+    expect(parseCaptureTime("")).toBeNull();
   });
 
-  test.skipIf(!Bun.which("exiftool") || !Bun.which("magick"))("stripGps removes GPS from a real JPEG and keeps the capture time", async () => {
+  test.skipIf(!Bun.which("exiftool") || !Bun.which("magick"))("stripGps removes EXIF and XMP GPS from a real JPEG and keeps the capture time", async () => {
     const { mkdtemp, readFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const dir = await mkdtemp(`${tmpdir()}/strip-gps-`);
     const file = `${dir}/a.jpg`;
     expect(Bun.spawnSync(["magick", "-size", "8x8", "xc:red", file]).exitCode).toBe(0);
-    const tag = Bun.spawnSync(["exiftool", "-q", "-overwrite_original", "-GPSLatitude=49.26346", "-GPSLatitudeRef=N", "-GPSLongitude=123.12054", "-GPSLongitudeRef=W", "-DateTimeOriginal=2026:11:05 18:05:00", "-OffsetTimeOriginal=-07:00", file]);
+    const tag = Bun.spawnSync(["exiftool", "-q", "-overwrite_original", "-GPSLatitude=49.26346", "-GPSLatitudeRef=N", "-GPSLongitude=123.12054", "-GPSLongitudeRef=W", "-XMP-exif:GPSLatitude=49.26346", "-XMP-exif:GPSLongitude=-123.12054", "-DateTimeOriginal=2026:11:05 18:05:00", "-OffsetTimeOriginal=-07:00", file]);
     expect(tag.exitCode).toBe(0);
     const bytes = await readFile(file);
     expect(await gpsFix(bytes)).not.toBeNull();
     const stripped = await stripGps({ mediaType: "image/jpeg", bytes });
     expect(stripped).not.toBeNull();
     expect(await gpsFix(stripped!.bytes)).toBeNull();
+    // No GPS tag left in any group (EXIF or XMP).
+    const left = Bun.spawnSync(["exiftool", "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: stripped!.bytes });
+    expect(left.stdout.toString().trim()).toBe("");
     expect(await captureTime(stripped!.bytes)).toBe(Date.parse("2026-11-05T18:05:00-07:00"));
+    // An XMP-only location is removed too.
+    const xmp = `${dir}/b.jpg`;
+    expect(Bun.spawnSync(["magick", "-size", "8x8", "xc:blue", xmp]).exitCode).toBe(0);
+    expect(Bun.spawnSync(["exiftool", "-q", "-overwrite_original", "-XMP-exif:GPSLatitude=49.26346", "-XMP-exif:GPSLongitude=-123.12054", xmp]).exitCode).toBe(0);
+    const xmpOut = await stripGps({ mediaType: "image/jpeg", bytes: await readFile(xmp) });
+    expect(xmpOut).not.toBeNull();
+    expect(Bun.spawnSync(["exiftool", "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: xmpOut!.bytes }).stdout.toString().trim()).toBe("");
     expect(await stripGps({ mediaType: "image/jpeg", bytes: Buffer.from("not an image") })).toBeNull();
-    expect(parseCaptureTime("2026:10:08 05:10:00|")).toBe(Date.parse("2026-10-08T12:10:00Z"));
-    expect(parseCaptureTime("|")).toBeNull();
-    expect(parseCaptureTime("")).toBeNull();
   });
 
   test("verdict parsing is strict about kind and clamps confidence", () => {

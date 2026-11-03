@@ -59,6 +59,8 @@ export type GymCheckin = {
   distanceM: number | null;
   accuracyM: number | null;
   receivedAt: string;
+  /** Gym photos only: the photo's difference hash (not a location), so a near copy earns nothing. */
+  dhash?: string;
 };
 
 export type GymSettings = {
@@ -158,11 +160,12 @@ export type PhotoMatch = { bySession: Map<string, GymCheckin>; byPhoto: Map<stri
 
 /**
  * The one rule for tying gym photos to sessions, used by both checkSession
- * and evaluateGym. Photos go oldest first; each takes one session not taken
- * yet, preferring one that contains it, else one starting within
- * PHOTO_SLACK_MS after it (earliest start, then id). A session that ended
- * before the photo never gets it, and no session longer than maxOpenMin does,
- * so one photo can't vouch for a long or later at-home log.
+ * and evaluateGym. Only a session that needs a photo can take one: it lacks
+ * an Uplifting location, otherwise qualifies (time, sets, no far location)
+ * and is no longer than maxOpenMin. Photos go oldest first; each takes one
+ * such session not taken yet, preferring one that contains it, else one
+ * starting within PHOTO_SLACK_MS after it (earliest start, then id). A
+ * session that ended before the photo never gets it.
  */
 export function matchPhotos(gym: GymState): PhotoMatch {
   const s = gymSettings(gym);
@@ -170,7 +173,11 @@ export function matchPhotos(gym: GymState): PhotoMatch {
   const byPhoto = new Map<string, GymSession>();
   const photos = gym.checkins.filter((c) => isPhoto(c) && atGym(gym, c)).sort((a, b) => ms(a.at) - ms(b.at));
   const sessions = gym.sessions
-    .filter((x) => !x.manual && ms(x.end) - ms(x.start) <= s.maxOpenMin * MIN)
+    .filter((x) => {
+      if (x.manual || ms(x.end) - ms(x.start) > s.maxOpenMin * MIN) return false;
+      const base = baseCheck(gym, x);
+      return base.ok && base.needsPhoto !== null;
+    })
     .sort((a, b) => ms(a.start) - ms(b.start) || a.id.localeCompare(b.id));
   for (const photo of photos) {
     const at = ms(photo.at);
@@ -185,22 +192,36 @@ export function matchPhotos(gym: GymState): PhotoMatch {
   return { bySession, byPhoto };
 }
 
-/** Whether a finished session counts, and why not when it doesn't. */
-export function checkSession(gym: GymState, session: GymSession, photos: PhotoMatch = matchPhotos(gym)): SessionCheck {
-  if (session.manual) return { session, qualifies: true };
+/** The finished session a gym photo was taken during (or just before): it is not an open Start. */
+function sessionAround(gym: GymState, photo: GymCheckin): GymSession | undefined {
+  const at = ms(photo.at);
+  return [...gym.sessions]
+    .sort((a, b) => ms(a.start) - ms(b.start) || a.id.localeCompare(b.id))
+    .find((x) => ms(x.start) - PHOTO_SLACK_MS <= at && at <= ms(x.end));
+}
+
+/** Everything about a session except the photo: fails with a reason, or passes, maybe needing a photo for a missing location. */
+function baseCheck(gym: GymState, session: GymSession): { ok: false; reason: string } | { ok: true; needsPhoto: "start" | "finish" | null } {
   const s = gymSettings(gym);
   const minutes = (ms(session.end) - ms(session.start)) / MIN;
-  if (!(minutes >= s.minMinutes)) return { session, qualifies: false, reason: `${Math.round(minutes)} min, under ${s.minMinutes}` };
-  if (session.sets < s.minSets) return { session, qualifies: false, reason: `${session.sets} sets, under ${s.minSets}` };
+  if (!(minutes >= s.minMinutes)) return { ok: false, reason: `${Math.round(minutes)} min, under ${s.minMinutes}` };
+  if (session.sets < s.minSets) return { ok: false, reason: `${session.sets} sets, under ${s.minSets}` };
   const kinds = ["start", "finish"] as const;
   const fixes = kinds.map((kind) => (session.clientId ? checkinFor(gym, session.clientId, kind) : undefined));
   // Uplifting's own evidence of being away always wins, whichever end it is.
   for (const [i, fix] of fixes.entries())
     if (fix && fix.distanceM !== null && fix.distanceM > s.gym.radiusM)
-      return { session, qualifies: false, reason: `${Math.round(fix.distanceM)} m from the gym at ${kinds[i]}` };
+      return { ok: false, reason: `${Math.round(fix.distanceM)} m from the gym at ${kinds[i]}` };
+  return { ok: true, needsPhoto: kinds.find((_, i) => !fixes[i] || fixes[i]!.distanceM === null) ?? null };
+}
+
+/** Whether a finished session counts, and why not when it doesn't. */
+export function checkSession(gym: GymState, session: GymSession, photos: PhotoMatch = matchPhotos(gym)): SessionCheck {
+  if (session.manual) return { session, qualifies: true };
+  const base = baseCheck(gym, session);
+  if (!base.ok) return { session, qualifies: false, reason: base.reason };
   // No location from Uplifting (an old build, GPS off): this session's gym photo stands in.
-  const missing = kinds.find((_, i) => !fixes[i] || fixes[i]!.distanceM === null);
-  if (missing && !photos.bySession.has(session.id)) return { session, qualifies: false, reason: `no location at ${missing}` };
+  if (base.needsPhoto && !photos.bySession.has(session.id)) return { session, qualifies: false, reason: `no location at ${base.needsPhoto}` };
   return { session, qualifies: true };
 }
 
@@ -221,7 +242,7 @@ function plannedAt(plan: GymPlan): number {
  * plan. A plan is kept by a qualifying session that starts between `earlyMin`
  * before it and its deadline; a Start at the gym in that window holds it open
  * until the Finish arrives (or `maxOpenMin` passes), even if the plan was made
- * mid-workout. Missed plans are then made up, oldest first, by unused
+ * mid-workout. Missed plans are then made up (those still locking first, newest first; then lapsed ones, oldest first) by unused
  * qualifying sessions that started after the plan's window opened. Either way
  * a session counts only if it ended after the plan was made or last moved, so
  * a plan added after a workout can't be cleared by it. Keeping comes before
@@ -243,9 +264,10 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   const finishedClients = new Map(gym.sessions.filter((x) => x.clientId).map((x) => [x.clientId!, x]));
   const plans = [...gym.plans].sort((a, b) => ms(a.start) - ms(b.start));
   const results: PlanResult[] = [];
-  // The finished session a Start belongs to: by client id, or for a gym photo, its matched session.
+  // The finished session a Start belongs to: by client id; for a gym photo, the session it backs,
+  // else any finished session it was taken during (a second photo of one workout is not an open Start).
   const sessionFor = (c: GymCheckin) =>
-    finishedClients.get(c.clientId) ?? (isPhoto(c) ? photos.byPhoto.get(c.clientId) : undefined);
+    finishedClients.get(c.clientId) ?? (isPhoto(c) ? (photos.byPhoto.get(c.clientId) ?? sessionAround(gym, c)) : undefined);
 
   for (const plan of plans) {
     const start = ms(plan.start);
@@ -504,10 +526,19 @@ export function gymPhotoWanted(gym: GymState | undefined, now: number): boolean 
   );
 }
 
-/** Records a gym photo as a Start check-in (distance only). Returns false if this photo was already recorded. */
-export function recordGymPhoto(gym: GymState, photo: { id: string; distanceM: number; at: number; now: number }): boolean {
+/**
+ * Records a gym photo as a Start check-in (distance only). "replay" when this
+ * photo was recorded before, "near" when a near copy of a recorded one was
+ * (`isNear` compares difference hashes); either way nothing is added.
+ */
+export function recordGymPhoto(
+  gym: GymState,
+  photo: { id: string; distanceM: number; at: number; now: number; dhash?: string | null },
+  isNear: (a: string, b: string) => boolean = () => false,
+): "recorded" | "replay" | "near" {
   const clientId = `${PHOTO_PREFIX}${photo.id}`;
-  if (gym.checkins.some((c) => c.clientId === clientId)) return false;
+  if (gym.checkins.some((c) => c.clientId === clientId)) return "replay";
+  if (photo.dhash && gym.checkins.some((c) => isPhoto(c) && c.dhash && isNear(c.dhash, photo.dhash!))) return "near";
   gym.checkins.push({
     clientId,
     kind: "start",
@@ -515,8 +546,9 @@ export function recordGymPhoto(gym: GymState, photo: { id: string; distanceM: nu
     distanceM: Math.round(photo.distanceM),
     accuracyM: null,
     receivedAt: new Date(photo.now).toISOString(),
+    ...(photo.dhash ? { dhash: photo.dhash } : {}),
   });
-  return true;
+  return "recorded";
 }
 
 /**

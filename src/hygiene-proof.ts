@@ -102,18 +102,29 @@ export async function gpsFix(bytes: Buffer): Promise<{ lat: number; lon: number 
 
 const EXIFTOOL = process.env.HYGIENE_EXIFTOOL_BIN ?? "exiftool";
 
-/** The same image with every GPS tag removed (other EXIF kept), or null if exiftool failed. */
+/**
+ * The same image with its location removed: every EXIF GPS tag and all XMP
+ * (where apps also write GPS), other EXIF such as the capture time kept.
+ * Null unless exiftool succeeded and finds no GPS tag left in any group.
+ */
 export async function stripGps(image: DecodedImage): Promise<DecodedImage | null> {
+  const strip = await exiftool(["-q", "-q", "-gps:all=", "-xmp:all=", "-o", "-", "-"], image.bytes);
+  if (!strip?.length) return null;
+  // Any tag with GPS in its name, in any group, means something was missed.
+  const left = await exiftool(["-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], strip);
+  if (left === null || left.toString("utf8").trim()) return null;
+  return { ...image, bytes: strip };
+}
+
+async function exiftool(args: string[], input: Buffer): Promise<Buffer | null> {
   try {
-    const child = Bun.spawn([EXIFTOOL, "-q", "-q", "-gps:all=", "-o", "-", "-"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
-    child.stdin.write(image.bytes);
+    const child = Bun.spawn([EXIFTOOL, ...args], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    child.stdin.write(input);
     await child.stdin.end();
     const timer = setTimeout(() => child.kill(), 15_000);
     const [output, code] = await Promise.all([new Response(child.stdout).arrayBuffer(), child.exited]);
     clearTimeout(timer);
-    if (code !== 0 || !output.byteLength) return null;
-    const bytes = Buffer.from(output);
-    return (await gpsFix(bytes)) ? null : { ...image, bytes };
+    return code === 0 ? Buffer.from(output) : null;
   } catch {
     return null;
   }

@@ -289,8 +289,9 @@ describe("Uplifting feed", () => {
     expect(statusAt(gym, at(DAY, "18:31"))).toEqual(["missed"]);
 
     const { gym: g2 } = planned();
-    expect(recordGymPhoto(g2, { id: "near", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:06") })).toBe(true);
-    expect(recordGymPhoto(g2, { id: "near", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:07") })).toBe(false);
+    expect(recordGymPhoto(g2, { id: "near", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:06"), dhash: "00" })).toBe("recorded");
+    expect(recordGymPhoto(g2, { id: "near", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:07") })).toBe("replay");
+    expect(recordGymPhoto(g2, { id: "other", distanceM: 20, at: at(DAY, "18:06"), now: at(DAY, "18:07"), dhash: "01" }, (a, b) => a[0] === b[0])).toBe("near");
     feed(g2, at(DAY, "18:40"), {});
     expect(statusAt(g2, at(DAY, "18:40"))).toEqual(["in-progress"]);
     // An old Uplifting build: no check-ins, no client id.
@@ -376,6 +377,66 @@ describe("Uplifting feed", () => {
     recordGymPhoto(two, { id: "b", distanceM: 20, at: at(DAY, "09:55"), now: at(DAY, "09:55") });
     feed(two, at(DAY, "11:00"), { workouts: [bare("t1", at(DAY, "10:00"), at(DAY, "10:45")), bare("t2", at(DAY, "10:05"), at(DAY, "10:50"))] });
     expect(statusAt(two, at(DAY, "11:00"))).toEqual(["kept", "kept"]);
+
+    // One photo inside two overlapping location-less workouts backs only one of them.
+    const one = emptyGym();
+    for (const time of ["10:00", "10:30"]) {
+      const r3 = editPlan(one, { action: "add", start: iso(at(DAY, time)), by: "test" }, at("2026-11-04", "12:00"));
+      if (!r3.ok) throw new Error(r3.error);
+    }
+    recordGymPhoto(one, { id: "solo", distanceM: 20, at: at(DAY, "10:10"), now: at(DAY, "10:10") });
+    feed(one, at(DAY, "11:00"), { workouts: [bare("u1", at(DAY, "10:00"), at(DAY, "10:50")), bare("u2", at(DAY, "10:05"), at(DAY, "10:55"))] });
+    expect(evaluateGym(one, at(DAY, "11:00")).filter((r) => r.status === "kept")).toHaveLength(1);
+  });
+
+  test("a photo isn't spent on a short warm-up; the main session takes it", () => {
+    const { gym } = planned();
+    recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "17:55"), now: at(DAY, "17:55") });
+    const bare = (id: string, s: number, e: number, sets: number) => ({ ...workout(id, "x", s, e, sets), client_id: null });
+    feed(gym, at(DAY, "19:10"), { workouts: [bare("warm", at(DAY, "17:40"), at(DAY, "18:00"), 3), bare("main", at(DAY, "18:05"), at(DAY, "19:05"), 12)] });
+    expect(evaluateGym(gym, at(DAY, "19:10"))[0]).toMatchObject({ status: "kept", sessionId: "main" });
+  });
+
+  test("a session with Uplifting locations doesn't take a photo a location-less one needs", () => {
+    const gym = emptyGym();
+    for (const time of ["18:00", "19:30"]) {
+      const r = editPlan(gym, { action: "add", start: iso(at(DAY, time)), by: "test" }, at("2026-11-04", "12:00"));
+      if (!r.ok) throw new Error(r.error);
+    }
+    recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "18:55"), now: at(DAY, "18:55") });
+    feed(gym, at(DAY, "20:10"), {
+      checkins: [checkin("c1", "start", at(DAY, "18:00")), checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("located", "c1", at(DAY, "18:00"), at(DAY, "19:00")), { ...workout("bare", "x", at(DAY, "19:05"), at(DAY, "20:05"), 10), client_id: null }],
+    });
+    expect(statusAt(gym, at(DAY, "20:10"))).toEqual(["kept", "kept"]);
+  });
+
+  test("a second photo of one workout is not an open Start for a later plan", () => {
+    const gym = emptyGym();
+    for (const time of ["18:00", "20:00"]) {
+      const r = editPlan(gym, { action: "add", start: iso(at(DAY, time)), by: "test" }, at("2026-11-04", "12:00"));
+      if (!r.ok) throw new Error(r.error);
+    }
+    recordGymPhoto(gym, { id: "a", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:05") });
+    recordGymPhoto(gym, { id: "b", distanceM: 20, at: at(DAY, "18:40"), now: at(DAY, "18:40") });
+    feed(gym, at(DAY, "20:35"), { workouts: [{ ...workout("s", "x", at(DAY, "18:00"), at(DAY, "19:00"), 10), client_id: null }] });
+    expect(statusAt(gym, at(DAY, "20:35"))).toEqual(["kept", "missed"]);
+  });
+
+  test("a make-up clears an older miss that still locks before a newer one that lapsed", () => {
+    const gym = emptyGym();
+    // A: 10:00 with 6 h grace and an unfinished Start at 15:59, so it fails at 19:59. B: 11:00, no grace.
+    const a = editPlan(gym, { action: "add", start: iso(at("2026-11-03", "10:00")), graceMin: 360, by: "test" }, at("2026-11-02", "12:00"));
+    const b = editPlan(gym, { action: "add", start: iso(at("2026-11-03", "11:00")), graceMin: 0, by: "test" }, at("2026-11-02", "12:00"));
+    if (!a.ok || !b.ok) throw new Error("add failed");
+    feed(gym, at("2026-11-03", "20:00"), { checkins: [checkin("open", "start", at("2026-11-03", "15:59"))] });
+    const now = at("2026-11-04", "13:10");
+    feed(gym, now, {
+      checkins: [checkin("c1", "start", at("2026-11-04", "12:00")), checkin("c1", "finish", at("2026-11-04", "13:00"))],
+      workouts: [workout("w1", "c1", at("2026-11-04", "12:00"), at("2026-11-04", "13:00"))],
+    });
+    expect(statusAt(gym, now)).toEqual(["made-up", "missed"]);
+    expect(gymOutstanding(gym, now)).toEqual([]);
   });
 
   test("a gym photo never overrides a far Uplifting location at either end", () => {

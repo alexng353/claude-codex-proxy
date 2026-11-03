@@ -96,6 +96,8 @@ beforeEach(async () => {
     },
     dhash: async (bytes) => hashes[bytes.toString("utf8")] ?? null,
     captureTime: async (bytes) => exif[bytes.toString("utf8")] ?? null,
+    // Test photos are not real images; location stripping has its own tests.
+    stripGps: async (image) => image,
   });
   // Shipped state: first arm Oct 8 05:00, Oct 7's night already proven.
   await mkdir(join(directory, `state-${run}`), { recursive: true });

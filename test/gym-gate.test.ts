@@ -93,6 +93,127 @@ const reply = async (text: string) => {
 };
 
 describe("gym on the gate", () => {
+  describe("gym photo replays, keepsakes and the recheck route", () => {
+    const fix = { lat: GOLDS.latitude, lon: GOLDS.longitude };
+    const dh: Record<string, string> = { gym: "0".repeat(64), gym2: "0".repeat(63) + "1", gymB: "f".repeat(64), tooth: "a".repeat(64), gymTooth: "a".repeat(63) + "b" };
+    const located = new Set(["gym", "gym2", "gymB", "gymTooth"]);
+    let verdict: () => Promise<{ kind: string; confidence: number; reason: string }>;
+    let archived: string[];
+    let strip: (image: { mediaType: string; bytes: Buffer }) => Promise<{ mediaType: string; bytes: Buffer } | null>;
+    let wakes: number;
+
+    beforeEach(async () => {
+      await writeFile(
+        process.env.HYGIENE_GATE_STATE!,
+        JSON.stringify({ version: 1, startsAt: iso(at(DAY, "05:00")), images: [], filled: {}, bypass: { count: 0, until: null, history: [] }, debts: [], notes: [], extraGatedTriggers: [] }),
+      );
+      resetGateCache();
+      archived = [];
+      wakes = 0;
+      verdict = async () => ({ kind: "none", confidence: 0.9, reason: "a gym" });
+      strip = async (image) => ({ ...image, bytes: Buffer.from(`stripped:${image.bytes}`) });
+      setGateDeps({
+        now: () => clock,
+        wake: async () => {
+          wakes++;
+          return "sent";
+        },
+        captureTime: async () => at(DAY, "18:20"),
+        gpsFix: async (bytes) => (located.has(bytes.toString("utf8")) ? fix : null),
+        dhash: async (bytes) => dh[bytes.toString("utf8")] ?? null,
+        stripGps: (image) => strip(image),
+        archive: (image) => {
+          archived.push(image.bytes.toString("utf8"));
+          return "/dev/null";
+        },
+        classify: () => verdict() as any,
+      });
+      await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+      clock = at(DAY, "18:35");
+    });
+
+    let n = 0;
+    const send = async (name: string) => {
+      const request = {
+        ...turn(""),
+        prompt_cache_key: `01a10494-b499-7af3-986b-3c30d8c9${String(1000 + ++n).padStart(4, "0")}`,
+        input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: `data:image/jpeg;base64,${Buffer.from(name).toString("base64")}`, detail: "auto" }] } as ResponseInputItem],
+      } as ResponsesRequest;
+      const d = await gateRequest(request);
+      return d.action === "respond" ? d.text : "forwarded";
+    };
+    const photoCheckins = async () => (await route("/hygiene/gym")).body.checkins.filter((c: any) => c.clientId.startsWith("photo:"));
+
+    test("after a 'none' hygiene verdict, a near copy and a replay earn nothing, and the reply says so", async () => {
+      // The morning teeth photo still locks; the gym part is recorded either way.
+      expect(await send("gym")).toContain("gym photo recorded");
+      expect(await photoCheckins()).toHaveLength(1);
+      expect(await send("gym2")).not.toContain("gym photo recorded");
+      expect(await photoCheckins()).toHaveLength(1);
+      const again = await gateRequest({
+        ...turn(""),
+        prompt_cache_key: "01a10494-b499-7af3-986b-3c30d8c99999",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "x" }, { type: "input_image", image_url: `data:image/jpeg;base64,${Buffer.from("gym").toString("base64")}`, detail: "auto" }] } as ResponseInputItem],
+      } as ResponsesRequest);
+      expect(JSON.stringify(again)).toContain("already counted");
+      expect(await photoCheckins()).toHaveLength(1);
+    });
+
+    test("after a checker error, a near copy earns nothing", async () => {
+      verdict = async () => {
+        throw new Error("down");
+      };
+      await send("gym");
+      await send("gym2");
+      expect(await photoCheckins()).toHaveLength(1);
+    });
+
+    test("a near copy of an earlier hygiene proof earns no gym credit", async () => {
+      verdict = async () => ({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+      await send("tooth");
+      expect(await photoCheckins()).toHaveLength(0);
+      expect(await send("gymTooth")).toContain("not counted for the gym");
+      expect(await photoCheckins()).toHaveLength(0);
+    });
+
+    test("the keepsake gets the stripped bytes, or isn't saved", async () => {
+      verdict = async () => ({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+      await send("gym");
+      expect(archived).toEqual(["stripped:gym"]);
+      strip = async () => null;
+      clock = at("2026-11-06", "06:00");
+      await send("gymB");
+      expect(archived).toEqual(["stripped:gym"]);
+    });
+
+    test("recheck: a checker error isn't acknowledged, and the gym part still counts", async () => {
+      verdict = async () => {
+        throw new Error("down");
+      };
+      const url = `data:image/jpeg;base64,${Buffer.from("gym").toString("base64")}`;
+      const first = await route("/hygiene/recheck", { url, at: clock });
+      expect(first.body).toEqual({ checked: false });
+      expect(await photoCheckins()).toHaveLength(1);
+    });
+
+    test("recheck: a gym photo that clears the only lock wakes held chats", async () => {
+      // Nothing hygiene-related is enforced yet, so the gym plan is the only lock.
+      await writeFile(
+        process.env.HYGIENE_GATE_STATE!,
+        JSON.stringify({ version: 1, startsAt: iso(at("2027-01-01", "05:00")), images: [], filled: {}, bypass: { count: 0, until: null, history: [] }, debts: [], notes: [], extraGatedTriggers: [] }),
+      );
+      resetGateCache();
+      clock = at(DAY, "12:00");
+      await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+      clock = at(DAY, "18:35");
+      expect(await reply("hi")).toContain("gate armed");
+      const url = `data:image/jpeg;base64,${Buffer.from("gym").toString("base64")}`;
+      expect((await route("/hygiene/recheck", { url, at: clock })).body).toEqual({ checked: true });
+      await Bun.sleep(50);
+      expect(wakes).toBe(1);
+    });
+  });
+
   test("gym photos: a replay, a near copy or no GPS adds nothing; a checker error stays retryable", async () => {
     // Morning teeth photo due from 05:00 so the hygiene checker runs too.
     await writeFile(
