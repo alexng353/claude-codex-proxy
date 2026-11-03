@@ -444,6 +444,78 @@ describe("weigh-in", () => {
   });
 });
 
+describe("creatine and outdoor walk", () => {
+  const enable = async (from = at(DAY, "05:00")) => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    const iso = new Date(from).toISOString();
+    await writeFile(path, JSON.stringify({ ...raw, creatineStartsAt: iso, walkStartsAt: iso }));
+    resetGateCache();
+  };
+  const send = async (name: string) => {
+    hashes[name] = new Bun.CryptoHasher("sha256").update(name).digest("hex");
+    return decide(request([env, user({ photo: name })]));
+  };
+
+  test("creatine is one photo; the walk is two outdoor photos 15 min apart by receipt time", async () => {
+    await enable();
+    expect(text(await decide(request([env, user("hi")])))).toBe(
+      "🪥 gate armed: morning teeth photo, morning creatine photo (scoop or glass), 15-min outdoor walk (an outdoor photo at the start, another 15+ min later)\nSend a fresh photo to unlock, or reply BYPASS.",
+    );
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    expect(text(await send("teeth"))).toStartWith("✅ morning teeth (Oct 8) photo accepted.\n💊 gate armed");
+    verdicts.push({ kind: "creatine", confidence: 0.9, reason: "scoop of powder" });
+    expect(text(await send("scoop"))).toStartWith("✅ morning creatine (Oct 8) photo accepted.\n🚶 gate armed");
+    clock = at(DAY, "06:05");
+    verdicts.push({ kind: "walk", confidence: 0.9, reason: "street" });
+    expect(text(await send("street"))).toBe(
+      "🚶 walk started at 06:05. Send another outdoor photo from 06:20 to finish it.\n🚶 gate armed: outdoor walk: second outdoor photo from 06:20\nSend a fresh photo to unlock, or reply BYPASS.",
+    );
+    clock = at(DAY, "06:12");
+    verdicts.push({ kind: "walk", confidence: 0.9, reason: "park" });
+    expect(text(await send("park-early"))).toStartWith(
+      "❌ too soon: the walk started at 06:05; send the second outdoor photo from 06:20.",
+    );
+    clock = at(DAY, "06:21");
+    // The same view again is a near copy of the start photo, not a walk.
+    hashes["street-again"] = hashes.street;
+    expect(text(await decide(request([env, user({ photo: "street-again" })])))).toStartWith("❌ photo rejected: it is a near-copy");
+    verdicts.push({ kind: "walk", confidence: 0.9, reason: "park" });
+    const done = await send("park");
+    expect(done.action).toBe("forward");
+    expect(gateStatus().lastProofs.map((p) => p.slot)).toEqual(
+      expect.arrayContaining([`${DAY}/morning-creatine`, `${DAY}/morning-walk-start`, `${DAY}/morning-walk`]),
+    );
+  });
+
+  test("off until enabled; DELAY postpones them with the other morning photos", async () => {
+    await enable(at("2026-10-09", "05:00"));
+    expect(text(await decide(request([env, user("hi")])))).toBe(
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS.",
+    );
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    const x = new Date(at(DAY, "20:00")).toISOString();
+    const filled = { [`${DAY}/shower`]: x, [`${DAY}/night-teeth`]: x };
+    await writeFile(path, JSON.stringify({ ...raw, filled }));
+    resetGateCache();
+    clock = at("2026-10-09", "07:45");
+    expect(text(await decide(request([env, user("hi")])))).toStartWith(
+      "🪥 gate armed: morning teeth photo, morning creatine photo (scoop or glass), 15-min outdoor walk",
+    );
+    expect(text(await decide(request([env, user("DELAY")])))).toBe(
+      "⏰ delay: gate open until 09:45. Send the morning photos before then.",
+    );
+    // Teeth and creatine alone keep the delay open while the walk is missing.
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" }, { kind: "creatine", confidence: 0.9, reason: "scoop" });
+    await send("t");
+    await send("c");
+    expect(gateStatus().delay.active).toBe(true);
+    clock = at("2026-10-09", "09:46");
+    expect(text(await decide(request([env, user("later")])))).toStartWith("🚶 gate armed: 15-min outdoor walk");
+  });
+});
+
 describe("DELAY", () => {
   const morningLocked = async () => {
     clock = at(DAY, "07:45");

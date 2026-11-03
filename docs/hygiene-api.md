@@ -26,6 +26,8 @@ Sends one proof photo.
 - **`kind`** is one of:
   - `teeth_morning`: from 05:00
   - `weight_morning`: from 05:00, a photo of the bathroom scale's reading, once weigh-ins are enabled
+  - `creatine_morning`: from 05:00, a photo of creatine being taken, once `creatineStartsAt` is set
+  - `walk_morning`: from 05:00, an outdoor photo, once `walkStartsAt` is set. The first fills `<day>/morning-walk-start`; one checked 15 or more minutes later (by receipt time) fills `<day>/morning-walk`. Sooner is `rejected`
   - `teeth_night`: from 17:00 that day, or an overdue night requirement from the day before
   - `shower`: any time that day, or an overdue shower requirement from the day before
 
@@ -80,7 +82,7 @@ Response (`200`, also when the photo fails):
   - `clear`: nothing is locked
   - `bypassed`: locked, but a BYPASS hour is open
   - `disabled`: the kill switch is on
-- **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight`, `penance` or `gym`. A `gym` item (slot `gym/<plan id>`, since 2026-11-02) is a planned gym session with no qualifying Uplifting session, for at most 24 h. This API has no gym kind for proofs; a geotagged gym photo counts only when sent in a chat (README, gym sessions).
+- **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight`, `creatine`, `walk`, `penance` or `gym`. A `gym` item (slot `gym/<plan id>`, since 2026-11-02) is a planned gym session with no qualifying Uplifting session, for at most 24 h. This API has no gym kind for proofs; a geotagged gym photo counts only when sent in a chat (README, gym sessions).
 - **`due_today`** lists what is due later today but does not lock yet, including today's planned gym sessions and one in progress.
 - **`open_debts`** lists BYPASS uses that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt } }`. A penance photo is sent in a chat; this API has no penance kind.
 - **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters. The one exception is the app shield's emergency button, below.

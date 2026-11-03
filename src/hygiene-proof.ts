@@ -210,7 +210,7 @@ export type Classifier = (
 ) => Promise<Verdict>;
 
 export const CLASSIFIER_SYSTEM =
-  "You verify hygiene and weigh-in proof photos for a habit tracker the photographed person set up for himself. Judge only what is visible. Answer through the JSON schema.";
+  "You verify hygiene, weigh-in, supplement and walk proof photos for a habit tracker the photographed person set up for himself. Judge only what is visible. Answer through the JSON schema.";
 
 export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string }): string {
   const lines = [
@@ -222,10 +222,22 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
     lines.push(
       '- "weight": a real bathroom scale photographed directly, with a weight reading legible on its display. Bare feet on the scale are fine.',
     );
+  if (wanted.kinds.includes("creatine"))
+    lines.push(
+      '- "creatine": creatine being taken, photographed directly: a scoop of white powder, a scoop over or in a glass or shaker, or a glass of water with powder stirred in. A creatine tub in view helps but is not required.',
+    );
+  if (wanted.kinds.includes("walk"))
+    lines.push(
+      '- "walk": a photo taken outdoors by someone on foot: a street, sidewalk, path, park, trees or open sky around the camera. Not a view through a window and not from inside a vehicle.',
+    );
   if (wanted.penance)
     lines.push(`- "penance": the photo shows this: ${JSON.stringify(wanted.penance)}`);
+  // Creatine and walk photos have no person in them; only the other kinds need one.
+  const personless = wanted.kinds.includes("creatine") || wanted.kinds.includes("walk");
   lines.push(
-    '- "none": anything else, including screenshots, photos of a screen, photos of printed photos, or images with no person.',
+    personless
+      ? '- "none": anything else, including screenshots, photos of a screen, photos of printed photos, or images with no person that match none of the kinds above.'
+      : '- "none": anything else, including screenshots, photos of a screen, photos of printed photos, or images with no person.',
     "confidence is your probability (0 to 1) that the chosen kind is right. reason is one short sentence.",
     'reading is the displayed weight with its unit (e.g. "72.4 kg" or "231.4 lb") for "weight", otherwise an empty string. Scales often use 7-segment LCD digits: read every digit and the decimal point exactly as shown, and take the unit from the display or the scale\'s unit label. Leave the unit out only if none is visible.',
   );
@@ -254,7 +266,7 @@ export function parseWeightReading(reading: string | null | undefined): number |
 export const VERDICT_SCHEMA = {
   type: "object",
   properties: {
-    kind: { type: "string", enum: ["teeth", "shower", "weight", "penance", "none"] },
+    kind: { type: "string", enum: ["teeth", "shower", "weight", "creatine", "walk", "penance", "none"] },
     confidence: { type: "number" },
     reason: { type: "string" },
     reading: { type: "string" },
@@ -265,7 +277,7 @@ export const VERDICT_SCHEMA = {
 
 export function parseVerdict(value: unknown): Verdict {
   const v = value as Partial<Verdict> | null;
-  if (!v || !["teeth", "shower", "weight", "penance", "none"].includes(v.kind as string))
+  if (!v || !["teeth", "shower", "weight", "creatine", "walk", "penance", "none"].includes(v.kind as string))
     throw new Error("classifier returned no usable verdict");
   const confidence = typeof v.confidence === "number" && Number.isFinite(v.confidence) ? v.confidence : 0;
   return {

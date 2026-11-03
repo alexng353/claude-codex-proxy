@@ -152,6 +152,38 @@ describe("requirements", () => {
     // A missed weigh-in does not carry past midnight.
     expect(slots(s, at("2026-10-09", "01:00"))).not.toContain(`${DAY}/morning-weight`);
   });
+
+  test("creatine and the outdoor walk are off by default and arm at 05:00 once enabled", () => {
+    const s = state();
+    s.filled["2026-10-07/shower"] = "x";
+    s.filled["2026-10-07/night-teeth"] = "x";
+    expect(candidateSlots(s, "creatine", at(DAY, "06:00"))).toEqual([]);
+    expect(candidateSlots(s, "walk", at(DAY, "06:00"))).toEqual([]);
+    s.creatineStartsAt = new Date(at(DAY, "05:00")).toISOString();
+    s.walkStartsAt = new Date(at(DAY, "05:00")).toISOString();
+    expect(dueToday(s, at(DAY, "04:59")).map((r) => r.slot)).toEqual(
+      expect.arrayContaining([`${DAY}/morning-creatine`, `${DAY}/morning-walk`]),
+    );
+    expect(slots(s, at(DAY, "04:59"))).toEqual([]);
+    expect(slots(s, at(DAY, "05:00"))).toEqual([`${DAY}/morning-teeth`, `${DAY}/morning-creatine`, `${DAY}/morning-walk`]);
+    expect(wantedKinds(s, at(DAY, "05:00"))).toEqual(["teeth", "shower", "creatine", "walk"]);
+    // The first outdoor photo starts the walk; the next one may finish it.
+    expect(candidateSlots(s, "walk", at(DAY, "06:00"))).toEqual([`${DAY}/morning-walk-start`]);
+    s.filled[`${DAY}/morning-walk-start`] = new Date(at(DAY, "06:00")).toISOString();
+    expect(candidateSlots(s, "walk", at(DAY, "06:05"))).toEqual([`${DAY}/morning-walk`]);
+    expect(outstanding(s, at(DAY, "06:05")).find((r) => r.slot === `${DAY}/morning-walk`)?.label).toBe(
+      "outdoor walk: second outdoor photo from 06:15",
+    );
+    s.filled[`${DAY}/morning-creatine`] = "x";
+    expect(wantedKinds(s, at(DAY, "07:00"))).toEqual(["teeth", "shower", "walk"]);
+    // Missed ones do not carry past midnight.
+    expect(slots(s, at("2026-10-09", "01:00")).filter((name) => name.startsWith(DAY))).toEqual([
+      `${DAY}/shower`,
+      `${DAY}/night-teeth`,
+    ]);
+    s.filled[`${DAY}/morning-walk`] = "x";
+    expect(wantedKinds(s, at(DAY, "07:00"))).toEqual(["teeth", "shower"]);
+  });
 });
 
 const meta = (fields: Record<string, string>) => ({

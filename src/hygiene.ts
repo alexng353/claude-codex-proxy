@@ -10,6 +10,11 @@
  * - Morning weigh-in arms at 05:00 too, once `weighInStartsAt` is set: a
  *   photo of the bathroom scale's reading. DELAY postpones both morning
  *   photos together.
+ * - Morning creatine (once `creatineStartsAt` is set) and a 15-minute
+ *   outdoor walk (once `walkStartsAt` is set) arm at 05:00 as well. The
+ *   walk is two outdoor photos at least 15 minutes apart by the time the
+ *   gate checked them: chat attachments arrive without EXIF, so the camera
+ *   clock can't be used. DELAY postpones every morning requirement.
  * - Night teeth (taken at or after 17:00) and a shower (any time that day)
  *   are due by midnight. If either is missing at 00:00 the gate locks until
  *   it is supplied. That overdue lock is separate from the next morning's
@@ -42,8 +47,10 @@ export const EXIF_FUTURE_SLACK_MS = 10 * 60 * 1000;
  */
 export const NEAR_DUPLICATE_BITS = 10;
 export const MIN_CONFIDENCE = 0.6;
+/** The outdoor walk's second photo counts this long after the first. */
+export const WALK_MS = 15 * 60 * 1000;
 
-export type ProofKind = "teeth" | "shower" | "weight" | "penance";
+export type ProofKind = "teeth" | "shower" | "weight" | "creatine" | "walk" | "penance";
 export type ClassifiedKind = ProofKind | "none";
 
 export type ImageVerdict =
@@ -115,6 +122,10 @@ export type GateState = {
    * weigh-ins are off, so adding the check never locks an existing state.
    */
   weighInStartsAt?: string;
+  /** First morning creatine photo to enforce; absent means off. */
+  creatineStartsAt?: string;
+  /** First morning outdoor walk to enforce; absent means off. */
+  walkStartsAt?: string;
   images: ImageRecord[];
   /** Requirement slot -> ISO time it was filled. */
   filled: Record<string, string>;
@@ -224,6 +235,10 @@ export type Requirement = {
 const slot = {
   morning: (day: string) => `${day}/morning-teeth`,
   weight: (day: string) => `${day}/morning-weight`,
+  creatine: (day: string) => `${day}/morning-creatine`,
+  walk: (day: string) => `${day}/morning-walk`,
+  /** Filled by the walk's first outdoor photo; never locks on its own. */
+  walkStart: (day: string) => `${day}/morning-walk-start`,
   night: (day: string) => `${day}/night-teeth`,
   shower: (day: string) => `${day}/shower`,
   penance: (id: string) => `penance/${id}`,
@@ -232,19 +247,44 @@ const slot = {
 /** The instant a slot starts to lock the gate. */
 function armMs(slotName: string): number {
   const [day, name] = slotName.split("/");
-  if (name === "morning-teeth" || name === "morning-weight") return zonedTime(day, MORNING_MINUTE);
+  if (name.startsWith("morning-")) return zonedTime(day, MORNING_MINUTE);
   return zonedTime(addDays(day, 1), 0);
 }
 
+/** Morning requirements added after launch: each is off until its own start field is set. */
+const OPT_IN: Record<string, (state: GateState) => string | undefined> = {
+  "morning-weight": (state) => state.weighInStartsAt,
+  "morning-creatine": (state) => state.creatineStartsAt,
+  "morning-walk": (state) => state.walkStartsAt,
+  "morning-walk-start": (state) => state.walkStartsAt,
+};
+
 function enforced(state: GateState, slotName: string): boolean {
   if (armMs(slotName) < Date.parse(state.startsAt)) return false;
-  if (!slotName.endsWith("/morning-weight")) return true;
-  return !!state.weighInStartsAt && armMs(slotName) >= Date.parse(state.weighInStartsAt);
+  const optIn = OPT_IN[slotName.split("/")[1]];
+  if (!optIn) return true;
+  const from = optIn(state);
+  return !!from && armMs(slotName) >= Date.parse(from);
 }
 
 /** This morning's enforced slots, which DELAY postpones together. */
 function morningSlots(state: GateState, day: string): string[] {
-  return [slot.morning(day), slot.weight(day)].filter((name) => enforced(state, name));
+  return [slot.morning(day), slot.weight(day), slot.creatine(day), slot.walk(day)].filter((name) =>
+    enforced(state, name),
+  );
+}
+
+/** When this morning's walk started (its first outdoor photo), or null. */
+export function walkStartedAt(state: GateState, day: string): number | null {
+  const at = state.filled[slot.walkStart(day)];
+  return at ? Date.parse(at) : null;
+}
+
+function walkLabel(state: GateState, day: string): string {
+  const started = walkStartedAt(state, day);
+  return started === null
+    ? "15-min outdoor walk (an outdoor photo at the start, another 15+ min later)"
+    : `outdoor walk: second outdoor photo from ${clockLabel(started + WALK_MS)}`;
 }
 
 export const bypassActive = (state: GateState, now: number) =>
@@ -281,6 +321,8 @@ export function outstanding(state: GateState, now: number): Requirement[] {
   if (minutes >= MORNING_MINUTE && !delayActive(state, now)) {
     add(slot.morning(day), "teeth", "morning teeth photo");
     add(slot.weight(day), "weight", "morning weigh-in photo (scale reading)");
+    add(slot.creatine(day), "creatine", "morning creatine photo (scoop or glass)");
+    add(slot.walk(day), "walk", walkLabel(state, day));
   }
   for (const debt of openPenance(state))
     result.push({
@@ -313,6 +355,10 @@ export function dueToday(state: GateState, now: number): Requirement[] {
     result.push({ slot: slot.morning(day), kind: "teeth", label: "morning teeth photo (from 05:00)" });
   if (morningPending && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day)))
     result.push({ slot: slot.weight(day), kind: "weight", label: "morning weigh-in photo (from 05:00)" });
+  if (morningPending && !state.filled[slot.creatine(day)] && enforced(state, slot.creatine(day)))
+    result.push({ slot: slot.creatine(day), kind: "creatine", label: "morning creatine photo (from 05:00)" });
+  if (morningPending && !state.filled[slot.walk(day)] && enforced(state, slot.walk(day)))
+    result.push({ slot: slot.walk(day), kind: "walk", label: "15-min outdoor walk (from 05:00)" });
   result.push(...gymDueToday(state.gym, now));
   return result;
 }
@@ -334,6 +380,15 @@ export function candidateSlots(state: GateState, kind: ProofKind, now: number): 
     return minutes >= MORNING_MINUTE && open(slot.weight(day)) && enforced(state, slot.weight(day))
       ? [slot.weight(day)]
       : [];
+  if (kind === "creatine")
+    return minutes >= MORNING_MINUTE && open(slot.creatine(day)) && enforced(state, slot.creatine(day))
+      ? [slot.creatine(day)]
+      : [];
+  if (kind === "walk") {
+    if (minutes < MORNING_MINUTE || !open(slot.walk(day)) || !enforced(state, slot.walk(day))) return [];
+    // The second photo's 15 minutes are checked when it arrives, so it can say how long is left.
+    return [open(slot.walkStart(day)) ? slot.walkStart(day) : slot.walk(day)];
+  }
   if (kind === "shower") {
     const result: string[] = [];
     if (open(slot.shower(yesterday)) && enforced(state, slot.shower(yesterday)))
@@ -351,7 +406,7 @@ export function candidateSlots(state: GateState, kind: ProofKind, now: number): 
 
 /** Proof kinds worth asking the classifier about right now. */
 export function wantedKinds(state: GateState, now: number): ProofKind[] {
-  return (["teeth", "shower", "weight", "penance"] as const).filter(
+  return (["teeth", "shower", "weight", "creatine", "walk", "penance"] as const).filter(
     (kind) => candidateSlots(state, kind, now).length > 0,
   );
 }
@@ -370,7 +425,13 @@ export function slotLabel(name: string, state?: GateState): string {
         ? "night teeth"
         : kind === "morning-weight"
           ? "morning weigh-in"
-          : "shower";
+          : kind === "morning-creatine"
+            ? "morning creatine"
+            : kind === "morning-walk"
+              ? "outdoor walk"
+              : kind === "morning-walk-start"
+                ? "walk start"
+                : "shower";
   return `${what} (${dayLabel(day)})`;
 }
 
@@ -808,7 +869,15 @@ export const hasNote = (item: ResponseInputItem) => partsOf(item).some(isNotePar
 
 // ---- Rendering ----
 
-const EMOJI: Record<Requirement["kind"], string> = { teeth: "🪥", shower: "🚿", weight: "🏋️", penance: "⚖️", gym: "💪" };
+const EMOJI: Record<Requirement["kind"], string> = {
+  teeth: "🪥",
+  shower: "🚿",
+  weight: "🏋️",
+  creatine: "💊",
+  walk: "🚶",
+  penance: "⚖️",
+  gym: "💪",
+};
 
 export function lockedText(requirements: Requirement[], results: string[] = []): string {
   const photos = requirements.some((r) => r.kind !== "gym");

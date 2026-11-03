@@ -51,6 +51,8 @@ import {
   partsOf,
   slotLabel,
   wantedKinds,
+  walkStartedAt,
+  WALK_MS,
   zonedTime,
   type Debt,
   type GateState,
@@ -512,6 +514,17 @@ async function checkImage(
     state.images.push({ ...record, verdict: "unneeded" });
     return { line: null };
   }
+  if (target.endsWith("/morning-walk")) {
+    // Receipt time, not EXIF: chat attachments arrive with their camera time stripped.
+    const started = walkStartedAt(state, localTime(now).day);
+    if (started !== null && now - started < WALK_MS) {
+      const from = clockLabel(started + WALK_MS);
+      state.images.push({ ...record, reason: `walk second photo before ${from}` });
+      return {
+        line: `❌ too soon: the walk started at ${clockLabel(started)}; send the second outdoor photo from ${from}.`,
+      };
+    }
+  }
   state.filled[target] = record.at;
   if (target.startsWith("penance/")) {
     const debt = state.debts.find((d) => `penance/${d.id}` === target);
@@ -542,6 +555,10 @@ async function checkImage(
       cairnWeightPending: true,
     } : {}),
   });
+  if (target.endsWith("/morning-walk-start"))
+    return {
+      line: `🚶 walk started at ${clockLabel(now)}. Send another outdoor photo from ${clockLabel(now + WALK_MS)} to finish it.`,
+    };
   return { line: `✅ ${slotLabel(target, state)} photo accepted${reading ? ` (${reading})` : ""}.` };
 }
 
@@ -677,7 +694,8 @@ function delayReply(state: GateState, now: number): string {
   const { day, minutes } = localTime(now);
   const due = outstanding(state, now);
   const morningOnly = onlyMorningDue(state, due, now);
-  const photos = due.length > 1 ? "morning photos" : due[0]?.kind === "weight" ? "weigh-in photo" : "teeth photo";
+  const single: Record<string, string> = { weight: "weigh-in photo", creatine: "creatine photo", walk: "walk photos" };
+  const photos = due.length > 1 ? "morning photos" : (single[due[0]?.kind ?? ""] ?? "teeth photo");
   if (delayActive(state, now))
     return `⏰ delay already open until ${clockLabel(Date.parse(state.delay.until!))}. Send the morning photo when you can.`;
   if (!due.length) return "✅ gate is already clear; no delay used.";
