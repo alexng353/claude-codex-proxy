@@ -16,7 +16,7 @@ import {
   type GymState,
   type UpliftingFeed,
 } from "../src/gym";
-import { emptyState, lockedText, outstanding, zonedTime } from "../src/hygiene";
+import { emptyState, lockedText, outstanding, setZoneHistory, zonedTime } from "../src/hygiene";
 
 const at = (day: string, time: string) => {
   const [h, m] = time.split(":").map(Number);
@@ -354,6 +354,38 @@ describe("Uplifting feed", () => {
       const { gym } = planned();
       feed(gym, at(DAY, "19:10"), { workouts: [tagged("Gold's Gym Broadway")] });
       expect(evaluateGym(gym, at(DAY, "19:10"))[0].status).toBe("missed");
+    });
+
+    test("a gym tag that arrives on a later read fills in; times, sets and an existing tag stay", () => {
+      const gym = tagMode();
+      feed(gym, at(DAY, "19:10"), { workouts: [tagged(null)] });
+      const first = { ...gym.sessions[0] };
+      expect(first.gymTag).toBeUndefined();
+      feed(gym, at(DAY, "19:20"), { workouts: [tagged("Golds", at(DAY, "18:00"), at(DAY, "20:00"), 30)] });
+      expect(gym.sessions).toHaveLength(1);
+      expect(gym.sessions[0]).toEqual({ ...first, gymTag: "Golds" });
+      expect(evaluateGym(gym, at(DAY, "19:20"))[0]).toMatchObject({ status: "kept", sessionId: "w1" });
+      feed(gym, at(DAY, "19:30"), { workouts: [tagged("Home")] });
+      expect(gym.sessions[0].gymTag).toBe("Golds");
+    });
+
+    test("a miss whose 4 h wait ends on a travel day doesn't lock after landing", () => {
+      const gym = tagMode();
+      // Deadline 18:30 PST (Nov 6 01:30Z) is before the flight; failedAt 22:30 PST (05:30Z) is in it.
+      const after = Date.parse("2026-11-07T01:00:00Z");
+      feed(gym, after, {});
+      expect(statusAt(gym, after)).toEqual(["missed"]);
+      expect(gymOutstanding(gym, after)).toHaveLength(1);
+      try {
+        setZoneHistory([
+          { zone: "America/Vancouver", from: "2026-11-01T12:00:00Z", seenAt: "2026-11-06T03:00:00Z" },
+          { zone: "Asia/Jakarta", from: "2026-11-07T00:00:00Z", seenAt: "2026-11-07T00:00:00Z" },
+        ]);
+        expect(statusAt(gym, after)).toEqual(["missed"]);
+        expect(gymOutstanding(gym, after)).toEqual([]);
+      } finally {
+        setZoneHistory(undefined);
+      }
     });
 
     test("a plan keeps the proof and tag it was added with: a settings change can't rewrite it", () => {

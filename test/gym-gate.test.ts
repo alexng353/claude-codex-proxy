@@ -93,6 +93,52 @@ const reply = async (text: string) => {
 };
 
 describe("gym on the gate", () => {
+  describe("zone and settings under the lock", () => {
+    const base = { version: 1, startsAt: iso(at("2027-01-01", "05:00")), images: [], filled: {}, bypass: { count: 0, until: null, history: [] }, debts: [], notes: [], extraGatedTriggers: [] };
+
+    test("a wall time is read in the zone the state file records now, not this slot's stale copy", async () => {
+      await route("/hygiene/gym");
+      // Another proxy slot recorded Jakarta since this one last read the file.
+      await Bun.sleep(5);
+      await writeFile(
+        process.env.HYGIENE_GATE_STATE!,
+        JSON.stringify({
+          ...base,
+          zones: [
+            { zone: "America/Vancouver", from: "2026-11-01T12:00:00Z", seenAt: "2026-11-04T12:00:00Z" },
+            { zone: "Asia/Jakarta", from: "2026-11-04T13:00:00Z", seenAt: "2026-11-05T12:00:00Z" },
+          ],
+        }),
+      );
+      const added = await route("/hygiene/gym/plans", { start: "2026-11-16 18:00", by: "bubble" });
+      expect(added.status).toBe(200);
+      expect(added.body.plan.start).toBe("2026-11-16T11:00:00.000Z");
+      const moved = await route(`/hygiene/gym/plans/${added.body.plan.id}/move`, { start: "2026-11-17 18:00", by: "bubble" });
+      expect(moved.body.plan.start).toBe("2026-11-17T11:00:00.000Z");
+    });
+
+    test("a plan saved before plans kept their own proof mode isn't rewritten by a later settings change", async () => {
+      clock = at(DAY, "19:10");
+      // The state format from before this change: no proof or tagPattern on the plan.
+      await writeFile(
+        process.env.HYGIENE_GATE_STATE!,
+        JSON.stringify({
+          ...base,
+          gym: {
+            plans: [{ id: `${DAY}-1`, start: iso(at(DAY, "18:00")), graceMin: 30, status: "planned", createdAt: iso(at("2026-11-04", "12:00")), log: [] }],
+            sessions: [{ id: "w1", clientId: null, start: iso(at(DAY, "18:05")), end: iso(at(DAY, "19:00")), sets: 12, seenAt: iso(clock), gymTag: "Gold's" }],
+            checkins: [],
+            syncedAt: iso(clock),
+          },
+        }),
+      );
+      resetGateCache();
+      expect((await route("/hygiene/gym")).body.plans[0].status).toBe("missed");
+      expect((await route("/hygiene/gym/settings", { proof: "workout-tag" })).status).toBe(200);
+      expect((await route("/hygiene/gym")).body.plans[0].status).toBe("missed");
+    });
+  });
+
   describe("gym photo replays, keepsakes and the recheck route", () => {
     const fix = { lat: GOLDS.latitude, lon: GOLDS.longitude };
     const dh: Record<string, string> = { gym: "0".repeat(64), gym2: "0".repeat(63) + "1", gymB: "f".repeat(64), tooth: "a".repeat(64), gymTooth: "a".repeat(63) + "b" };

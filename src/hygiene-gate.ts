@@ -79,6 +79,7 @@ import {
 import { tryLock, unlock } from "./filelock";
 import {
   checkSession,
+  stampPlanSettings,
   editPlan,
   emptyGym,
   evaluateGym,
@@ -190,6 +191,8 @@ export function loadState(): GateState {
     if (!raw || typeof raw !== "object") throw new Error("state file is not a JSON object");
     state = { ...emptyState(raw.startsAt ?? defaultStartsAt(deps.now())), ...raw } as GateState;
   }
+  // Older plans get the proof mode and tag they were made under (gym.ts stampPlanSettings).
+  stampPlanSettings(state.gym);
   cache = { path, mtimeMs, state };
   setZoneHistory(state.zones);
   return state;
@@ -1079,27 +1082,38 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   const by = text(body.by, 80);
   const note = text(body.note);
 
-  const plan = async (edit: PlanEdit) => {
+  // Wall times are read inside the locked mutation, after the state (and so the phone's zone
+  // history) is reloaded: another proxy slot may have recorded a zone change since this one
+  // last read the file. Parsing is checked up front only for the 400.
+  const startError =
+    'start is required: "YYYY-MM-DD HH:MM" in the phone zone, optionally followed by a zone name such as America/Vancouver, or ISO with an offset';
+  const plan = async (make: () => PlanEdit | null) => {
     const result = await mutateGym((gym, now) => {
-      const r = editPlan(gym, edit, now);
+      const edit = make();
+      const r = edit ? editPlan(gym, edit, now) : ({ ok: false, error: startError } as const);
       return { changed: r.ok, result: r };
     }, "gym plan changed");
     return Response.json(result, { status: result.ok ? 200 : 400 });
   };
   if (path === "/plans") {
-    // Wall times ("YYYY-MM-DD HH:MM") are read here, in the phone's current zone.
-    const start = parseStart(text(body.start, 90) ?? "");
-    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" in the phone zone, optionally followed by a zone name such as America/Vancouver, or ISO with an offset' }, { status: 400 });
+    const raw = text(body.start, 90) ?? "";
+    if (!parseStart(raw)) return Response.json({ error: startError }, { status: 400 });
     // Models often send null for an omitted optional: treat it as "use the default".
     const grace = typeof body.grace_min === "number" ? body.grace_min : body.grace_min == null ? undefined : NaN;
-    return plan({ action: "add", start, graceMin: grace, note, by });
+    return plan(() => {
+      const start = parseStart(raw);
+      return start ? { action: "add", start, graceMin: grace, note, by } : null;
+    });
   }
   const edit = /^\/plans\/([A-Za-z0-9-]+)\/(move|cancel)$/.exec(path);
   if (edit) {
-    if (edit[2] === "cancel") return plan({ action: "cancel", id: edit[1], note, by });
-    const start = parseStart(text(body.start, 90) ?? "");
-    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" in the phone zone, optionally followed by a zone name such as America/Vancouver, or ISO with an offset' }, { status: 400 });
-    return plan({ action: "move", id: edit[1], start, note, by });
+    if (edit[2] === "cancel") return plan(() => ({ action: "cancel", id: edit[1], note, by }));
+    const raw = text(body.start, 90) ?? "";
+    if (!parseStart(raw)) return Response.json({ error: startError }, { status: 400 });
+    return plan(() => {
+      const start = parseStart(raw);
+      return start ? { action: "move", id: edit[1], start, note, by } : null;
+    });
   }
   if (path === "/settings") {
     const grace = body.grace_min === undefined ? undefined : typeof body.grace_min === "number" ? body.grace_min : NaN;
@@ -1124,12 +1138,12 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     return Response.json({ ok: true, settings, note: "applies to plans added from now on; existing plans keep the settings they were added with" });
   }
   if (path === "/pauses") {
-    const from = parseStart(text(body.from, 90) ?? "");
-    const to = parseStart(text(body.to, 90) ?? "");
+    const rawFrom = text(body.from, 90) ?? "";
+    const rawTo = text(body.to, 90) ?? "";
     const reason = text(body.reason) ?? "";
-    if (!from || !to) return Response.json({ error: "from and to (ISO times) are required" }, { status: 400 });
+    if (!parseStart(rawFrom) || !parseStart(rawTo)) return Response.json({ error: "from and to (ISO times) are required" }, { status: 400 });
     const result = await mutateGym((gym, now) => {
-      const r = addPause(gym, { from, to, reason, by }, now);
+      const r = addPause(gym, { from: parseStart(rawFrom) ?? "", to: parseStart(rawTo) ?? "", reason, by }, now);
       return { changed: r.ok, result: r };
     }, "gym pause");
     return Response.json(result, { status: result.ok ? 200 : 400 });
@@ -1152,13 +1166,16 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   // security boundary (the state file is editable too).
   if (path === "/sessions/credit") {
     const reason = text(body.reason, 300);
-    const startMs = Date.parse(parseStart(String(body.start ?? "")) ?? "");
-    const endMs = Date.parse(parseStart(String(body.end ?? "")) ?? "");
+    const rawStart = String(body.start ?? "");
+    const rawEnd = String(body.end ?? "");
     if (!by || !reason) return Response.json({ error: "by and reason are required" }, { status: 400 });
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs)
-      return Response.json({ error: "start and end must be ISO times, end after start" }, { status: 400 });
-    if (endMs > deps.now()) return Response.json({ error: "a credited session must already have ended" }, { status: 400 });
-    const session = await mutateGym((gym, now) => {
+    const result = await mutateGym<{ error: string } | { session: Record<string, unknown> }>((gym, now) => {
+      // Parsed under the lock, in the zone the reloaded state records (see plan above).
+      const startMs = Date.parse(parseStart(rawStart) ?? "");
+      const endMs = Date.parse(parseStart(rawEnd) ?? "");
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs)
+        return { changed: false, result: { error: "start and end must be ISO times, end after start" } };
+      if (endMs > now) return { changed: false, result: { error: "a credited session must already have ended" } };
       const id = text(body.workout_id, 80) ?? `manual:${gym.sessions.filter((s) => s.manual).length + 1}`;
       if (gym.sessions.some((s) => s.id === id)) gym.sessions = gym.sessions.filter((s) => s.id !== id);
       const s = {
@@ -1171,9 +1188,10 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
         manual: { by, reason },
       };
       gym.sessions.push(s);
-      return { changed: true, result: s };
+      return { changed: true, result: { session: s } };
     }, "gym session credited");
-    return Response.json({ ok: true, session });
+    if ("error" in result) return Response.json(result, { status: 400 });
+    return Response.json({ ok: true, session: result.session });
   }
   return null;
 }

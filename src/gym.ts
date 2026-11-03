@@ -150,6 +150,28 @@ export function gymSettings(gym: GymState | undefined): GymSettings {
   return { ...DEFAULT_GYM_SETTINGS, ...s, gym: { ...DEFAULT_GYM_SETTINGS.gym, ...(s.gym ?? {}) } };
 }
 
+/**
+ * Plans saved before plans carried their own proof mode and tag get today's
+ * settings written onto them, so a later settings change can't rewrite them.
+ * The gate runs this on every read of its state file, before any edit.
+ */
+export function stampPlanSettings(gym: GymState | undefined): boolean {
+  if (!gym?.plans) return false;
+  const { proof, tagPattern } = gymSettings(gym);
+  let changed = false;
+  for (const plan of gym.plans) {
+    if (plan.proof === undefined) {
+      plan.proof = proof;
+      changed = true;
+    }
+    if (plan.tagPattern === undefined) {
+      plan.tagPattern = tagPattern;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 export function distanceM(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
   const rad = (d: number) => (d * Math.PI) / 180;
   const dLat = rad(b.lat - a.lat);
@@ -523,12 +545,14 @@ export function gymOutstanding(gym: GymState | undefined, now: number): GymRequi
   // live lock.
   const pause = pauseAt(gym, now);
   return evaluateGym(gym, now)
-    // A plan whose deadline fell on a travel day (a zone change) doesn't lock either.
+    // A plan whose deadline, or the moment it failed (workout-tag mode waits 4 h more),
+    // fell on a travel day (a zone change) doesn't lock either.
     .filter(
       (r) =>
         r.status === "missed" &&
         missLocks(r, now) &&
         !inTransit(r.deadline) &&
+        !inTransit(r.failedAt ?? r.deadline) &&
         (!pause || ms(r.plan.start) <= ms(pause.at)),
     )
     .map((r) => ({
@@ -796,7 +820,17 @@ export function mergeFeed(gym: GymState, feed: UpliftingFeed, now: number): bool
   for (const w of feed.workouts ?? []) {
     if (typeof w?.id !== "string" || w.kind !== "workout" || !w.end_time) continue;
     if (!Number.isFinite(Date.parse(w.start_time)) || !Number.isFinite(Date.parse(w.end_time))) continue;
-    if (gym.sessions.some((x) => x.id === w.id)) continue;
+    const tag = typeof w.gym_location === "string" && w.gym_location.trim() ? w.gym_location.trim().slice(0, 100) : undefined;
+    const known = gym.sessions.find((x) => x.id === w.id);
+    if (known) {
+      // A session's times and sets are frozen when first seen; only a missing gym tag fills in
+      // later (an older API, or a tag added in Uplifting after the sync).
+      if (tag && !known.gymTag && !known.manual) {
+        known.gymTag = tag;
+        changed = true;
+      }
+      continue;
+    }
     gym.sessions.push({
       id: w.id,
       clientId: typeof w.client_id === "string" ? w.client_id : null,
@@ -804,7 +838,7 @@ export function mergeFeed(gym: GymState, feed: UpliftingFeed, now: number): bool
       end: new Date(Date.parse(w.end_time)).toISOString(),
       sets: Number.isFinite(w.set_count) ? w.set_count : 0,
       seenAt: nowIso,
-      ...(typeof w.gym_location === "string" && w.gym_location.trim() ? { gymTag: w.gym_location.trim().slice(0, 100) } : {}),
+      ...(tag ? { gymTag: tag } : {}),
     });
     changed = true;
   }
