@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { zonedTime } from "../src/hygiene";
+import { setZoneHistory, zonedTime } from "../src/hygiene";
 import { handleHygieneApi, setAuthenticator } from "../src/hygiene-api";
 import { resetGateCache, setGateDeps } from "../src/hygiene-gate";
 
@@ -282,5 +282,40 @@ describe("shield bypass", () => {
   test("answers 503 while the gate is switched off", async () => {
     await writeFile(process.env.HYGIENE_GATE_DISABLED_FILE!, "");
     expect((await bypass({ minutes: 15, source: "cairn-shield", at: iso(clock) })).status).toBe(503);
+  });
+});
+
+describe("device time zone (X-Device-Time-Zone on GET /status)", () => {
+  async function status(zone?: string) {
+    const request = new Request("http://localhost/hygiene/api/v1/status", {
+      headers: { authorization: "Bearer phone", ...(zone ? { "x-device-time-zone": zone } : {}) },
+    });
+    const reply = await handleHygieneApi(request, new URL(request.url));
+    return (await reply!.json()) as any;
+  }
+  afterAll(() => setZoneHistory(undefined));
+
+  test("records the zone and follows it; an unknown zone is ignored; a repeat adds nothing", async () => {
+    expect((await status()).zone).toBe("America/Vancouver");
+    expect((await state()).zones).toBeUndefined();
+    await status("America/Vancouver");
+    clock += 60_000;
+    const jkt = await status("Asia/Jakarta");
+    expect(jkt.zone).toBe("Asia/Jakarta");
+    expect(jkt.today).toBe("2026-11-05");
+    // The 05:00 Vancouver slot armed before the gate heard from the phone at all, so it was a
+    // live lock before the change and stays one; the travel day starts at the first report.
+    expect(jkt.state).toBe("armed");
+    expect((await state()).zones.map((z: any) => z.zone)).toEqual(["America/Vancouver", "Asia/Jakarta"]);
+    expect((await status("Mars/Olympus")).zone).toBe("Asia/Jakarta");
+    expect((await status("../../etc/passwd")).zone).toBe("Asia/Jakarta");
+    clock += 60_000;
+    await status("Asia/Jakarta");
+    const zones = (await state()).zones;
+    expect(zones).toHaveLength(2);
+    expect(zones[1].seenAt).toBe(zones[1].from);
+    clock += 3_600_000;
+    await status("Asia/Jakarta");
+    expect((await state()).zones[1].seenAt).toBe(iso(clock));
   });
 });

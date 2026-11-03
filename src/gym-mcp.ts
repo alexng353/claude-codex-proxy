@@ -6,7 +6,7 @@
  *
  * Register in Codex: [mcp_servers.gym] command = "bun", args = ["<repo>/src/gym-mcp.ts"].
  */
-import { describeReport, gymCall, parseStart } from "./gym-client";
+import { describeReport, gymCall, startArg } from "./gym-client";
 
 const WHEN =
   'Vancouver wall time "YYYY-MM-DD HH:MM" (e.g. "2026-11-04 18:00"), or ISO with an offset. Must be in the future.';
@@ -68,12 +68,12 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     case "gym_status":
       return result(await gymCall(""));
     case "gym_plan_add": {
-      const start = parseStart(String(args.start ?? ""));
+      const start = startArg(String(args.start ?? ""));
       if (!start) return { text: `start must be ${WHEN}`, isError: true };
       return result(await gymCall("/plans", { start, by: by(), note, ...(args.grace_min !== undefined ? { grace_min: args.grace_min } : {}) }));
     }
     case "gym_plan_move": {
-      const start = parseStart(String(args.start ?? ""));
+      const start = startArg(String(args.start ?? ""));
       if (!start) return { text: `start must be ${WHEN}`, isError: true };
       return result(await gymCall(`/plans/${encodeURIComponent(String(args.id ?? ""))}/move`, { start, by: by(), note }));
     }

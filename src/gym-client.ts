@@ -25,6 +25,16 @@ export function parseStart(text: string): string | null {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
+/**
+ * A start as typed, for the gate to read: wall times are read there, in the
+ * phone's current zone (the CLI and MCP processes don't know it). Null when
+ * it is neither a wall time nor an ISO time with an offset.
+ */
+export function startArg(text: string): string | null {
+  const t = text.trim();
+  return /^\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}$/.test(t) || parseStart(t) ? t : null;
+}
+
 export async function gymCall(path: string, body?: Record<string, unknown>): Promise<{ status: number; body: any }> {
   const key = process.env.PROXY_API_KEY;
   const reply = await fetch(`${proxyBase()}/hygiene/gym${path}`, {
