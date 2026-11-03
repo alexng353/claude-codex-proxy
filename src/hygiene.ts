@@ -198,8 +198,9 @@ export const TRANSIT_COOLDOWN_MS = 7 * 86_400_000;
 /**
  * Only a change that moves the clock this much is a travel day. A same-clock
  * alias (Canada/Pacific, America/Los_Angeles) or a one-hour hop is not: the
- * morning still happens at a normal hour, and picking a city by hand on the
- * phone must not open the gate.
+ * morning still happens at a normal hour. Picking a far city by hand on the
+ * phone still gets one travel day; the 7-day cooldown is the only limit on that
+ * (it is a self-imposed gate, and every change is logged).
  */
 export const TRANSIT_MIN_SHIFT_MS = 3 * 3_600_000;
 
