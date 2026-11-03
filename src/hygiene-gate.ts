@@ -81,6 +81,8 @@ import {
   distanceM,
   gymPhotoWanted,
   recordGymPhoto,
+  addPause,
+  endPause,
   gymSettings,
   when as vancouverLabel,
   type GymState,
@@ -996,6 +998,7 @@ export function gymReport() {
       return { ...s, counts: check.qualifies, ...(check.reason ? { reason: check.reason } : {}) };
     }),
     checkins: (gym?.checkins ?? []).slice(-20),
+    pauses: gym?.pauses ?? [],
   };
 }
 
@@ -1039,14 +1042,45 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
     return plan({ action: "move", id: edit[1], start, note, by });
   }
   if (path === "/settings") {
-    const grace = typeof body.grace_min === "number" ? body.grace_min : NaN;
-    if (!Number.isInteger(grace) || grace < 0 || grace > 360)
+    const grace = body.grace_min === undefined ? undefined : typeof body.grace_min === "number" ? body.grace_min : NaN;
+    if (grace !== undefined && (!Number.isInteger(grace) || grace < 0 || grace > 360))
       return Response.json({ error: "grace_min must be a whole number of minutes, 0-360" }, { status: 400 });
+    const proof = body.proof;
+    if (proof !== undefined && proof !== "checkins" && proof !== "workout-tag")
+      return Response.json({ error: 'proof must be "checkins" or "workout-tag"' }, { status: 400 });
+    const tag = body.tag_pattern === undefined ? undefined : text(body.tag_pattern, 40);
+    if (body.tag_pattern !== undefined && !tag) return Response.json({ error: "tag_pattern must be non-empty text" }, { status: 400 });
+    if (grace === undefined && proof === undefined && tag === undefined)
+      return Response.json({ error: "give grace_min, proof or tag_pattern" }, { status: 400 });
     const settings = await mutateGym((gym) => {
-      gym.settings = { ...(gym.settings ?? {}), graceMin: grace };
+      gym.settings = {
+        ...(gym.settings ?? {}),
+        ...(grace !== undefined ? { graceMin: grace } : {}),
+        ...(proof !== undefined ? { proof } : {}),
+        ...(tag !== undefined ? { tagPattern: tag } : {}),
+      };
       return { changed: true, result: gymSettings(gym) };
     }, "gym settings");
-    return Response.json({ ok: true, settings, note: "applies to plans added from now on" });
+    return Response.json({ ok: true, settings, note: grace !== undefined ? "grace applies to plans added from now on" : "applies now" });
+  }
+  if (path === "/pauses") {
+    const from = text(body.from, 40);
+    const to = text(body.to, 40);
+    const reason = text(body.reason) ?? "";
+    if (!from || !to) return Response.json({ error: "from and to (ISO times) are required" }, { status: 400 });
+    const result = await mutateGym((gym, now) => {
+      const r = addPause(gym, { from, to, reason, by }, now);
+      return { changed: r.ok, result: r };
+    }, "gym pause");
+    return Response.json(result, { status: result.ok ? 200 : 400 });
+  }
+  const ending = /^\/pauses\/([A-Za-z0-9-]+)\/end$/.exec(path);
+  if (ending) {
+    const result = await mutateGym((gym, now) => {
+      const r = endPause(gym, ending[1], now, by);
+      return { changed: r.ok, result: r };
+    }, "gym pause ended");
+    return Response.json(result, { status: result.ok ? 200 : 400 });
   }
   if (path === "/sync") {
     await syncGym(gymHost);
