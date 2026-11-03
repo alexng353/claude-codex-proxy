@@ -6,7 +6,9 @@ import {
   evaluateGym,
   gymDueToday,
   gymOutstanding,
+  gymPhotoWanted,
   mergeFeed,
+  recordGymPhoto,
   pruneGym,
   type GymState,
   type UpliftingFeed,
@@ -262,6 +264,53 @@ describe("edits", () => {
 });
 
 describe("Uplifting feed", () => {
+  test("a miss locks for 24 h at most, stays missed, and can still be made up", () => {
+    const { gym } = planned();
+    feed(gym, at(DAY, "18:31"), {});
+    expect(gymOutstanding(gym, at(DAY, "18:31"))).toHaveLength(1);
+    const late = at(DAY, "18:30") + 24 * 3_600_000;
+    feed(gym, late - 60_000, {});
+    expect(gymOutstanding(gym, late - 60_000)).toHaveLength(1);
+    feed(gym, late, {});
+    expect(gymOutstanding(gym, late)).toEqual([]);
+    expect(statusAt(gym, late)).toEqual(["missed"]);
+    const next = "2026-11-07";
+    feed(gym, at(next, "20:00"), {
+      checkins: [checkin("c9", "start", at(next, "18:00")), checkin("c9", "finish", at(next, "19:00"))],
+      workouts: [workout("w9", "c9", at(next, "18:00"), at(next, "19:00"))],
+    });
+    expect(statusAt(gym, at(next, "20:00"))).toEqual(["made-up"]);
+  });
+
+  test("a gym photo stands in for missing Uplifting location; a far photo doesn't", () => {
+    const { gym } = planned();
+    recordGymPhoto(gym, { id: "far", distanceM: 500, at: at(DAY, "18:05"), now: at(DAY, "18:06") });
+    feed(gym, at(DAY, "18:31"), {});
+    expect(statusAt(gym, at(DAY, "18:31"))).toEqual(["missed"]);
+
+    const { gym: g2 } = planned();
+    expect(recordGymPhoto(g2, { id: "near", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:06") })).toBe(true);
+    expect(recordGymPhoto(g2, { id: "near", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:07") })).toBe(false);
+    feed(g2, at(DAY, "18:40"), {});
+    expect(statusAt(g2, at(DAY, "18:40"))).toEqual(["in-progress"]);
+    // An old Uplifting build: no check-ins, no client id.
+    feed(g2, at(DAY, "19:10"), { workouts: [{ ...workout("w1", "x", at(DAY, "18:00"), at(DAY, "19:00"), 10), client_id: null }] });
+    expect(evaluateGym(g2, at(DAY, "19:10"))[0]).toMatchObject({ status: "kept", sessionId: "w1" });
+
+    // A photo with no workout after it: the 4 h Start window ends in a miss.
+    const { gym: g3 } = planned();
+    recordGymPhoto(g3, { id: "lone", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:06") });
+    feed(g3, at(DAY, "22:10"), {});
+    expect(evaluateGym(g3, at(DAY, "22:10"))[0]).toMatchObject({ status: "missed", reason: "started, never finished" });
+  });
+
+  test("gymPhotoWanted only while a plan could use a photo", () => {
+    const { gym } = planned();
+    expect(gymPhotoWanted(gym, at(DAY, "14:59"))).toBe(false);
+    expect(gymPhotoWanted(gym, at(DAY, "15:00"))).toBe(true);
+    expect(gymPhotoWanted(undefined, at(DAY, "18:00"))).toBe(false);
+  });
+
   test("a session is recorded once; editing its times later changes nothing", () => {
     const gym = emptyGym();
     const now = at(DAY, "20:00");
@@ -350,10 +399,10 @@ describe("the gate", () => {
     expect(due.map((r) => r.kind)).toEqual(["gym"]);
     expect(lockedText(due)).toBe(
       "💪 gate armed: gym session planned Thu, Nov 5 18:00 (no Start at the gym by 18:30)\n" +
-        "Log a gym session in Uplifting (Start and Finish at the gym) to unlock, or reply BYPASS.",
+        "Log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply BYPASS.",
     );
     expect(lockedText([{ slot: "x", kind: "shower", label: "shower photo" }, ...due]).split("\n")[1]).toBe(
-      "Send a fresh photo and log a gym session in Uplifting (Start and Finish at the gym) to unlock, or reply BYPASS.",
+      "Send a fresh photo and log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply BYPASS.",
     );
   });
 });

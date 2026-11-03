@@ -60,6 +60,7 @@ import {
 import {
   archivePhoto,
   captureTime,
+  gpsFix,
   claudeClassifier,
   decodeDataUrl,
   dhash,
@@ -74,6 +75,9 @@ import {
   editPlan,
   emptyGym,
   evaluateGym,
+  distanceM,
+  gymPhotoWanted,
+  recordGymPhoto,
   gymSettings,
   when as vancouverLabel,
   type GymState,
@@ -100,6 +104,8 @@ export type GateDeps = {
   classify: Classifier;
   dhash: (bytes: Buffer) => Promise<string | null>;
   captureTime: (bytes: Buffer) => Promise<number | null>;
+  /** EXIF GPS of a photo, for gym photos. */
+  gpsFix: (bytes: Buffer) => Promise<{ lat: number; lon: number } | null>;
   /** Saves an accepted photo and returns its path. */
   archive: typeof archivePhoto;
   /** Base URL the model uses for the ruling endpoint. */
@@ -115,6 +121,7 @@ const defaults: GateDeps = {
   classify: claudeClassifier,
   dhash,
   captureTime,
+  gpsFix,
   archive: archivePhoto,
   baseUrl: `http://127.0.0.1:${process.env.PORT ?? 3456}`,
   wake: todayWake,
@@ -329,9 +336,53 @@ async function checkImageRecorded(
   now: number,
   only?: ProofTarget,
 ): Promise<ImageOutcome> {
+  // A gym photo also goes through the hygiene check: a shower photo at the gym is still a shower photo.
+  const gymLine = only ? null : await gymPhoto(state, url, now);
   const before = state.images.length;
   const outcome = await whileChecking(statePath(), () => checkImage(state, url, source, now, only));
-  return outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
+  const result = outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
+  if (!gymLine) return result;
+  let record = result.record;
+  if (!record) {
+    // Nothing hygiene-related was due: keep a record so the photo can't be reused and the state is saved.
+    const decoded = decodeDataUrl(url)!;
+    record = {
+      sha256: sha256(decoded.bytes),
+      dhash: null,
+      at: new Date(now).toISOString(),
+      source,
+      kind: null,
+      verdict: "unneeded",
+      reason: "gym photo",
+    };
+    state.images.push(record);
+  }
+  // "No hygiene proof visible" is noise when the photo was meant for the gym.
+  const hygieneLine = record.verdict === "rejected" && record.kind === "none" ? null : result.line;
+  return { line: hygieneLine ? `${gymLine}\n${hygieneLine}` : gymLine, record };
+}
+
+/**
+ * A photo taken at the gym while a plan could use it (Alex, 2026-11-02: a
+ * geotagged photo at Gold's plus the Uplifting log counts if Uplifting's
+ * location fails). Needs a fresh camera time and GPS inside the gym radius;
+ * it is stored as a Start check-in, distance only. Returns the reply line, or
+ * null when the photo isn't a gym photo.
+ */
+async function gymPhoto(state: GateState, url: string, now: number): Promise<string | null> {
+  if (!state.gym || !gymPhotoWanted(state.gym, now)) return null;
+  const decoded = decodeDataUrl(url);
+  if (!decoded) return null;
+  const taken = await deps.captureTime(decoded.bytes);
+  if (taken === null || now - taken > EXIF_MAX_AGE_MS || taken - now > EXIF_FUTURE_SLACK_MS) return null;
+  const fix = await deps.gpsFix(decoded.bytes);
+  if (!fix) return null;
+  const s = gymSettings(state.gym);
+  const distance = distanceM(fix, s.gym);
+  if (!(distance <= s.gym.radiusM)) return null;
+  const at = Math.min(taken, now);
+  recordGymPhoto(state.gym, { id: sha256(decoded.bytes).slice(0, 16), distanceM: distance, at, now });
+  return `💪 gym photo recorded: ${Math.round(distance)} m from ${s.gym.name} at ${clockLabel(at)}. It stands in for Uplifting's location; the session counts once the Uplifting workout it was taken during syncs (at least ${s.minMinutes} min and ${s.minSets} sets).`;
 }
 
 async function checkImage(

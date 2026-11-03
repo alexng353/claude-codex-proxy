@@ -134,11 +134,34 @@ export type PlanResult = {
   deadline: number;
   /** Why a missed plan was missed. */
   reason?: string;
+  /** When a missed plan failed: its deadline, or the end of an unfinished Start's hours. */
+  failedAt?: number;
   /** The session that kept or made up the plan. */
   sessionId?: string;
 };
 
 export type SessionCheck = { session: GymSession; qualifies: boolean; reason?: string };
+
+/**
+ * Gym photos (Alex, 2026-11-02: a geotagged photo at Gold's plus the Uplifting
+ * log counts if Uplifting's location fails). A photo sent to the gate with a
+ * fresh camera time and GPS inside the gym radius is stored as a Start
+ * check-in with this client id prefix: distance only, never coordinates.
+ */
+export const PHOTO_PREFIX = "photo:";
+const isPhoto = (c: GymCheckin) => c.clientId.startsWith(PHOTO_PREFIX);
+/** A gym photo counts for a session that started or ended within this of it. */
+const PHOTO_SLACK_MS = 15 * MIN;
+
+function photoDuring(gym: GymState, session: GymSession): GymCheckin | undefined {
+  return gym.checkins.find(
+    (c) =>
+      isPhoto(c) &&
+      atGym(gym, c) &&
+      ms(c.at) >= ms(session.start) - PHOTO_SLACK_MS &&
+      ms(c.at) <= ms(session.end) + PHOTO_SLACK_MS,
+  );
+}
 
 /** Whether a finished session counts, and why not when it doesn't. */
 export function checkSession(gym: GymState, session: GymSession): SessionCheck {
@@ -149,7 +172,11 @@ export function checkSession(gym: GymState, session: GymSession): SessionCheck {
   if (session.sets < s.minSets) return { session, qualifies: false, reason: `${session.sets} sets, under ${s.minSets}` };
   for (const kind of ["start", "finish"] as const) {
     const fix = session.clientId ? checkinFor(gym, session.clientId, kind) : undefined;
-    if (!fix || fix.distanceM === null) return { session, qualifies: false, reason: `no location at ${kind}` };
+    // No location from Uplifting (an old build, GPS off): a gym photo during the session stands in.
+    if (!fix || fix.distanceM === null) {
+      if (photoDuring(gym, session)) return { session, qualifies: true };
+      return { session, qualifies: false, reason: `no location at ${kind}` };
+    }
     if (fix.distanceM > s.gym.radiusM)
       return { session, qualifies: false, reason: `${Math.round(fix.distanceM)} m from the gym at ${kind}` };
   }
@@ -194,6 +221,10 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   const finishedClients = new Map(gym.sessions.filter((x) => x.clientId).map((x) => [x.clientId!, x]));
   const plans = [...gym.plans].sort((a, b) => ms(a.start) - ms(b.start));
   const results: PlanResult[] = [];
+  // The finished session a Start belongs to: by client id, or for a gym photo, the session around it.
+  const sessionFor = (c: GymCheckin) =>
+    finishedClients.get(c.clientId) ??
+    (isPhoto(c) ? gym.sessions.find((x) => ms(c.at) >= ms(x.start) - PHOTO_SLACK_MS && ms(c.at) <= ms(x.end) + PHOTO_SLACK_MS) : undefined);
 
   for (const plan of plans) {
     const start = ms(plan.start);
@@ -221,7 +252,7 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
     const started = gym.checkins
       .filter((c) => c.kind === "start" && atGym(gym, c) && inWindow(c.at) && ms(c.at) <= now)
       .sort((a, b) => ms(a.at) - ms(b.at));
-    const unfinished = started.filter((c) => !finishedClients.has(c.clientId));
+    const unfinished = started.filter((c) => !sessionFor(c));
     const open = unfinished.find((c) => now < ms(c.at) + s.maxOpenMin * MIN);
     if (open) {
       results.push({ plan, status: "in-progress", deadline });
@@ -233,7 +264,7 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       results.push({ plan, status: "upcoming", deadline });
       continue;
     }
-    const failed = started.map((c) => finishedClients.get(c.clientId)).find(Boolean);
+    const failed = started.map(sessionFor).find(Boolean);
     const failedCheck = failed && checks.find((c) => c.session.id === failed.id);
     const reason = failed
       ? failedCheck?.qualifies
@@ -244,7 +275,7 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       : started.length
         ? "started, never finished"
         : `no Start at the gym by ${clockLabel(deadline)}`;
-    results.push({ plan, status: "missed", deadline, reason });
+    results.push({ plan, status: "missed", deadline, reason, failedAt });
   }
 
   for (const result of results) {
@@ -294,6 +325,8 @@ export const gymSlot = (planId: string) => `gym/${planId}`;
 
 /** Polls run every 2 minutes; a read older than this can't lock the gate. */
 export const FRESH_READ_MS = 10 * MIN;
+/** A miss locks the gate for at most this long after it failed (Alex, 2026-11-02); it stays missed and can still be made up. */
+export const LOCK_MAX_MS = 24 * 60 * MIN;
 
 /**
  * Missed plans not yet made up: these lock the gate, but only on a fresh,
@@ -303,7 +336,7 @@ export const FRESH_READ_MS = 10 * MIN;
 export function gymOutstanding(gym: GymState | undefined, now: number): GymRequirement[] {
   if (!gym?.syncedAt || gym.syncError || now - ms(gym.syncedAt) > FRESH_READ_MS) return [];
   return evaluateGym(gym, now)
-    .filter((r) => r.status === "missed")
+    .filter((r) => r.status === "missed" && now < (r.failedAt ?? r.deadline) + LOCK_MAX_MS)
     .map((r) => ({
       slot: gymSlot(r.plan.id),
       kind: "gym" as const,
@@ -425,6 +458,30 @@ export type UpliftingFeed = {
 
 const KEEP_DAYS = 60;
 
+/** A plan a gym photo could help now: its window has opened, and it isn't settled, kept, made up or cancelled. */
+export function gymPhotoWanted(gym: GymState | undefined, now: number): boolean {
+  if (!gym) return false;
+  const early = gymSettings(gym).earlyMin * MIN;
+  return evaluateGym(gym, now).some(
+    (r) => r.status === "in-progress" || r.status === "missed" || (r.status === "upcoming" && now >= ms(r.plan.start) - early),
+  );
+}
+
+/** Records a gym photo as a Start check-in (distance only). Returns false if this photo was already recorded. */
+export function recordGymPhoto(gym: GymState, photo: { id: string; distanceM: number; at: number; now: number }): boolean {
+  const clientId = `${PHOTO_PREFIX}${photo.id}`;
+  if (gym.checkins.some((c) => c.clientId === clientId)) return false;
+  gym.checkins.push({
+    clientId,
+    kind: "start",
+    at: new Date(photo.at).toISOString(),
+    distanceM: Math.round(photo.distanceM),
+    accuracyM: null,
+    receivedAt: new Date(photo.now).toISOString(),
+  });
+  return true;
+}
+
 /**
  * Merges a feed into the gate's copy. A session is recorded once, the first
  * time it is seen finished, so editing its times later can't create or move
@@ -486,7 +543,8 @@ export function pruneGym(gym: GymState, now: number): boolean {
       changed = true;
     }
   }
-  const missed = results.filter((r) => r.status === "missed");
+  // A miss past the data window no longer locks (24 h cap) and can't pin old data forever.
+  const missed = results.filter((r) => r.status === "missed" && ms(r.plan.start) >= cutoff);
   const needed = missed.length ? Math.min(...missed.map((r) => ms(r.plan.start))) - gymSettings(gym).earlyMin * MIN : Infinity;
   const keepFrom = Math.min(cutoff, needed);
   const before = gym.sessions.length + gym.checkins.length;

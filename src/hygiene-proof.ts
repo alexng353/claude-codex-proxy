@@ -91,6 +91,33 @@ export async function captureTime(bytes: Buffer): Promise<number | null> {
   return parseCaptureTime(out?.toString("utf8") ?? "");
 }
 
+/** EXIF GPS position, or null when the photo has none (sharing often strips it). Never stored: only its distance to the gym is. */
+export async function gpsFix(bytes: Buffer): Promise<{ lat: number; lon: number } | null> {
+  const out = await magick(
+    ["identify", "-format", "%[EXIF:GPSLatitude]|%[EXIF:GPSLatitudeRef]|%[EXIF:GPSLongitude]|%[EXIF:GPSLongitudeRef]", "-"],
+    bytes,
+  ).catch(() => null);
+  return parseGpsFix(out?.toString("utf8") ?? "");
+}
+
+/** "49/1,15/1,6057/125|N|123/1,7/1,1743/125|W" (degrees, minutes, seconds as rationals) to signed decimal degrees. */
+export function parseGpsFix(raw: string): { lat: number; lon: number } | null {
+  const [lat, latRef, lon, lonRef] = raw.trim().split("|");
+  const degrees = (text: string | undefined) => {
+    const parts = (text ?? "").split(",").map((p) => {
+      const [n, d = "1"] = p.trim().split("/");
+      return Number(n) / Number(d);
+    });
+    if (parts.length !== 3 || parts.some((x) => !Number.isFinite(x) || x < 0)) return null;
+    return parts[0] + parts[1] / 60 + parts[2] / 3600;
+  };
+  const a = degrees(lat);
+  const o = degrees(lon);
+  if (a === null || o === null || !/^[NS]$/.test(latRef ?? "") || !/^[EW]$/.test(lonRef ?? "")) return null;
+  if (a > 90 || o > 180) return null;
+  return { lat: latRef === "S" ? -a : a, lon: lonRef === "W" ? -o : o };
+}
+
 export function parseCaptureTime(raw: string): number | null {
   const [stamp, offset] = raw.trim().split("|");
   const match = /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(stamp ?? "");

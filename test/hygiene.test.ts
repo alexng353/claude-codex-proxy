@@ -13,7 +13,7 @@ import {
   zonedTime,
   type GateState,
 } from "../src/hygiene";
-import { dhashFromGray, hammingDistance, parseCaptureTime, parseVerdict, parseWeightReading } from "../src/hygiene-proof";
+import { dhashFromGray, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 /** Vancouver wall time on a given day, e.g. at("2026-10-08", "05:00"). */
@@ -429,6 +429,13 @@ describe("proof helpers", () => {
 
   test("EXIF capture time honours the offset, else Vancouver", () => {
     expect(parseCaptureTime("2026:10:08 05:10:00|-07:00")).toBe(Date.parse("2026-10-08T12:10:00Z"));
+    // magick's EXIF GPS format (checked on a real JPEG 2026-11-02): rationals d,m,s plus a hemisphere.
+    const fix = parseGpsFix("49/1,15/1,6057/125|N|123/1,7/1,1743/125|W");
+    expect(fix!.lat).toBeCloseTo(49.26346, 5);
+    expect(fix!.lon).toBeCloseTo(-123.12054, 5);
+    expect(parseGpsFix("|||")).toBeNull();
+    expect(parseGpsFix("49/1,15/1,6057/125|X|123/1,7/1,1743/125|W")).toBeNull();
+    expect(parseGpsFix("49/0,15/1,1/1|N|123/1,7/1,1/1|W")).toBeNull();
     expect(parseCaptureTime("2026:10:08 05:10:00|")).toBe(Date.parse("2026-10-08T12:10:00Z"));
     expect(parseCaptureTime("|")).toBeNull();
     expect(parseCaptureTime("")).toBeNull();

@@ -93,6 +93,48 @@ const reply = async (text: string) => {
 };
 
 describe("gym on the gate", () => {
+  test("a geotagged photo at the gym unlocks a missed plan; a photo elsewhere doesn't", async () => {
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+    const exif: Record<string, { taken: number; fix: { lat: number; lon: number } | null }> = {
+      gym: { taken: at(DAY, "18:20"), fix: { lat: GOLDS.latitude, lon: GOLDS.longitude } },
+      far: { taken: at(DAY, "18:20"), fix: { lat: GOLDS.latitude + 0.0045, lon: GOLDS.longitude } },
+      old: { taken: at(DAY, "17:00"), fix: { lat: GOLDS.latitude, lon: GOLDS.longitude } },
+    };
+    setGateDeps({
+      now: () => clock,
+      wake: async () => "sent",
+      captureTime: async (bytes) => exif[bytes.toString("utf8")]?.taken ?? null,
+      gpsFix: async (bytes) => exif[bytes.toString("utf8")]?.fix ?? null,
+      classify: async () => ({ kind: "none", confidence: 0.9, reason: "no hygiene proof" }),
+    });
+    const photoTurn = (name: string): ResponsesRequest =>
+      ({
+        ...turn(""),
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_image", image_url: `data:image/jpeg;base64,${Buffer.from(name).toString("base64")}`, detail: "auto" }],
+          } as ResponseInputItem,
+        ],
+      }) as ResponsesRequest;
+    clock = at(DAY, "18:35");
+    expect(await reply("hi")).toContain("gate armed: gym session");
+    for (const name of ["far", "old"]) {
+      const d = await gateRequest(photoTurn(name));
+      expect(d.action).toBe("respond");
+    }
+    const d = await gateRequest(photoTurn("gym"));
+    expect(d.action).toBe("forward");
+    const report = await route("/hygiene/gym");
+    expect(report.body.plans[0].status).toBe("in-progress");
+    expect(report.body.checkins).toHaveLength(1);
+    expect(report.body.checkins[0]).toMatchObject({ kind: "start", distanceM: 0, at: iso(at(DAY, "18:20")) });
+    expect(report.body.checkins[0].clientId).toStartWith("photo:");
+    // The photo's coordinates are never stored, only its distance.
+    expect(Object.keys(report.body.checkins[0]).sort()).toEqual(["accuracyM", "at", "clientId", "distanceM", "kind", "receivedAt"]);
+  });
+
   test("a missed plan locks the next turn; a qualifying session unlocks it", async () => {
     const added = await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
     expect(added.status).toBe(200);
@@ -105,7 +147,7 @@ describe("gym on the gate", () => {
     // The turn reads Uplifting first: nothing there, so the plan is missed.
     expect(await reply("hi")).toBe(
       "💪 gate armed: gym session planned Thu, Nov 5 18:00 (no Start at the gym by 18:30)\n" +
-        "Log a gym session in Uplifting (Start and Finish at the gym) to unlock, or reply BYPASS.",
+        "Log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply BYPASS.",
     );
     expect(reads).toBeGreaterThan(0);
 

@@ -808,7 +808,7 @@ export function lockedText(requirements: Requirement[], results: string[] = []):
   const gym = requirements.some((r) => r.kind === "gym");
   const unlock = [
     ...(photos ? ["send a fresh photo"] : []),
-    ...(gym ? ["log a gym session in Uplifting (Start and Finish at the gym)"] : []),
+    ...(gym ? ["log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on)"] : []),
   ].join(" and ");
   return [
     ...results,
