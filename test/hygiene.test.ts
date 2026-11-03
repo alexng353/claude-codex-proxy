@@ -476,7 +476,7 @@ describe("proof helpers", () => {
     fs.writeFileSync(`${fakeDir}/perl`, `#!/bin/sh\ntouch ${marker}\ncat\n`, { mode: 0o755 });
     const proof = `${import.meta.dir}/../src/hygiene-proof.ts`;
     const script = `const { stripGps } = await import(${JSON.stringify(proof)}); const bytes = require("node:fs").readFileSync(${JSON.stringify(file)}); console.log((await stripGps({ mediaType: "image/jpeg", bytes })) ? "stripped" : "null");`;
-    const run = Bun.spawnSync([process.execPath, "-e", script], { env: { ...process.env, PATH: `${fakeDir}:${process.env.PATH}` } });
+    const run = Bun.spawnSync([process.execPath, "-e", script], { env: { ...process.env, PATH: `${fakeDir}:${process.env.PATH}`, PERL5OPT: "-Mcomb_no_such_module" } });
     expect(run.stdout.toString().trim()).toBe("stripped");
     expect(fs.existsSync(marker)).toBe(false);
     expect(await gpsFix(stripped!.bytes)).toBeNull();
@@ -492,6 +492,7 @@ describe("proof helpers", () => {
     expect(xmpOut).not.toBeNull();
     expect(Bun.spawnSync([exiftoolBin()!, "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: xmpOut!.bytes }).stdout.toString().trim()).toBe("");
     expect(await stripGps({ mediaType: "image/jpeg", bytes: Buffer.from("not an image") })).toBeNull();
+    (require("node:fs") as typeof import("node:fs")).rmSync(dir, { recursive: true, force: true });
   });
 
   test("verdict parsing is strict about kind and clamps confidence", () => {

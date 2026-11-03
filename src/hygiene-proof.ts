@@ -118,8 +118,13 @@ const EXIFTOOL = exiftoolBin();
 if (!EXIFTOOL) console.error("hygiene-proof: exiftool not found; photo keepsakes will not be saved");
 /** exiftool's shebang is `#!/usr/bin/env perl`: only root-owned directories, and no inherited PERL5* settings. */
 const EXIFTOOL_ENV = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" };
-/** Logged on each change from working to failing, so a bad photo can't use up the only warning. */
-let exiftoolFailing = false;
+/** The last exiftool error logged: each new error is logged once, and a success clears it. */
+let lastExiftoolError: string | null = null;
+function noteExiftoolError(error: string | null): void {
+  if (error !== null && error !== lastExiftoolError)
+    console.error(`hygiene-proof: ${EXIFTOOL} failed (${error.slice(0, 160)}); that photo's keepsake is skipped`);
+  lastExiftoolError = error;
+}
 
 /**
  * The same image with its location removed: every EXIF GPS tag and all XMP
@@ -148,11 +153,11 @@ async function exiftool(args: string[], input: Buffer): Promise<Buffer | null> {
       child.exited,
     ]);
     clearTimeout(timer);
-    if (code !== 0 && !exiftoolFailing)
-      console.error(`hygiene-proof: ${EXIFTOOL} exited ${code} (${errors.split("\n")[0].slice(0, 160)}); that photo's keepsake is skipped`);
-    exiftoolFailing = code !== 0;
+    noteExiftoolError(code === 0 ? null : `exit ${code}: ${errors.split("\n")[0]}`);
     return code === 0 ? Buffer.from(output) : null;
-  } catch {
+  } catch (error) {
+    // E.g. the binary was removed after startup (ENOENT).
+    noteExiftoolError((error as NodeJS.ErrnoException).code ?? (error as Error).message);
     return null;
   }
 }
