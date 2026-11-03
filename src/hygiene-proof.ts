@@ -231,7 +231,10 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
       '- "walk": a photo taken outdoors by someone on foot: a street, sidewalk, path, park, trees or open sky around the camera. Not a view through a window and not from inside a vehicle.',
     );
   if (wanted.penance)
-    lines.push(`- "penance": the photo shows this: ${JSON.stringify(wanted.penance)}`);
+    lines.push(
+      `- "penance": the photo shows this: ${JSON.stringify(wanted.penance)}`,
+      'If the photo matches the penance, answer "penance" even when it also matches another kind.',
+    );
   // Creatine and walk photos have no person in them; only the other kinds need one.
   const personless = wanted.kinds.includes("creatine") || wanted.kinds.includes("walk");
   lines.push(

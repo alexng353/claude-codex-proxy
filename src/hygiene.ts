@@ -903,10 +903,14 @@ export function imageMarker(record: ImageRecord, state?: GateState): string {
   return `[hygiene-gate: photo ${what}; image withheld]`;
 }
 
-/** Photos of Alex in the bathroom never reach the working model. */
+/**
+ * Photos of Alex in the bathroom never reach the working model. Outdoor walk
+ * and creatine photos are not private, so they reach it unless they are copies.
+ */
 export const isWithheld = (record: ImageRecord) =>
   !record.manual &&
-  (record.verdict === "duplicate" || (record.kind !== null && record.kind !== "none"));
+  (record.verdict === "duplicate" ||
+    (record.kind !== null && record.kind !== "none" && record.kind !== "walk" && record.kind !== "creatine"));
 
 export function noteText(debt: Debt, baseUrl: string): string {
   const at = Date.parse(debt.at);
@@ -931,7 +935,7 @@ export function delayNoteText(until: number): string {
   return [
     `<${NOTE_TAG}>`,
     "Supplied automatically by Alex's hygiene gate; Alex did not type this.",
-    `Alex used DELAY to postpone his morning photos (teeth, plus the weigh-in when due) until ${clockLabel(until)}.`,
+    `Alex used DELAY to postpone his morning photos (teeth, plus the weigh-in, creatine and outdoor walk when due) until ${clockLabel(until)}.`,
     "End your final reply to this message with one short line asking him to send the missing morning photo.",
     `</${NOTE_TAG}>`,
   ].join("\n");

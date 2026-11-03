@@ -488,6 +488,16 @@ describe("creatine and outdoor walk", () => {
     );
   });
 
+  test("an outdoor photo sent while the gate is open (BYPASS) neither starts the walk nor is withheld", async () => {
+    await enable();
+    expect(text(await decide(request([env, user("BYPASS")])))).toStartWith("🚪");
+    verdicts.push({ kind: "walk", confidence: 0.9, reason: "street" });
+    const passed = await send("listing");
+    expect(passed.action).toBe("forward");
+    expect(JSON.stringify(passed)).toContain(photo("listing"));
+    expect(gateStatus().lastProofs.map((p) => p.slot)).not.toContain(`${DAY}/morning-walk-start`);
+  });
+
   test("off until enabled; DELAY postpones them with the other morning photos", async () => {
     await enable(at("2026-10-09", "05:00"));
     expect(text(await decide(request([env, user("hi")])))).toBe(
@@ -569,7 +579,7 @@ describe("DELAY", () => {
     await decide(request([env, user("DELAY")]));
     const first = [env, user("DELAY"), assistant("⏰"), user("summarise the agenda")];
     const one = await decide(request(first));
-    const nag = "Alex used DELAY to postpone his morning photos (teeth, plus the weigh-in when due) until 09:45.";
+    const nag = "Alex used DELAY to postpone his morning photos (teeth, plus the weigh-in, creatine and outdoor walk when due) until 09:45.";
     const firstInput = one.action === "forward" ? (one.request.input as ResponseInputItem[]) : [];
     expect(JSON.stringify(firstInput[3])).toContain(nag);
     expect(JSON.stringify(firstInput[3])).toContain("End your final reply to this message with one short line asking him to send the missing morning photo.");

@@ -13,7 +13,7 @@ import {
   zonedTime,
   type GateState,
 } from "../src/hygiene";
-import { captureTime, dhashFromGray, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps, exiftoolBin } from "../src/hygiene-proof";
+import { captureTime, classifierPrompt, dhashFromGray, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps, exiftoolBin } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 /** Vancouver wall time on a given day, e.g. at("2026-10-08", "05:00"). */
@@ -183,6 +183,18 @@ describe("requirements", () => {
     ]);
     s.filled[`${DAY}/morning-walk`] = "x";
     expect(wantedKinds(s, at(DAY, "07:00"))).toEqual(["teeth", "shower"]);
+  });
+
+  test("classifier prompt: walk and creatine only when wanted; a matching penance wins", () => {
+    const plain = classifierPrompt({ kinds: ["teeth", "shower"] });
+    expect(plain).not.toContain('"walk"');
+    expect(plain).toContain("or images with no person.");
+    const both = classifierPrompt({ kinds: ["walk", "creatine", "penance"], penance: "photo of you on a walk outside" });
+    expect(both).toContain('- "walk": a photo taken outdoors');
+    expect(both).toContain('- "creatine": creatine being taken');
+    expect(both).toContain('answer "penance" even when it also matches another kind');
+    expect(both).toContain("images with no person that match none of the kinds above.");
+    expect(parseVerdict({ kind: "walk", confidence: 0.8, reason: "street", reading: "" }).kind).toBe("walk");
   });
 });
 

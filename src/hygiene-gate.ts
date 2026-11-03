@@ -510,7 +510,14 @@ async function checkImage(
     return { line: `❌ photo not clear enough to accept: ${verdict.reason || "low confidence"}` };
   }
   const target = slotsFor(verdict.kind as ProofKind)[0];
-  if (!target) {
+  // An everyday outdoor or kitchen photo must not start a walk or count as creatine by accident:
+  // only one sent to unlock the gate, during DELAY, or through Cairn's proof flow counts.
+  const meant =
+    (verdict.kind !== "walk" && verdict.kind !== "creatine") ||
+    record.locked ||
+    source.thread === "cairn" ||
+    delayActive(state, now);
+  if (!target || !meant) {
     state.images.push({ ...record, verdict: "unneeded" });
     return { line: null };
   }
