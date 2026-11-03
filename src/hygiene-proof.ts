@@ -100,6 +100,25 @@ export async function gpsFix(bytes: Buffer): Promise<{ lat: number; lon: number 
   return parseGpsFix(out?.toString("utf8") ?? "");
 }
 
+const EXIFTOOL = process.env.HYGIENE_EXIFTOOL_BIN ?? "exiftool";
+
+/** The same image with every GPS tag removed (other EXIF kept), or null if exiftool failed. */
+export async function stripGps(image: DecodedImage): Promise<DecodedImage | null> {
+  try {
+    const child = Bun.spawn([EXIFTOOL, "-q", "-q", "-gps:all=", "-o", "-", "-"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    child.stdin.write(image.bytes);
+    await child.stdin.end();
+    const timer = setTimeout(() => child.kill(), 15_000);
+    const [output, code] = await Promise.all([new Response(child.stdout).arrayBuffer(), child.exited]);
+    clearTimeout(timer);
+    if (code !== 0 || !output.byteLength) return null;
+    const bytes = Buffer.from(output);
+    return (await gpsFix(bytes)) ? null : { ...image, bytes };
+  } catch {
+    return null;
+  }
+}
+
 /** "49/1,15/1,6057/125|N|123/1,7/1,1743/125|W" (degrees, minutes, seconds as rationals) to signed decimal degrees. */
 export function parseGpsFix(raw: string): { lat: number; lon: number } | null {
   const [lat, latRef, lon, lonRef] = raw.trim().split("|");

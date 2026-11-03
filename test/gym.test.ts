@@ -309,6 +309,106 @@ describe("Uplifting feed", () => {
     expect(gymPhotoWanted(gym, at(DAY, "14:59"))).toBe(false);
     expect(gymPhotoWanted(gym, at(DAY, "15:00"))).toBe(true);
     expect(gymPhotoWanted(undefined, at(DAY, "18:00"))).toBe(false);
+    // Kept: nothing to help.
+    const { gym: kept } = planned();
+    feed(kept, at(DAY, "19:10"), {
+      checkins: [checkin("c1", "start", at(DAY, "18:00")), checkin("c1", "finish", at(DAY, "19:00"))],
+      workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+    });
+    expect(gymPhotoWanted(kept, at(DAY, "19:10"))).toBe(false);
+    // Cancelled ahead of time.
+    const { gym: off, id } = planned();
+    editPlan(off, { action: "cancel", id, by: "test" }, at(DAY, "12:00"));
+    expect(gymPhotoWanted(off, at(DAY, "17:00"))).toBe(false);
+    // A miss past its 24 h lock no longer wants photos.
+    const { gym: lapsed } = planned();
+    const late = at(DAY, "18:30") + 24 * 3_600_000;
+    feed(lapsed, late, {});
+    expect(gymPhotoWanted(lapsed, late - 1)).toBe(true);
+    expect(gymPhotoWanted(lapsed, late)).toBe(false);
+  });
+
+  test("an unfinished Start locks from the end of its 4 hours, so the cap counts from there", () => {
+    const { gym } = planned();
+    feed(gym, at(DAY, "22:15"), { checkins: [checkin("c1", "start", at(DAY, "18:10"))] });
+    const failed = at(DAY, "22:10");
+    feed(gym, failed + 24 * 3_600_000 - 60_000, {});
+    expect(gymOutstanding(gym, failed + 24 * 3_600_000 - 60_000)).toHaveLength(1);
+    feed(gym, failed + 24 * 3_600_000, {});
+    expect(gymOutstanding(gym, failed + 24 * 3_600_000)).toEqual([]);
+  });
+
+  test("a make-up clears the miss that still locks before a lapsed one", () => {
+    const gym = emptyGym();
+    for (const day of ["2026-11-02", "2026-11-04"]) {
+      const r = editPlan(gym, { action: "add", start: iso(at(day, "18:00")), by: "test" }, at("2026-11-01", "12:00"));
+      if (!r.ok) throw new Error(r.error);
+    }
+    feed(gym, at("2026-11-04", "18:31"), {});
+    expect(gymOutstanding(gym, at("2026-11-04", "18:31"))).toHaveLength(1);
+    feed(gym, at("2026-11-04", "20:05"), {
+      checkins: [checkin("c1", "start", at("2026-11-04", "19:00")), checkin("c1", "finish", at("2026-11-04", "20:00"))],
+      workouts: [workout("w1", "c1", at("2026-11-04", "19:00"), at("2026-11-04", "20:00"))],
+    });
+    expect(statusAt(gym, at("2026-11-04", "20:05"))).toEqual(["missed", "made-up"]);
+    expect(gymOutstanding(gym, at("2026-11-04", "20:05"))).toEqual([]);
+  });
+
+  test("one gym photo backs one session only; never a session that ended before it", () => {
+    const gym = emptyGym();
+    for (const time of ["10:00", "10:30"]) {
+      const r = editPlan(gym, { action: "add", start: iso(at(DAY, time)), by: "test" }, at("2026-11-04", "12:00"));
+      if (!r.ok) throw new Error(r.error);
+    }
+    recordGymPhoto(gym, { id: "one", distanceM: 20, at: at(DAY, "09:52"), now: at(DAY, "09:52") });
+    const bare = (id: string, s: number, e: number) => ({ ...workout(id, "x", s, e, 10), client_id: null });
+    feed(gym, at(DAY, "11:00"), { workouts: [bare("s1", at(DAY, "09:00"), at(DAY, "09:50")), bare("s2", at(DAY, "10:00"), at(DAY, "10:45"))] });
+    const kept = evaluateGym(gym, at(DAY, "11:00")).filter((r) => r.status === "kept");
+    expect(kept.map((r) => r.sessionId)).toEqual(["s2"]);
+
+    // Two photos back two sessions: each session takes its own photo.
+    const two = emptyGym();
+    for (const time of ["10:00", "10:30"]) {
+      const r2 = editPlan(two, { action: "add", start: iso(at(DAY, time)), by: "test" }, at("2026-11-04", "12:00"));
+      if (!r2.ok) throw new Error(r2.error);
+    }
+    recordGymPhoto(two, { id: "a", distanceM: 20, at: at(DAY, "09:50"), now: at(DAY, "09:50") });
+    recordGymPhoto(two, { id: "b", distanceM: 20, at: at(DAY, "09:55"), now: at(DAY, "09:55") });
+    feed(two, at(DAY, "11:00"), { workouts: [bare("t1", at(DAY, "10:00"), at(DAY, "10:45")), bare("t2", at(DAY, "10:05"), at(DAY, "10:50"))] });
+    expect(statusAt(two, at(DAY, "11:00"))).toEqual(["kept", "kept"]);
+  });
+
+  test("a gym photo never overrides a far Uplifting location at either end", () => {
+    for (const [start, finish] of [
+      [null, AWAY],
+      [AWAY, null],
+    ] as const) {
+      const { gym } = planned();
+      recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:05") });
+      const c = (kind: "start" | "finish", t: number, where: typeof AWAY | null) =>
+        where ? checkin("c1", kind, t, where) : { ...checkin("c1", kind, t), latitude: null, longitude: null };
+      feed(gym, at(DAY, "19:10"), {
+        checkins: [c("start", at(DAY, "18:00"), start), c("finish", at(DAY, "19:00"), finish)],
+        workouts: [workout("w1", "c1", at(DAY, "18:00"), at(DAY, "19:00"))],
+      });
+      expect(evaluateGym(gym, at(DAY, "19:10"))[0].status).toBe("missed");
+    }
+  });
+
+  test("a photo just after a short warm-up waits for the main session instead of failing on the warm-up", () => {
+    const { gym } = planned();
+    recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "18:05"), now: at(DAY, "18:05") });
+    feed(gym, at(DAY, "18:40"), { workouts: [{ ...workout("warm", "x", at(DAY, "17:40"), at(DAY, "18:00"), 3), client_id: null }] });
+    expect(statusAt(gym, at(DAY, "18:40"))).toEqual(["in-progress"]);
+  });
+
+  test("a miss older than the data window no longer pins old sessions", () => {
+    const gym = emptyGym();
+    const r = editPlan(gym, { action: "add", start: iso(at("2026-08-01", "18:00")), by: "test" }, at("2026-07-31", "12:00"));
+    if (!r.ok) throw new Error(r.error);
+    feed(gym, at("2026-08-01", "18:31"), { workouts: [workout("old", "o", at("2026-08-02", "10:00"), at("2026-08-02", "10:20"))] });
+    pruneGym(gym, at(DAY, "12:00"));
+    expect(gym.sessions).toEqual([]);
   });
 
   test("a session is recorded once; editing its times later changes nothing", () => {

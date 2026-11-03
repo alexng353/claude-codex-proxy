@@ -150,36 +150,57 @@ export type SessionCheck = { session: GymSession; qualifies: boolean; reason?: s
  */
 export const PHOTO_PREFIX = "photo:";
 const isPhoto = (c: GymCheckin) => c.clientId.startsWith(PHOTO_PREFIX);
-/** A gym photo counts for a session that started or ended within this of it. */
+/** A gym photo taken up to this long before a session starts can stand in for it. */
 const PHOTO_SLACK_MS = 15 * MIN;
 
-function photoDuring(gym: GymState, session: GymSession): GymCheckin | undefined {
-  return gym.checkins.find(
-    (c) =>
-      isPhoto(c) &&
-      atGym(gym, c) &&
-      ms(c.at) >= ms(session.start) - PHOTO_SLACK_MS &&
-      ms(c.at) <= ms(session.end) + PHOTO_SLACK_MS,
-  );
+/** Which session each gym photo belongs to: at most one each way. */
+export type PhotoMatch = { bySession: Map<string, GymCheckin>; byPhoto: Map<string, GymSession> };
+
+/**
+ * The one rule for tying gym photos to sessions, used by both checkSession
+ * and evaluateGym. Photos go oldest first; each takes one session not taken
+ * yet, preferring one that contains it, else one starting within
+ * PHOTO_SLACK_MS after it (earliest start, then id). A session that ended
+ * before the photo never gets it, and no session longer than maxOpenMin does,
+ * so one photo can't vouch for a long or later at-home log.
+ */
+export function matchPhotos(gym: GymState): PhotoMatch {
+  const s = gymSettings(gym);
+  const bySession = new Map<string, GymCheckin>();
+  const byPhoto = new Map<string, GymSession>();
+  const photos = gym.checkins.filter((c) => isPhoto(c) && atGym(gym, c)).sort((a, b) => ms(a.at) - ms(b.at));
+  const sessions = gym.sessions
+    .filter((x) => !x.manual && ms(x.end) - ms(x.start) <= s.maxOpenMin * MIN)
+    .sort((a, b) => ms(a.start) - ms(b.start) || a.id.localeCompare(b.id));
+  for (const photo of photos) {
+    const at = ms(photo.at);
+    const free = sessions.filter((x) => !bySession.has(x.id));
+    const pick =
+      free.find((x) => ms(x.start) <= at && at <= ms(x.end)) ??
+      free.find((x) => at < ms(x.start) && ms(x.start) - at <= PHOTO_SLACK_MS);
+    if (!pick) continue;
+    bySession.set(pick.id, photo);
+    byPhoto.set(photo.clientId, pick);
+  }
+  return { bySession, byPhoto };
 }
 
 /** Whether a finished session counts, and why not when it doesn't. */
-export function checkSession(gym: GymState, session: GymSession): SessionCheck {
+export function checkSession(gym: GymState, session: GymSession, photos: PhotoMatch = matchPhotos(gym)): SessionCheck {
   if (session.manual) return { session, qualifies: true };
   const s = gymSettings(gym);
   const minutes = (ms(session.end) - ms(session.start)) / MIN;
   if (!(minutes >= s.minMinutes)) return { session, qualifies: false, reason: `${Math.round(minutes)} min, under ${s.minMinutes}` };
   if (session.sets < s.minSets) return { session, qualifies: false, reason: `${session.sets} sets, under ${s.minSets}` };
-  for (const kind of ["start", "finish"] as const) {
-    const fix = session.clientId ? checkinFor(gym, session.clientId, kind) : undefined;
-    // No location from Uplifting (an old build, GPS off): a gym photo during the session stands in.
-    if (!fix || fix.distanceM === null) {
-      if (photoDuring(gym, session)) return { session, qualifies: true };
-      return { session, qualifies: false, reason: `no location at ${kind}` };
-    }
-    if (fix.distanceM > s.gym.radiusM)
-      return { session, qualifies: false, reason: `${Math.round(fix.distanceM)} m from the gym at ${kind}` };
-  }
+  const kinds = ["start", "finish"] as const;
+  const fixes = kinds.map((kind) => (session.clientId ? checkinFor(gym, session.clientId, kind) : undefined));
+  // Uplifting's own evidence of being away always wins, whichever end it is.
+  for (const [i, fix] of fixes.entries())
+    if (fix && fix.distanceM !== null && fix.distanceM > s.gym.radiusM)
+      return { session, qualifies: false, reason: `${Math.round(fix.distanceM)} m from the gym at ${kinds[i]}` };
+  // No location from Uplifting (an old build, GPS off): this session's gym photo stands in.
+  const missing = kinds.find((_, i) => !fixes[i] || fixes[i]!.distanceM === null);
+  if (missing && !photos.bySession.has(session.id)) return { session, qualifies: false, reason: `no location at ${missing}` };
   return { session, qualifies: true };
 }
 
@@ -216,15 +237,15 @@ function plannedAt(plan: GymPlan): number {
 export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[] {
   if (!gym) return [];
   const s = gymSettings(gym);
-  const checks = gym.sessions.map((session) => checkSession(gym, session));
+  const photos = matchPhotos(gym);
+  const checks = gym.sessions.map((session) => checkSession(gym, session, photos));
   const used = new Set<string>();
   const finishedClients = new Map(gym.sessions.filter((x) => x.clientId).map((x) => [x.clientId!, x]));
   const plans = [...gym.plans].sort((a, b) => ms(a.start) - ms(b.start));
   const results: PlanResult[] = [];
-  // The finished session a Start belongs to: by client id, or for a gym photo, the session around it.
+  // The finished session a Start belongs to: by client id, or for a gym photo, its matched session.
   const sessionFor = (c: GymCheckin) =>
-    finishedClients.get(c.clientId) ??
-    (isPhoto(c) ? gym.sessions.find((x) => ms(c.at) >= ms(x.start) - PHOTO_SLACK_MS && ms(c.at) <= ms(x.end) + PHOTO_SLACK_MS) : undefined);
+    finishedClients.get(c.clientId) ?? (isPhoto(c) ? photos.byPhoto.get(c.clientId) : undefined);
 
   for (const plan of plans) {
     const start = ms(plan.start);
@@ -278,8 +299,20 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
     results.push({ plan, status: "missed", deadline, reason, failedAt });
   }
 
-  for (const result of results) {
-    if (result.status !== "missed") continue;
+  // Make-ups go first to misses that still lock (newest first), then to lapsed ones (oldest first),
+  // so a session always clears a live lock when one exists.
+  const misses = results
+    .filter((r) => r.status === "missed")
+    .sort((a, b) =>
+      missLocks(a, now) !== missLocks(b, now)
+        ? missLocks(a, now)
+          ? -1
+          : 1
+        : missLocks(a, now)
+          ? ms(b.plan.start) - ms(a.plan.start)
+          : ms(a.plan.start) - ms(b.plan.start),
+    );
+  for (const result of misses) {
     const opens = ms(result.plan.start) - s.earlyMin * MIN;
     const madeAt = plannedAt(result.plan);
     const makeup = checks
@@ -327,6 +360,7 @@ export const gymSlot = (planId: string) => `gym/${planId}`;
 export const FRESH_READ_MS = 10 * MIN;
 /** A miss locks the gate for at most this long after it failed (Alex, 2026-11-02); it stays missed and can still be made up. */
 export const LOCK_MAX_MS = 24 * 60 * MIN;
+export const missLocks = (r: PlanResult, now: number) => now < (r.failedAt ?? r.deadline) + LOCK_MAX_MS;
 
 /**
  * Missed plans not yet made up: these lock the gate, but only on a fresh,
@@ -336,7 +370,7 @@ export const LOCK_MAX_MS = 24 * 60 * MIN;
 export function gymOutstanding(gym: GymState | undefined, now: number): GymRequirement[] {
   if (!gym?.syncedAt || gym.syncError || now - ms(gym.syncedAt) > FRESH_READ_MS) return [];
   return evaluateGym(gym, now)
-    .filter((r) => r.status === "missed" && now < (r.failedAt ?? r.deadline) + LOCK_MAX_MS)
+    .filter((r) => r.status === "missed" && missLocks(r, now))
     .map((r) => ({
       slot: gymSlot(r.plan.id),
       kind: "gym" as const,
@@ -463,7 +497,10 @@ export function gymPhotoWanted(gym: GymState | undefined, now: number): boolean 
   if (!gym) return false;
   const early = gymSettings(gym).earlyMin * MIN;
   return evaluateGym(gym, now).some(
-    (r) => r.status === "in-progress" || r.status === "missed" || (r.status === "upcoming" && now >= ms(r.plan.start) - early),
+    (r) =>
+      r.status === "in-progress" ||
+      (r.status === "missed" && missLocks(r, now)) ||
+      (r.status === "upcoming" && now >= ms(r.plan.start) - early),
   );
 }
 

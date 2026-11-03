@@ -93,6 +93,66 @@ const reply = async (text: string) => {
 };
 
 describe("gym on the gate", () => {
+  test("gym photos: a replay, a near copy or no GPS adds nothing; a checker error stays retryable", async () => {
+    // Morning teeth photo due from 05:00 so the hygiene checker runs too.
+    await writeFile(
+      process.env.HYGIENE_GATE_STATE!,
+      JSON.stringify({ version: 1, startsAt: iso(at(DAY, "05:00")), images: [], filled: {}, bypass: { count: 0, until: null, history: [] }, debts: [], notes: [], extraGatedTriggers: [] }),
+    );
+    resetGateCache();
+    await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+    const fix = { lat: GOLDS.latitude, lon: GOLDS.longitude };
+    const meta: Record<string, { gps: typeof fix | null; dhash: string }> = {
+      gym: { gps: fix, dhash: "0".repeat(64) },
+      gym2: { gps: fix, dhash: "0".repeat(63) + "1" },
+      nogps: { gps: null, dhash: "f".repeat(64) },
+    };
+    let down = true;
+    let classified = 0;
+    setGateDeps({
+      now: () => clock,
+      wake: async () => "sent",
+      captureTime: async () => at(DAY, "18:20"),
+      gpsFix: async (bytes) => meta[bytes.toString("utf8")]?.gps ?? null,
+      dhash: async (bytes) => meta[bytes.toString("utf8")]?.dhash ?? null,
+      archive: () => "/dev/null",
+      classify: async () => {
+        classified++;
+        if (down) throw new Error("down");
+        return { kind: "teeth", confidence: 0.95, reason: "brushing" };
+      },
+    });
+    const send = async (name: string, thread = "01a10494-b499-7af3-986b-3c30d8c94b91") => {
+      const request = {
+        ...turn(""),
+        prompt_cache_key: thread,
+        input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: `data:image/jpeg;base64,${Buffer.from(name).toString("base64")}`, detail: "auto" }] } as ResponseInputItem],
+      } as ResponsesRequest;
+      const d = await gateRequest(request);
+      return d.action === "respond" ? d.text : "forwarded";
+    };
+    const photoCheckins = async () => (await route("/hygiene/gym")).body.checkins.filter((c: any) => c.clientId.startsWith("photo:"));
+    clock = at(DAY, "18:35");
+
+    expect(await send("nogps")).toContain("gate armed");
+    expect(await photoCheckins()).toHaveLength(0);
+
+    // Checker down: the gym Start is kept, the teeth photo isn't recorded.
+    expect(await send("gym")).toContain("couldn't check the photo");
+    expect(await photoCheckins()).toHaveLength(1);
+    // Resent once the checker works: classified again and accepted; the gym Start isn't doubled.
+    down = false;
+    expect(await send("gym", "01a10494-b499-7af3-986b-3c30d8c94b92")).toBe("forwarded");
+    // nogps, then gym (down), then gym again: classified each time.
+    expect(classified).toBe(3);
+    expect(await photoCheckins()).toHaveLength(1);
+
+    // A near copy (re-encoded) and an exact replay in another chat add no gym credit.
+    await send("gym2", "01a10494-b499-7af3-986b-3c30d8c94b93");
+    await send("gym", "01a10494-b499-7af3-986b-3c30d8c94b94");
+    expect(await photoCheckins()).toHaveLength(1);
+  });
+
   test("a geotagged photo at the gym unlocks a missed plan; a photo elsewhere doesn't", async () => {
     await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
     const exif: Record<string, { taken: number; fix: { lat: number; lon: number } | null }> = {

@@ -13,7 +13,7 @@ import {
   zonedTime,
   type GateState,
 } from "../src/hygiene";
-import { dhashFromGray, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading } from "../src/hygiene-proof";
+import { captureTime, dhashFromGray, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 /** Vancouver wall time on a given day, e.g. at("2026-10-08", "05:00"). */
@@ -436,6 +436,23 @@ describe("proof helpers", () => {
     expect(parseGpsFix("|||")).toBeNull();
     expect(parseGpsFix("49/1,15/1,6057/125|X|123/1,7/1,1743/125|W")).toBeNull();
     expect(parseGpsFix("49/0,15/1,1/1|N|123/1,7/1,1/1|W")).toBeNull();
+  });
+
+  test.skipIf(!Bun.which("exiftool") || !Bun.which("magick"))("stripGps removes GPS from a real JPEG and keeps the capture time", async () => {
+    const { mkdtemp, readFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(`${tmpdir()}/strip-gps-`);
+    const file = `${dir}/a.jpg`;
+    expect(Bun.spawnSync(["magick", "-size", "8x8", "xc:red", file]).exitCode).toBe(0);
+    const tag = Bun.spawnSync(["exiftool", "-q", "-overwrite_original", "-GPSLatitude=49.26346", "-GPSLatitudeRef=N", "-GPSLongitude=123.12054", "-GPSLongitudeRef=W", "-DateTimeOriginal=2026:11:05 18:05:00", "-OffsetTimeOriginal=-07:00", file]);
+    expect(tag.exitCode).toBe(0);
+    const bytes = await readFile(file);
+    expect(await gpsFix(bytes)).not.toBeNull();
+    const stripped = await stripGps({ mediaType: "image/jpeg", bytes });
+    expect(stripped).not.toBeNull();
+    expect(await gpsFix(stripped!.bytes)).toBeNull();
+    expect(await captureTime(stripped!.bytes)).toBe(Date.parse("2026-11-05T18:05:00-07:00"));
+    expect(await stripGps({ mediaType: "image/jpeg", bytes: Buffer.from("not an image") })).toBeNull();
     expect(parseCaptureTime("2026:10:08 05:10:00|")).toBe(Date.parse("2026-10-08T12:10:00Z"));
     expect(parseCaptureTime("|")).toBeNull();
     expect(parseCaptureTime("")).toBeNull();
