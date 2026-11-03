@@ -517,8 +517,14 @@ async function checkImage(
     record.locked ||
     source.thread === "cairn" ||
     delayActive(state, now);
-  if (!target || !meant) {
+  if (!target) {
     state.images.push({ ...record, verdict: "unneeded" });
+    return { line: null };
+  }
+  if (!meant) {
+    // Rejected, not unneeded: it stays out of the copy checks, so the same photo counts once
+    // BYPASS ends. No line: the turn is forwarded, so nothing would show it.
+    state.images.push({ ...record, reason: "not counted: sent while BYPASS was open" });
     return { line: null };
   }
   if (target.endsWith("/morning-walk")) {
