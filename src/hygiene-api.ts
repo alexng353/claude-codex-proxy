@@ -86,6 +86,9 @@ const TARGETS: Record<string, ProofTarget> = {
   teeth_night: { kind: "teeth" as ProofKind, slot: (s) => s.endsWith("/night-teeth") },
   teeth_morning: { kind: "teeth" as ProofKind, slot: (s) => s.endsWith("/morning-teeth") },
   weight_morning: { kind: "weight" as ProofKind, slot: (s) => s.endsWith("/morning-weight") },
+  creatine_morning: { kind: "creatine" as ProofKind, slot: (s) => s.endsWith("/morning-creatine") },
+  // Either photo of the walk: the first starts it, one 15+ min later finishes it.
+  walk_morning: { kind: "walk" as ProofKind, slot: (s) => s.endsWith("/morning-walk-start") || s.endsWith("/morning-walk") },
 };
 
 function decodeImage(body: { image?: unknown; media_type?: unknown }): { mediaType: string; bytes: Buffer } | null {
@@ -153,7 +156,7 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
       return json({ error: "body must be JSON" }, 400);
     }
     const target = typeof body.kind === "string" ? TARGETS[body.kind] : undefined;
-    if (!target) return json({ error: "kind must be shower, teeth_night, teeth_morning or weight_morning" }, 400);
+    if (!target) return json({ error: "kind must be shower, teeth_night, teeth_morning, weight_morning, creatine_morning or walk_morning" }, 400);
     const image = decodeImage(body);
     if (!image) return json({ error: "image must be base64 or a data: URL" }, 400);
     if (image.bytes.length > MAX_IMAGE_BYTES) return json({ error: "image is larger than 25 MB" }, 413);
