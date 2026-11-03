@@ -83,6 +83,12 @@ export type ImageRecord = {
   capturedAt?: string | null;
   /** New accepted weigh-ins are durable input for the Cairn delivery worker. */
   cairnWeightPending?: boolean;
+  /**
+   * A gym photo sent when no hygiene proof was due: never a hygiene proof, so
+   * left out of the near-copy checks (gym-to-gym copies are judged within
+   * 12 h on the gym check-ins instead). Lasts as long as the record.
+   */
+  gymOnly?: boolean;
   /** Weigh-ins: the scale reading as shown, e.g. "72.4 kg". */
   reading?: string;
 };

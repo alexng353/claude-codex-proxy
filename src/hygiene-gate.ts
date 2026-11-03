@@ -363,6 +363,7 @@ async function checkImageRecorded(
       kind: null,
       verdict: "unneeded",
       reason: "gym photo",
+      gymOnly: true,
     };
     state.images.push(record);
   }
@@ -403,12 +404,10 @@ async function gymPhoto(
   const dhash = await deps.dhash(decoded.bytes);
   const near = (a: string, b: string) => hammingDistance(a, b) <= NEAR_DUPLICATE_BITS;
   // An earlier hygiene proof (or its near copy) can't be reused as a gym photo either.
-  // Gym photos' own records are left out: gym-to-gym near copies are judged by recordGymPhoto
-  // within 12 h, so the same mirror and pose on another day still counts.
-  const gymPhotos = new Set(state.gym.checkins.filter((c) => c.clientId.startsWith("photo:")).map((c) => c.clientId.slice(6)));
-  const proofs = state.images.filter(
-    (r) => (r.verdict === "accepted" || r.verdict === "unneeded") && !gymPhotos.has(r.sha256.slice(0, 16)),
-  );
+  // Gym-only records are left out: gym-to-gym near copies are judged by recordGymPhoto within
+  // 12 h, so the same mirror and pose on another day still counts. Real hygiene proofs (even one
+  // that was also a gym photo) stay in for all time.
+  const proofs = state.images.filter((r) => (r.verdict === "accepted" || r.verdict === "unneeded") && !r.gymOnly);
   // An exact copy of a hygiene proof is a replay, a near copy never counts (a photo already
   // recorded for the gym is not in `proofs`; recordGymPhoto calls its resend a replay).
   const exactProof = proofs.some((r) => r.sha256 === hash);
@@ -458,7 +457,8 @@ async function checkImage(
     locked: outstanding(state, now).length > 0 && !bypassActive(state, now),
   };
   // Only passed proofs count: a retake right after a rejected photo must not collide with it.
-  const proofs = state.images.filter((r) => r.verdict === "accepted" || r.verdict === "unneeded");
+  // A gym-only photo never proved hygiene, so it can't make a later photo a copy.
+  const proofs = state.images.filter((r) => (r.verdict === "accepted" || r.verdict === "unneeded") && !r.gymOnly);
   if (proofs.some((r) => r.sha256 === hash)) {
     state.images.push({ ...record, verdict: "duplicate", reason: "exact copy of an earlier photo" });
     return { line: "❌ photo rejected: it is a copy of an earlier proof photo." };

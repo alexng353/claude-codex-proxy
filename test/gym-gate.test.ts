@@ -237,6 +237,29 @@ describe("gym on the gate", () => {
       expect(await photoCheckins()).toHaveLength(2);
     });
 
+    test("a gym-only record never blocks a later photo, even after its check-in is pruned", async () => {
+      // An old gym-only record (its check-in long gone) with the same look, and the morning teeth photo due.
+      const s = JSON.parse(await Bun.file(process.env.HYGIENE_GATE_STATE!).text());
+      s.images = [{ sha256: "f".repeat(64), dhash: dh.gym, at: iso(at("2026-09-01", "18:00")), source: { thread: "t", key: "k" }, kind: null, verdict: "unneeded", reason: "gym photo", gymOnly: true }];
+      await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+      resetGateCache();
+      const text = await send("gym2");
+      expect(text).toContain("gym photo recorded");
+      expect(text).not.toContain("near-copy");
+      expect(await photoCheckins()).toHaveLength(1);
+    });
+
+    test("a near copy of a photo that was both a gym photo and an accepted proof never counts again", async () => {
+      verdict = async () => ({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+      await route("/hygiene/gym/plans", { start: iso(at("2026-11-06", "18:00")), by: "bubble" });
+      // Teeth accepted and the plan held: the turn goes through.
+      await send("gym");
+      expect(await photoCheckins()).toHaveLength(1);
+      clock = at("2026-11-06", "18:35");
+      expect(await send("gym2")).toContain("not counted for the gym");
+      expect(await photoCheckins()).toHaveLength(1);
+    });
+
     test("recheck: a gym photo that clears the only lock wakes held chats", async () => {
       // Nothing hygiene-related is enforced yet, so the gym plan is the only lock.
       await writeFile(
