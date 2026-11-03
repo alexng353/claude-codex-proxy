@@ -212,6 +212,31 @@ describe("gym on the gate", () => {
       expect(await photoCheckins()).toHaveLength(1);
     });
 
+    test("a similar gym photo counts on another day, not 30 minutes later", async () => {
+      // Every hygiene slot of both days already filled: gym photos get their own fallback records.
+      const filled: Record<string, string> = {};
+      for (const day of [DAY, "2026-11-06"])
+        for (const s of ["morning-teeth", "morning-weight", "night-teeth", "shower"]) filled[`${day}/${s}`] = iso(at(DAY, "06:00"));
+      await writeFile(
+        process.env.HYGIENE_GATE_STATE!,
+        JSON.stringify({ version: 1, startsAt: iso(at(DAY, "05:00")), images: [], filled, bypass: { count: 0, until: null, history: [] }, debts: [], notes: [], extraGatedTriggers: [] }),
+      );
+      resetGateCache();
+      clock = at(DAY, "12:00");
+      await route("/hygiene/gym/plans", { start: iso(at(DAY, "18:00")), by: "bubble" });
+      await route("/hygiene/gym/plans", { start: iso(at("2026-11-06", "18:00")), by: "bubble" });
+      clock = at(DAY, "18:10");
+      // Nothing locks yet, so the turn goes through; count the check-ins instead.
+      await send("gym");
+      expect(await photoCheckins()).toHaveLength(1);
+      clock = at(DAY, "18:40");
+      await send("gym2");
+      expect(await photoCheckins()).toHaveLength(1);
+      clock = at("2026-11-06", "18:10");
+      await send("gym2");
+      expect(await photoCheckins()).toHaveLength(2);
+    });
+
     test("recheck: a gym photo that clears the only lock wakes held chats", async () => {
       // Nothing hygiene-related is enforced yet, so the gym plan is the only lock.
       await writeFile(

@@ -404,6 +404,27 @@ describe("Uplifting feed", () => {
     expect(statusAt(gym, at(DAY, "18:40"))).toEqual(["in-progress"]);
   });
 
+  test("an earlier warm-up doesn't hide a finished main workout that was away from the gym", () => {
+    const { gym } = planned();
+    recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "17:55"), now: at(DAY, "17:55") });
+    feed(gym, at(DAY, "19:10"), {
+      checkins: [checkin("m", "start", at(DAY, "18:05")), checkin("m", "finish", at(DAY, "19:05"), AWAY)],
+      workouts: [{ ...workout("warm", "x", at(DAY, "17:40"), at(DAY, "18:00"), 3), client_id: null }, workout("main", "m", at(DAY, "18:05"), at(DAY, "19:05"))],
+    });
+    const [r] = evaluateGym(gym, at(DAY, "19:10"));
+    expect(r.status).toBe("missed");
+    expect(r.reason).toContain("from the gym at finish");
+  });
+
+  test("a miss with only a warm-up photo names the warm-up", () => {
+    const { gym } = planned();
+    recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "17:50"), now: at(DAY, "17:50") });
+    feed(gym, at(DAY, "21:55"), { workouts: [{ ...workout("warm", "x", at(DAY, "17:40"), at(DAY, "18:00"), 3), client_id: null }] });
+    const [r] = evaluateGym(gym, at(DAY, "21:55"));
+    expect(r.status).toBe("missed");
+    expect(r.reason).toBe("session didn't count: 20 min, under 45");
+  });
+
   test("near copies are looked for within 12 hours only", () => {
     const gym = emptyGym();
     const same = (a: string, b: string) => a[0] === b[0];

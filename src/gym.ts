@@ -194,12 +194,12 @@ export function matchPhotos(gym: GymState): PhotoMatch {
   return { bySession, byPhoto };
 }
 
-/** The finished session a gym photo was taken during (or just before): it is not an open Start. */
-function sessionAround(gym: GymState, photo: GymCheckin): GymSession | undefined {
+/** Finished sessions a gym photo was taken during (or just before), earliest first. */
+function sessionsAround(gym: GymState, photo: GymCheckin): GymSession[] {
   const at = ms(photo.at);
   return [...gym.sessions]
     .sort((a, b) => ms(a.start) - ms(b.start) || a.id.localeCompare(b.id))
-    .find((x) => ms(x.start) - PHOTO_SLACK_MS <= at && at <= ms(x.end));
+    .filter((x) => ms(x.start) - PHOTO_SLACK_MS <= at && at <= ms(x.end));
 }
 
 /** Everything about a session except the photo: fails with a reason, or passes, maybe needing a photo for a missing location. */
@@ -274,8 +274,8 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   const sessionFor = (c: GymCheckin) => {
     if (finishedClients.has(c.clientId)) return finishedClients.get(c.clientId);
     if (!isPhoto(c)) return undefined;
-    const around = sessionAround(gym, c);
-    return photos.byPhoto.get(c.clientId) ?? (around && !warmUp(around) ? around : undefined);
+    // The first real (non-warm-up) workout around it, so an earlier warm-up can't hide it.
+    return photos.byPhoto.get(c.clientId) ?? sessionsAround(gym, c).find((x) => !warmUp(x));
   };
 
   for (const plan of plans) {
@@ -316,7 +316,8 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
       results.push({ plan, status: "upcoming", deadline });
       continue;
     }
-    const failed = started.map(sessionFor).find(Boolean);
+    // For the reason only: a photo inside just a warm-up names that warm-up.
+    const failed = started.map((c) => sessionFor(c) ?? (isPhoto(c) ? sessionsAround(gym, c)[0] : undefined)).find(Boolean);
     const failedCheck = failed && checks.find((c) => c.session.id === failed.id);
     const reason = failed
       ? failedCheck?.qualifies
