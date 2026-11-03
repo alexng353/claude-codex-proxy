@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { processAlive } from "./proc-alive";
+import { killQuietly, waitGone } from "./proc-alive";
 
 test("remote supervisor returns exporter output without waiting for stdin EOF", async () => {
   const dir = mkdtempSync(join(tmpdir(), "prediction-remote-"));
@@ -76,11 +76,11 @@ test("SSH stdin EOF cancels exporter and its descendant before deadline", async 
     const pid = Number(readFileSync(pidPath, "utf8"));
     await child.stdin.end();
     await child.exited;
-    const alive = processAlive(pid);
+    const alive = !(await waitGone(pid));
     try {
       expect(alive).toBe(false);
     } finally {
-      if (alive) process.kill(pid, "SIGKILL");
+      if (alive) killQuietly(pid);
     }
     expect(child.exitCode).not.toBe(0);
   } finally {

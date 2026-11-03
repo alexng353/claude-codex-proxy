@@ -14,3 +14,23 @@ export function processAlive(pid: number): boolean {
   }
   return !stat.includes(") Z ");
 }
+
+// A SIGKILLed process can still read as running for a moment after the kill
+// returns. Poll until it is gone or the deadline passes; true means gone.
+export async function waitGone(pid: number, ms = 2000): Promise<boolean> {
+  const end = Date.now() + ms;
+  while (processAlive(pid)) {
+    if (Date.now() >= end) return false;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return true;
+}
+
+// Cleanup kill that tolerates the process having exited meanwhile.
+export function killQuietly(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e;
+  }
+}
