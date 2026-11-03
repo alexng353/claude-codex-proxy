@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { parseStart } from "../src/gym-client";
-import { emptyState, inTransit, localTime, outstanding, setZoneHistory, zoneAt, type GateState, type ZoneChange } from "../src/hygiene";
+import {
+  emptyState,
+  inTransit,
+  knownZone,
+  localTime,
+  outstanding,
+  setZoneHistory,
+  zoneAt,
+  type GateState,
+  type ZoneChange,
+} from "../src/hygiene";
 
 // Vancouver is UTC-7 all year from Nov 2026; Jakarta is UTC+7. All times below are UTC.
 const Z = (iso: string) => Date.parse(iso);
@@ -120,5 +130,21 @@ describe("travel: the gate's day follows the phone's zone", () => {
     expect(parseStart("2026-11-16 18:00")).toBe("2026-11-17T01:00:00.000Z");
     setZoneHistory(there);
     expect(parseStart("2026-11-16 18:00")).toBe("2026-11-16T11:00:00.000Z");
+    // A plan for after the trip, typed in Jakarta, names its zone.
+    expect(parseStart("2026-12-05 18:00 America/Vancouver")).toBe("2026-12-06T01:00:00.000Z");
+    expect(parseStart("2026-12-05 18:00 Mars/Olympus")).toBeNull();
+  });
+
+  test("a same-clock alias or a small hop is no travel day; posix/ and right/ names are refused", () => {
+    for (const zone of ["Canada/Pacific", "America/Los_Angeles", "America/Denver"]) {
+      setZoneHistory([
+        { zone: VAN, from: "2026-11-01T12:00:00Z", seenAt: "2026-11-10T10:00:00Z" },
+        { zone, from: "2026-11-10T10:50:00Z", seenAt: "2026-11-10T10:50:00Z" },
+      ]);
+      expect(inTransit(Z("2026-11-10T12:00:00Z"))).toBe(false);
+      expect(slots(state(), Z("2026-11-10T14:00:00Z"))).toContain("2026-11-10/morning-teeth");
+    }
+    expect(knownZone("Asia/Jakarta")).toBe(true);
+    for (const bad of ["posix/America/Vancouver", "right/Asia/Jakarta", "Mars/Olympus"]) expect(knownZone(bad)).toBe(false);
   });
 });

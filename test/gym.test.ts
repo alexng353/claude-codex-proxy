@@ -29,8 +29,9 @@ const GOLDS = { lat: DEFAULT_GYM_SETTINGS.gym.lat, lon: DEFAULT_GYM_SETTINGS.gym
 const AWAY = { lat: GOLDS.lat + 0.0045, lon: GOLDS.lon };
 
 /** A gym with one plan at 18:00 on DAY, added the day before. */
-function planned(grace = 30): { gym: GymState; id: string } {
+function planned(grace = 30, settings?: GymState["settings"]): { gym: GymState; id: string } {
   const gym = emptyGym();
+  if (settings) gym.settings = settings;
   const r = editPlan(gym, { action: "add", start: iso(at(DAY, "18:00")), graceMin: grace, by: "test" }, at("2026-11-04", "12:00"));
   if (!r.ok) throw new Error(r.error);
   return { gym, id: r.plan.id };
@@ -309,11 +310,7 @@ describe("Uplifting feed", () => {
       client_id: null,
       gym_location: tag,
     });
-    const tagMode = () => {
-      const { gym } = planned();
-      gym.settings = { proof: "workout-tag" };
-      return gym;
-    };
+    const tagMode = () => planned(30, { proof: "workout-tag" }).gym;
 
     test("a workout tagged at Gold's keeps the plan with no check-ins", () => {
       const gym = tagMode();
@@ -358,6 +355,20 @@ describe("Uplifting feed", () => {
       feed(gym, at(DAY, "19:10"), { workouts: [tagged("Gold's Gym Broadway")] });
       expect(evaluateGym(gym, at(DAY, "19:10"))[0].status).toBe("missed");
     });
+
+    test("a plan keeps the proof and tag it was added with: a settings change can't rewrite it", () => {
+      const { gym } = planned();
+      feed(gym, at(DAY, "19:10"), { workouts: [tagged("Gold's Gym Broadway")] });
+      gym.settings = { proof: "workout-tag" };
+      expect(evaluateGym(gym, at(DAY, "19:10"))[0].status).toBe("missed");
+      expect(gymOutstanding(gym, at(DAY, "19:10"))).toHaveLength(1);
+      const home = tagMode();
+      feed(home, at(DAY, "22:31"), { workouts: [tagged("Home")] });
+      home.settings = { ...home.settings, tagPattern: "home" };
+      expect(evaluateGym(home, at(DAY, "22:31"))[0].status).toBe("missed");
+      // A plan added after the change follows it.
+      expect(editPlan(home, { action: "add", start: iso(at("2026-11-06", "18:00")), by: "t" }, at(DAY, "22:40")).ok && home.plans[1].tagPattern).toBe("home");
+    });
   });
 
   describe("travel pause", () => {
@@ -388,6 +399,18 @@ describe("Uplifting feed", () => {
       expect(now.ok).toBe(true);
       feed(gym, at(DAY, "18:45"), {});
       expect(gymOutstanding(gym, at(DAY, "18:45"))).toHaveLength(1);
+    });
+
+    test("a pause made after a plan started, before it failed, can't erase its miss", () => {
+      for (const settings of [undefined, { proof: "workout-tag" as const }]) {
+        const { gym } = planned(30, settings);
+        const p = addPause(gym, { from: iso(at(DAY, "18:10")), to: iso(at("2026-11-10", "00:00")), reason: "r" }, at(DAY, "18:10"));
+        expect(p.ok).toBe(true);
+        const late = at(DAY, "22:31");
+        feed(gym, late, {});
+        expect(statusAt(gym, late)).toEqual(["missed"]);
+        expect(gymOutstanding(gym, late)).toHaveLength(1);
+      }
     });
 
     test("limits, overlap and ending early", () => {
