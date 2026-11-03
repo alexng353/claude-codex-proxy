@@ -397,6 +397,21 @@ describe("Uplifting feed", () => {
     expect(evaluateGym(gym, at(DAY, "19:10"))[0]).toMatchObject({ status: "kept", sessionId: "main" });
   });
 
+  test("a photo inside a short warm-up still holds the plan while the main session runs", () => {
+    const { gym } = planned();
+    recordGymPhoto(gym, { id: "p", distanceM: 20, at: at(DAY, "17:50"), now: at(DAY, "17:50") });
+    feed(gym, at(DAY, "18:40"), { workouts: [{ ...workout("warm", "x", at(DAY, "17:40"), at(DAY, "18:00"), 3), client_id: null }] });
+    expect(statusAt(gym, at(DAY, "18:40"))).toEqual(["in-progress"]);
+  });
+
+  test("near copies are looked for within 12 hours only", () => {
+    const gym = emptyGym();
+    const same = (a: string, b: string) => a[0] === b[0];
+    expect(recordGymPhoto(gym, { id: "d1", distanceM: 20, at: at(DAY, "18:00"), now: at(DAY, "18:00"), dhash: "00" }, same)).toBe("recorded");
+    expect(recordGymPhoto(gym, { id: "d1b", distanceM: 20, at: at(DAY, "18:30"), now: at(DAY, "18:30"), dhash: "01" }, same)).toBe("near");
+    expect(recordGymPhoto(gym, { id: "d3", distanceM: 20, at: at("2026-11-07", "18:00"), now: at("2026-11-07", "18:00"), dhash: "02" }, same)).toBe("recorded");
+  });
+
   test("a session with Uplifting locations doesn't take a photo a location-less one needs", () => {
     const gym = emptyGym();
     for (const time of ["18:00", "19:30"]) {

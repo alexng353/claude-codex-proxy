@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_GYM_SETTINGS, type UpliftingFeed } from "../src/gym";
 import { refreshIfDeciding, setGymFetcher, startGymSync } from "../src/gym-sync";
 import { zonedTime } from "../src/hygiene";
-import { gateRequest, handleHygieneRoute, resetGateCache, setGateDeps } from "../src/hygiene-gate";
+import { gateRequest, handleHygieneRoute, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 const at = (day: string, time: string) => {
@@ -101,6 +101,7 @@ describe("gym on the gate", () => {
     let archived: string[];
     let strip: (image: { mediaType: string; bytes: Buffer }) => Promise<{ mediaType: string; bytes: Buffer } | null>;
     let wakes: number;
+    let strips: number;
 
     beforeEach(async () => {
       await writeFile(
@@ -110,6 +111,7 @@ describe("gym on the gate", () => {
       resetGateCache();
       archived = [];
       wakes = 0;
+      strips = 0;
       verdict = async () => ({ kind: "none", confidence: 0.9, reason: "a gym" });
       strip = async (image) => ({ ...image, bytes: Buffer.from(`stripped:${image.bytes}`) });
       setGateDeps({
@@ -118,10 +120,13 @@ describe("gym on the gate", () => {
           wakes++;
           return "sent";
         },
-        captureTime: async () => at(DAY, "18:20"),
+        captureTime: async () => clock - 5 * 60_000,
         gpsFix: async (bytes) => (located.has(bytes.toString("utf8")) ? fix : null),
         dhash: async (bytes) => dh[bytes.toString("utf8")] ?? null,
-        stripGps: (image) => strip(image),
+        stripGps: (image) => {
+          strips++;
+          return strip(image);
+        },
         archive: (image) => {
           archived.push(image.bytes.toString("utf8"));
           return "/dev/null";
@@ -178,12 +183,23 @@ describe("gym on the gate", () => {
 
     test("the keepsake gets the stripped bytes, or isn't saved", async () => {
       verdict = async () => ({ kind: "teeth", confidence: 0.95, reason: "brushing" });
-      await send("gym");
-      expect(archived).toEqual(["stripped:gym"]);
+      // A photo without GPS is stripped too (XMP or tags the reader can't parse may still hold one).
+      expect(await send("tooth")).toContain("photo accepted");
+      expect(archived).toEqual(["stripped:tooth"]);
       strip = async () => null;
       clock = at("2026-11-06", "06:00");
-      await send("gymB");
-      expect(archived).toEqual(["stripped:gym"]);
+      expect(await send("gymB")).toContain("photo accepted");
+      expect(strips).toBe(2);
+      expect(archived).toEqual(["stripped:tooth"]);
+    });
+
+    test("an exact copy of a proof accepted elsewhere (Cairn) earns no gym credit", async () => {
+      verdict = async () => ({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+      const done = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("gym") }, { kind: "teeth", slot: () => true });
+      expect(done.result).toBe("pass");
+      expect(await photoCheckins()).toHaveLength(0);
+      await send("gym");
+      expect(await photoCheckins()).toHaveLength(0);
     });
 
     test("recheck: a checker error isn't acknowledged, and the gym part still counts", async () => {

@@ -404,9 +404,17 @@ async function gymPhoto(
   const near = (a: string, b: string) => hammingDistance(a, b) <= NEAR_DUPLICATE_BITS;
   // An earlier hygiene proof (or its near copy) can't be reused as a gym photo either.
   const proofs = state.images.filter((r) => r.verdict === "accepted" || r.verdict === "unneeded");
+  // An exact copy of a proof is a replay unless this very photo was already recorded for the gym
+  // (its own fallback record has the same hash); a near copy of one never counts.
+  const recordedBefore = state.gym.checkins.some((c) => c.clientId === `photo:${hash.slice(0, 16)}`);
+  const exactProof = !recordedBefore && proofs.some((r) => r.sha256 === hash);
   const reused = proofs.some((r) => r.sha256 !== hash && r.dhash && dhash && near(r.dhash, dhash));
   const at = Math.min(taken, now);
-  const outcome = reused ? "near" : recordGymPhoto(state.gym, { id: hash.slice(0, 16), distanceM: distance, at, now, dhash }, near);
+  const outcome = exactProof
+    ? "replay"
+    : reused
+      ? "near"
+      : recordGymPhoto(state.gym, { id: hash.slice(0, 16), distanceM: distance, at, now, dhash }, near);
   const line =
     outcome === "recorded"
       ? `💪 gym photo recorded: ${Math.round(distance)} m from ${s.gym.name} at ${clockLabel(at)}. It stands in for Uplifting's location; the session counts once the Uplifting workout it was taken during syncs (at least ${s.minMinutes} min and ${s.minSets} sets).`

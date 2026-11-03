@@ -154,6 +154,8 @@ export const PHOTO_PREFIX = "photo:";
 const isPhoto = (c: GymCheckin) => c.clientId.startsWith(PHOTO_PREFIX);
 /** A gym photo taken up to this long before a session starts can stand in for it. */
 const PHOTO_SLACK_MS = 15 * MIN;
+/** Near copies are looked for among gym photos taken within this of each other. */
+const NEAR_WINDOW_MS = 12 * 60 * MIN;
 
 /** Which session each gym photo belongs to: at most one each way. */
 export type PhotoMatch = { bySession: Map<string, GymCheckin>; byPhoto: Map<string, GymSession> };
@@ -266,8 +268,15 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
   const results: PlanResult[] = [];
   // The finished session a Start belongs to: by client id; for a gym photo, the session it backs,
   // else any finished session it was taken during (a second photo of one workout is not an open Start).
-  const sessionFor = (c: GymCheckin) =>
-    finishedClients.get(c.clientId) ?? (isPhoto(c) ? (photos.byPhoto.get(c.clientId) ?? sessionAround(gym, c)) : undefined);
+  // A photo inside a finished session is finished with it, except inside a warm-up (too short or
+  // too few sets): then the real workout may still be running, so the photo can still hold the plan.
+  const warmUp = (x: GymSession) => (ms(x.end) - ms(x.start)) / MIN < s.minMinutes || x.sets < s.minSets;
+  const sessionFor = (c: GymCheckin) => {
+    if (finishedClients.has(c.clientId)) return finishedClients.get(c.clientId);
+    if (!isPhoto(c)) return undefined;
+    const around = sessionAround(gym, c);
+    return photos.byPhoto.get(c.clientId) ?? (around && !warmUp(around) ? around : undefined);
+  };
 
   for (const plan of plans) {
     const start = ms(plan.start);
@@ -538,7 +547,9 @@ export function recordGymPhoto(
 ): "recorded" | "replay" | "near" {
   const clientId = `${PHOTO_PREFIX}${photo.id}`;
   if (gym.checkins.some((c) => c.clientId === clientId)) return "replay";
-  if (photo.dhash && gym.checkins.some((c) => isPhoto(c) && c.dhash && isNear(c.dhash, photo.dhash!))) return "near";
+  // Only recent gym photos: the same mirror and pose on another day is a new photo.
+  const recent = (c: GymCheckin) => Math.abs(ms(c.at) - photo.at) <= NEAR_WINDOW_MS;
+  if (photo.dhash && gym.checkins.some((c) => isPhoto(c) && c.dhash && recent(c) && isNear(c.dhash, photo.dhash!))) return "near";
   gym.checkins.push({
     clientId,
     kind: "start",
