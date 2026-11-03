@@ -254,8 +254,8 @@ export async function noteDeviceZone(raw: string): Promise<void> {
     const cutoff = now - RETAIN_MS;
     while (zones.length > 1 && Date.parse(zones[1].from) < cutoff) zones.shift();
     saveState(state);
-    // The first report only starts the record; nothing about the gate changed.
-    if (last && last.zone !== zone) release(state, now, "time zone changed");
+    // A first report of Vancouver only starts the record; nothing about the gate changed.
+    if ((last?.zone ?? TIME_ZONE) !== zone) release(state, now, "time zone changed");
   });
 }
 
@@ -1088,8 +1088,8 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   };
   if (path === "/plans") {
     // Wall times ("YYYY-MM-DD HH:MM") are read here, in the phone's current zone.
-    const start = parseStart(text(body.start, 40) ?? "");
-    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" (local) or ISO with an offset' }, { status: 400 });
+    const start = parseStart(text(body.start, 90) ?? "");
+    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" in the phone zone, optionally followed by a zone name such as America/Vancouver, or ISO with an offset' }, { status: 400 });
     // Models often send null for an omitted optional: treat it as "use the default".
     const grace = typeof body.grace_min === "number" ? body.grace_min : body.grace_min == null ? undefined : NaN;
     return plan({ action: "add", start, graceMin: grace, note, by });
@@ -1097,8 +1097,8 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
   const edit = /^\/plans\/([A-Za-z0-9-]+)\/(move|cancel)$/.exec(path);
   if (edit) {
     if (edit[2] === "cancel") return plan({ action: "cancel", id: edit[1], note, by });
-    const start = parseStart(text(body.start, 40) ?? "");
-    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" (local) or ISO with an offset' }, { status: 400 });
+    const start = parseStart(text(body.start, 90) ?? "");
+    if (!start) return Response.json({ error: 'start is required: "YYYY-MM-DD HH:MM" in the phone zone, optionally followed by a zone name such as America/Vancouver, or ISO with an offset' }, { status: 400 });
     return plan({ action: "move", id: edit[1], start, note, by });
   }
   if (path === "/settings") {
@@ -1121,11 +1121,11 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
       };
       return { changed: true, result: gymSettings(gym) };
     }, "gym settings");
-    return Response.json({ ok: true, settings, note: grace !== undefined ? "grace applies to plans added from now on" : "applies now" });
+    return Response.json({ ok: true, settings, note: "applies to plans added from now on; existing plans keep the settings they were added with" });
   }
   if (path === "/pauses") {
-    const from = parseStart(text(body.from, 40) ?? "");
-    const to = parseStart(text(body.to, 40) ?? "");
+    const from = parseStart(text(body.from, 90) ?? "");
+    const to = parseStart(text(body.to, 90) ?? "");
     const reason = text(body.reason) ?? "";
     if (!from || !to) return Response.json({ error: "from and to (ISO times) are required" }, { status: 400 });
     const result = await mutateGym((gym, now) => {
