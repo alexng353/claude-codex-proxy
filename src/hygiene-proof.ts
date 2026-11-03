@@ -306,9 +306,14 @@ export function parseVerdict(value: unknown): Verdict {
 
 const CLASSIFIER_MODEL = process.env.HYGIENE_CLASSIFIER_MODEL ?? "haiku";
 const CLASSIFIER_TIMEOUT_MS = 60_000;
-/** Accounts tried for one photo, and the time after which no further one is started. */
+/**
+ * Accounts tried for one photo, and the time all tries together may take: under the follower
+ * gate's 85 s wait, and short because the gate's state lock is held meanwhile (comb).
+ */
 const CLASSIFIER_ACCOUNT_TRIES = 3;
-const CLASSIFIER_RETRY_BUDGET_MS = 90_000;
+const CLASSIFIER_BUDGET_MS = 80_000;
+/** A try with less time left than this isn't started. */
+const CLASSIFIER_MIN_TRY_MS = 5_000;
 
 /** The call ran but gave no verdict (an error result, no result, a timeout): another account may. */
 class ClassifierCallError extends Error {}
@@ -317,17 +322,20 @@ class ClassifierCallError extends Error {}
  * One-shot Claude Code call on the cheapest model; no session, tools or customizations. Nov 3:
  * the first account in order had hit its weekly limit but wasn't marked limited, so every
  * photo got "classifier error". A failed call now marks a limited account and moves to the
- * next one, available accounts first.
+ * next available one. Accounts the chat path skips (signed out, auth-blocked, over their
+ * weekly cap, limited) aren't retried; with none available the first is tried once, as before.
  */
 export const claudeClassifier: Classifier = async (image, wanted) => {
   const all = listAccounts();
-  const order = [...all.filter((a) => !unavailable(a)), ...all.filter((a) => unavailable(a))];
-  const started = Date.now();
+  const available = all.filter((a) => !unavailable(a));
+  const order = available.length ? available : all.slice(0, 1);
+  const deadline = Date.now() + CLASSIFIER_BUDGET_MS;
   let last: Error | undefined;
   for (const account of order.slice(0, CLASSIFIER_ACCOUNT_TRIES)) {
-    if (last && Date.now() - started > CLASSIFIER_RETRY_BUDGET_MS) break;
+    const left = deadline - Date.now();
+    if (last && left < CLASSIFIER_MIN_TRY_MS) break;
     try {
-      return await classifyOn(account, image, wanted);
+      return await classifyOn(account, image, wanted, Math.min(CLASSIFIER_TIMEOUT_MS, left));
     } catch (error) {
       if (!(error instanceof ClassifierCallError)) throw error;
       last = error;
@@ -341,6 +349,7 @@ async function classifyOn(
   account: Account,
   image: Parameters<Classifier>[0],
   wanted: Parameters<Classifier>[1],
+  timeoutMs: number,
 ): Promise<Verdict> {
   const { CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
   for (const key of STRIPPED_ENV) delete env[key];
@@ -388,17 +397,25 @@ async function classifyOn(
       ],
     },
   };
-  child.stdin.write(`${JSON.stringify(message)}\n`);
-  await child.stdin.end();
-  const timer = setTimeout(() => child.kill(), CLASSIFIER_TIMEOUT_MS);
+  // Before the write: a CLI that stalls reading a large image is cut off too (comb).
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, timeoutMs);
   try {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+    await child.stdin.end();
     const output = await new Response(child.stdout).text();
     await child.exited;
+    if (timedOut) throw new ClassifierCallError(`classifier timed out after ${Math.round(timeoutMs / 1000)} s`);
     type Event = {
       type?: string;
       is_error?: boolean;
       structured_output?: unknown;
       result?: string;
+      errors?: unknown[];
+      api_error_status?: number;
       rate_limit_info?: RateLimitInfo;
     };
     const events: Event[] = [];
@@ -414,9 +431,11 @@ async function classifyOn(
     const result = [...events].reverse().find((event) => event.type === "result");
     if (!result) throw new ClassifierCallError("classifier produced no result");
     if (result.is_error) {
-      const why = (result.result ?? "").slice(0, 200);
-      if (isLimitError(undefined, why)) markLimited(account);
-      throw new ClassifierCallError(`classifier call failed: ${why || "no reason given"}`);
+      // As the chat path reads it (claude.ts resultErrorText): the result, its errors, the status.
+      const why = [result.result, ...(result.errors ?? [])].filter((t) => typeof t === "string").join("\n");
+      if (isLimitError(result.api_error_status, why)) markLimited(account);
+      const status = result.api_error_status ? ` (${result.api_error_status})` : "";
+      throw new ClassifierCallError(`classifier call failed${status}: ${why.slice(0, 200) || "no reason given"}`);
     }
     return parseVerdict(result.structured_output ?? JSON.parse(result.result ?? "null"));
   } finally {

@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isLimitError, isLimited, listAccounts, resetAccountState } from "../src/accounts";
+import { isLimitError, isLimited, listAccounts, markLimited, resetAccountState } from "../src/accounts";
 import { claudeClassifier } from "../src/hygiene-proof";
 
 // Nov 3, 13:31: the first account in order answered "You've hit your weekly limit" (is_error),
@@ -54,9 +54,16 @@ const verdict = [
 ];
 
 test("the limit texts Claude Code prints, with or without the window, are limit errors", () => {
-  for (const text of ["You have hit your limit", "You've hit your weekly limit · resets Nov 8, 4am", "You've hit your session limit"])
+  for (const text of [
+    "You have hit your limit",
+    "You've hit your weekly limit · resets Nov 8, 4am",
+    "You've hit your session limit",
+    "You've hit your usage credit limit",
+    "You've hit your monthly spend limit",
+  ])
     expect(isLimitError(undefined, text)).toBe(true);
   expect(isLimitError(undefined, "API Error: 529 overloaded")).toBe(false);
+  expect(isLimitError(undefined, "You've hit your fast limit")).toBe(false);
 });
 
 test("a limited account is marked and the next account classifies the photo", async () => {
@@ -81,7 +88,46 @@ test("an error that isn't a limit tries the next account without marking the fir
 });
 
 test("when every account fails, the error names the last reason", async () => {
+  setup(["first", "second", "third", "fourth"]);
+  const tokens = script([limited, [{ type: "system" }], [{ type: "result", is_error: true, result: "API Error: 500" }], verdict]);
+  await expect(claudeClassifier(image, { kinds: ["creatine"] })).rejects.toThrow("API Error: 500");
+  // Three tries at most, a fourth account is left alone.
+  expect(tokens).toEqual(["fake-token-first", "fake-token-second", "fake-token-third"]);
+});
+
+test("a 429 status or a limit in errors[] marks the account; a rejected rate_limit_event too", async () => {
+  setup(["first", "second", "third"]);
+  script([
+    [{ type: "result", is_error: true, api_error_status: 429, result: "Too many requests" }],
+    [{ type: "result", is_error: true, result: "", errors: ["You've hit your weekly limit"] }],
+    verdict,
+  ]);
+  expect((await claudeClassifier(image, { kinds: ["creatine"] })).kind).toBe("creatine");
+  const limitedNow = (name: string) => isLimited(listAccounts().find((a) => a.name === name)!);
+  expect([limitedNow("first"), limitedNow("second"), limitedNow("third")]).toEqual([true, true, false]);
+
   setup(["first", "second"]);
-  script([limited, [{ type: "system" }]]);
-  await expect(claudeClassifier(image, { kinds: ["creatine"] })).rejects.toThrow("classifier produced no result");
+  const reset = Math.floor(Date.now() / 1000) + 3600;
+  script([[{ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: reset } }, ...limited], verdict]);
+  await claudeClassifier(image, { kinds: ["creatine"] });
+  expect(limitedNow("first")).toBe(true);
+});
+
+test("a launch that throws fails at once; limited accounts aren't retried", async () => {
+  setup(["first", "second"]);
+  let launches = 0;
+  (Bun as any).spawn = () => {
+    launches++;
+    throw new Error("boundary stopped");
+  };
+  await expect(claudeClassifier(image, { kinds: ["creatine"] })).rejects.toThrow("boundary stopped");
+  expect(launches).toBe(1);
+
+  // Available accounts first; one already limited is skipped, not tried after the others.
+  setup(["first", "second"]);
+  markLimited(listAccounts().find((a) => a.name === "first")!);
+  const tokens = script([[{ type: "result", is_error: true, result: "API Error: 500" }]]);
+  await expect(claudeClassifier(image, { kinds: ["creatine"] })).rejects.toThrow();
+  expect(tokens[0]).toBe("fake-token-second");
+  expect(tokens).not.toContain("fake-token-first");
 });
