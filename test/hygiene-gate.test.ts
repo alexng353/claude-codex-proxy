@@ -498,6 +498,17 @@ describe("creatine and outdoor walk", () => {
     expect(gateStatus().lastProofs.map((p) => p.slot)).not.toContain(`${DAY}/morning-walk-start`);
   });
 
+  test("a creatine photo sent during BYPASS counts when sent again after it", async () => {
+    await enable();
+    expect(text(await decide(request([env, user("BYPASS")])))).toStartWith("🚪");
+    verdicts.push({ kind: "creatine", confidence: 0.9, reason: "scoop" });
+    expect((await send("scoop")).action).toBe("forward");
+    clock = at(DAY, "07:05");
+    verdicts.push({ kind: "creatine", confidence: 0.9, reason: "scoop" });
+    const again = await decide(request([env, user({ photo: "scoop" }), assistant("💊"), user("again", { photo: "scoop" })]));
+    expect(JSON.stringify(again)).toContain("morning creatine (Oct 8) photo accepted");
+  });
+
   test("off until enabled; DELAY postpones them with the other morning photos", async () => {
     await enable(at("2026-10-09", "05:00"));
     expect(text(await decide(request([env, user("hi")])))).toBe(
