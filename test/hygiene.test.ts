@@ -444,9 +444,14 @@ describe("proof helpers", () => {
   test.skipIf(!Bun.which("exiftool", { PATH: "/usr/bin/vendor_perl" }))("exiftool is found with a service PATH that lacks vendor_perl", () => {
     // Found without any PATH, and a stub in a user PATH entry never wins over the system copy.
     expect(exiftoolBin({ PATH: "/nonexistent" })).toBe("/usr/bin/vendor_perl/exiftool");
-    const stubDir = require("node:fs").mkdtempSync(`${require("node:os").tmpdir()}/fake-exiftool-`);
-    require("node:fs").writeFileSync(`${stubDir}/exiftool`, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    expect(exiftoolBin({ PATH: stubDir })).toBe("/usr/bin/vendor_perl/exiftool");
+    const fs = require("node:fs") as typeof import("node:fs");
+    const stubDir = fs.mkdtempSync(`${require("node:os").tmpdir()}/fake-exiftool-`);
+    try {
+      fs.writeFileSync(`${stubDir}/exiftool`, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      expect(exiftoolBin({ PATH: stubDir })).toBe("/usr/bin/vendor_perl/exiftool");
+    } finally {
+      fs.rmSync(stubDir, { recursive: true, force: true });
+    }
     expect(exiftoolBin({ PATH: "/x", HYGIENE_EXIFTOOL_BIN: "/opt/et" })).toBe("/opt/et");
   });
 
@@ -462,6 +467,18 @@ describe("proof helpers", () => {
     expect(await gpsFix(bytes)).not.toBeNull();
     const stripped = await stripGps({ mediaType: "image/jpeg", bytes });
     expect(stripped).not.toBeNull();
+    // A perl planted ahead in PATH never runs: exiftool gets its own environment. Checked in a
+    // fresh process, since Bun's default spawn environment is a snapshot taken at startup.
+    const fakeDir = `${dir}/fakebin`;
+    const marker = `${dir}/fake-perl-ran`;
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(fakeDir);
+    fs.writeFileSync(`${fakeDir}/perl`, `#!/bin/sh\ntouch ${marker}\ncat\n`, { mode: 0o755 });
+    const proof = `${import.meta.dir}/../src/hygiene-proof.ts`;
+    const script = `const { stripGps } = await import(${JSON.stringify(proof)}); const bytes = require("node:fs").readFileSync(${JSON.stringify(file)}); console.log((await stripGps({ mediaType: "image/jpeg", bytes })) ? "stripped" : "null");`;
+    const run = Bun.spawnSync([process.execPath, "-e", script], { env: { ...process.env, PATH: `${fakeDir}:${process.env.PATH}` } });
+    expect(run.stdout.toString().trim()).toBe("stripped");
+    expect(fs.existsSync(marker)).toBe(false);
     expect(await gpsFix(stripped!.bytes)).toBeNull();
     // No GPS tag left in any group (EXIF or XMP).
     const left = Bun.spawnSync([exiftoolBin()!, "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: stripped!.bytes });

@@ -103,9 +103,10 @@ export async function gpsFix(bytes: Buffer): Promise<{ lat: number; lon: number 
 /**
  * exiftool's path. Arch installs it in /usr/bin/vendor_perl, which a systemd
  * unit's PATH usually lacks (found live 2026-11-02: every keepsake would have
- * been dropped). Root-owned system directories are searched first, so an
- * `exiftool` dropped into a user-writable PATH entry can't fake the stripping;
- * PATH comes last.
+ * been dropped). Root-owned system directories are searched before PATH, and
+ * it runs with its own small environment (EXIFTOOL_ENV), so a user-writable
+ * PATH entry or PERL5* variable isn't picked up. This is hardening, not a
+ * boundary: whoever can set HYGIENE_EXIFTOOL_BIN can also edit the proxy.
  */
 export function exiftoolBin(env: Record<string, string | undefined> = process.env): string | null {
   if (env.HYGIENE_EXIFTOOL_BIN) return env.HYGIENE_EXIFTOOL_BIN;
@@ -115,7 +116,10 @@ export function exiftoolBin(env: Record<string, string | undefined> = process.en
 }
 const EXIFTOOL = exiftoolBin();
 if (!EXIFTOOL) console.error("hygiene-proof: exiftool not found; photo keepsakes will not be saved");
-let exiftoolFailureLogged = false;
+/** exiftool's shebang is `#!/usr/bin/env perl`: only root-owned directories, and no inherited PERL5* settings. */
+const EXIFTOOL_ENV = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" };
+/** Logged on each change from working to failing, so a bad photo can't use up the only warning. */
+let exiftoolFailing = false;
 
 /**
  * The same image with its location removed: every EXIF GPS tag and all XMP
@@ -134,17 +138,19 @@ export async function stripGps(image: DecodedImage): Promise<DecodedImage | null
 async function exiftool(args: string[], input: Buffer): Promise<Buffer | null> {
   if (!EXIFTOOL) return null;
   try {
-    const child = Bun.spawn([EXIFTOOL, ...args], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    const child = Bun.spawn([EXIFTOOL, ...args], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: EXIFTOOL_ENV });
     child.stdin.write(input);
     await child.stdin.end();
     const timer = setTimeout(() => child.kill(), 15_000);
-    const [output, code] = await Promise.all([new Response(child.stdout).arrayBuffer(), child.exited]);
+    const [output, errors, code] = await Promise.all([
+      new Response(child.stdout).arrayBuffer(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
     clearTimeout(timer);
-    if (code !== 0 && !exiftoolFailureLogged) {
-      // Once: a broken binary or missing perl would otherwise drop keepsakes with only a vague per-photo line.
-      exiftoolFailureLogged = true;
-      console.error(`hygiene-proof: ${EXIFTOOL} exited ${code}; keepsakes are skipped while it fails`);
-    }
+    if (code !== 0 && !exiftoolFailing)
+      console.error(`hygiene-proof: ${EXIFTOOL} exited ${code} (${errors.split("\n")[0].slice(0, 160)}); that photo's keepsake is skipped`);
+    exiftoolFailing = code !== 0;
     return code === 0 ? Buffer.from(output) : null;
   } catch {
     return null;
