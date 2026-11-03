@@ -364,8 +364,10 @@ export function observeRateLimit(account: Account, info: RateLimitInfo, at = Dat
   );
 }
 
+// "hit your weekly limit" (Nov 3) and "hit your session limit" name the window; the bare
+// "hit your limit" alone didn't match them, so the account was never marked limited.
 const LIMIT_TEXT =
-  /(usage limit|rate limit|hit your limit|limit reached|out of extra usage)/i;
+  /(usage limit|rate limit|hit your (?:\w+ )?limit|limit reached|out of extra usage)/i;
 
 export function isLimitError(status: unknown, text: string | undefined): boolean {
   return status === 429 || LIMIT_TEXT.test(text ?? "");

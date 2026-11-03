@@ -10,7 +10,16 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as accounts from "./accounts";
-import { accountEnv, isLimited, listAccounts, type Account } from "./accounts";
+import {
+  accountEnv,
+  isLimited,
+  isLimitError,
+  listAccounts,
+  markLimited,
+  observeRateLimit,
+  type Account,
+  type RateLimitInfo,
+} from "./accounts";
 
 /** Prefer the newer check that also skips accounts whose login failed. */
 const unavailable =
@@ -297,10 +306,42 @@ export function parseVerdict(value: unknown): Verdict {
 
 const CLASSIFIER_MODEL = process.env.HYGIENE_CLASSIFIER_MODEL ?? "haiku";
 const CLASSIFIER_TIMEOUT_MS = 60_000;
+/** Accounts tried for one photo, and the time after which no further one is started. */
+const CLASSIFIER_ACCOUNT_TRIES = 3;
+const CLASSIFIER_RETRY_BUDGET_MS = 90_000;
 
-/** One-shot Claude Code call on the cheapest model; no session, tools or customizations. */
+/** The call ran but gave no verdict (an error result, no result, a timeout): another account may. */
+class ClassifierCallError extends Error {}
+
+/**
+ * One-shot Claude Code call on the cheapest model; no session, tools or customizations. Nov 3:
+ * the first account in order had hit its weekly limit but wasn't marked limited, so every
+ * photo got "classifier error". A failed call now marks a limited account and moves to the
+ * next one, available accounts first.
+ */
 export const claudeClassifier: Classifier = async (image, wanted) => {
-  const account = listAccounts().find((a) => !unavailable(a)) ?? listAccounts()[0];
+  const all = listAccounts();
+  const order = [...all.filter((a) => !unavailable(a)), ...all.filter((a) => unavailable(a))];
+  const started = Date.now();
+  let last: Error | undefined;
+  for (const account of order.slice(0, CLASSIFIER_ACCOUNT_TRIES)) {
+    if (last && Date.now() - started > CLASSIFIER_RETRY_BUDGET_MS) break;
+    try {
+      return await classifyOn(account, image, wanted);
+    } catch (error) {
+      if (!(error instanceof ClassifierCallError)) throw error;
+      last = error;
+      console.error(`hygiene-gate: classifier on ${account.name}: ${error.message}`);
+    }
+  }
+  throw last ?? new Error("no Claude account for the classifier");
+};
+
+async function classifyOn(
+  account: Account,
+  image: Parameters<Classifier>[0],
+  wanted: Parameters<Classifier>[1],
+): Promise<Verdict> {
   const { CLAUDE_CODE_EFFORT_LEVEL: _effort, ...env } = process.env;
   for (const key of STRIPPED_ENV) delete env[key];
   const child = Bun.spawn(
@@ -353,23 +394,35 @@ export const claudeClassifier: Classifier = async (image, wanted) => {
   try {
     const output = await new Response(child.stdout).text();
     await child.exited;
-    for (const line of output.split("\n").reverse()) {
+    type Event = {
+      type?: string;
+      is_error?: boolean;
+      structured_output?: unknown;
+      result?: string;
+      rate_limit_info?: RateLimitInfo;
+    };
+    const events: Event[] = [];
+    for (const line of output.split("\n")) {
       if (!line.startsWith("{")) continue;
-      let event: { type?: string; is_error?: boolean; structured_output?: unknown; result?: string };
       try {
-        event = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (event.type !== "result") continue;
-      if (event.is_error) throw new Error("classifier call failed");
-      return parseVerdict(event.structured_output ?? JSON.parse(event.result ?? "null"));
+        events.push(JSON.parse(line));
+      } catch {}
     }
-    throw new Error("classifier produced no result");
+    // Like a chat turn: what the account reports about its limits counts toward picking it.
+    for (const event of events)
+      if (event.type === "rate_limit_event") observeRateLimit(account, event.rate_limit_info ?? {});
+    const result = [...events].reverse().find((event) => event.type === "result");
+    if (!result) throw new ClassifierCallError("classifier produced no result");
+    if (result.is_error) {
+      const why = (result.result ?? "").slice(0, 200);
+      if (isLimitError(undefined, why)) markLimited(account);
+      throw new ClassifierCallError(`classifier call failed: ${why || "no reason given"}`);
+    }
+    return parseVerdict(result.structured_output ?? JSON.parse(result.result ?? "null"));
   } finally {
     clearTimeout(timer);
   }
-};
+}
 
 // ---- Archive ----
 
