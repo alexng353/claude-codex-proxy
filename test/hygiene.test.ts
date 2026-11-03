@@ -442,17 +442,21 @@ describe("proof helpers", () => {
   });
 
   test.skipIf(!Bun.which("exiftool", { PATH: "/usr/bin/vendor_perl" }))("exiftool is found with a service PATH that lacks vendor_perl", () => {
-    expect(exiftoolBin({ PATH: "/usr/local/bin:/usr/bin" })).toBe("/usr/bin/vendor_perl/exiftool");
+    // Found without any PATH, and a stub in a user PATH entry never wins over the system copy.
+    expect(exiftoolBin({ PATH: "/nonexistent" })).toBe("/usr/bin/vendor_perl/exiftool");
+    const stubDir = require("node:fs").mkdtempSync(`${require("node:os").tmpdir()}/fake-exiftool-`);
+    require("node:fs").writeFileSync(`${stubDir}/exiftool`, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    expect(exiftoolBin({ PATH: stubDir })).toBe("/usr/bin/vendor_perl/exiftool");
     expect(exiftoolBin({ PATH: "/x", HYGIENE_EXIFTOOL_BIN: "/opt/et" })).toBe("/opt/et");
   });
 
-  test.skipIf(!Bun.which("exiftool") || !Bun.which("magick"))("stripGps removes EXIF and XMP GPS from a real JPEG and keeps the capture time", async () => {
+  test.skipIf(!exiftoolBin() || !Bun.which("magick"))("stripGps removes EXIF and XMP GPS from a real JPEG and keeps the capture time", async () => {
     const { mkdtemp, readFile } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const dir = await mkdtemp(`${tmpdir()}/strip-gps-`);
     const file = `${dir}/a.jpg`;
     expect(Bun.spawnSync(["magick", "-size", "8x8", "xc:red", file]).exitCode).toBe(0);
-    const tag = Bun.spawnSync(["exiftool", "-q", "-overwrite_original", "-GPSLatitude=49.26346", "-GPSLatitudeRef=N", "-GPSLongitude=123.12054", "-GPSLongitudeRef=W", "-XMP-exif:GPSLatitude=49.26346", "-XMP-exif:GPSLongitude=-123.12054", "-DateTimeOriginal=2026:11:05 18:05:00", "-OffsetTimeOriginal=-07:00", file]);
+    const tag = Bun.spawnSync([exiftoolBin()!, "-q", "-overwrite_original", "-GPSLatitude=49.26346", "-GPSLatitudeRef=N", "-GPSLongitude=123.12054", "-GPSLongitudeRef=W", "-XMP-exif:GPSLatitude=49.26346", "-XMP-exif:GPSLongitude=-123.12054", "-DateTimeOriginal=2026:11:05 18:05:00", "-OffsetTimeOriginal=-07:00", file]);
     expect(tag.exitCode).toBe(0);
     const bytes = await readFile(file);
     expect(await gpsFix(bytes)).not.toBeNull();
@@ -460,16 +464,16 @@ describe("proof helpers", () => {
     expect(stripped).not.toBeNull();
     expect(await gpsFix(stripped!.bytes)).toBeNull();
     // No GPS tag left in any group (EXIF or XMP).
-    const left = Bun.spawnSync(["exiftool", "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: stripped!.bytes });
+    const left = Bun.spawnSync([exiftoolBin()!, "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: stripped!.bytes });
     expect(left.stdout.toString().trim()).toBe("");
     expect(await captureTime(stripped!.bytes)).toBe(Date.parse("2026-11-05T18:05:00-07:00"));
     // An XMP-only location is removed too.
     const xmp = `${dir}/b.jpg`;
     expect(Bun.spawnSync(["magick", "-size", "8x8", "xc:blue", xmp]).exitCode).toBe(0);
-    expect(Bun.spawnSync(["exiftool", "-q", "-overwrite_original", "-XMP-exif:GPSLatitude=49.26346", "-XMP-exif:GPSLongitude=-123.12054", xmp]).exitCode).toBe(0);
+    expect(Bun.spawnSync([exiftoolBin()!, "-q", "-overwrite_original", "-XMP-exif:GPSLatitude=49.26346", "-XMP-exif:GPSLongitude=-123.12054", xmp]).exitCode).toBe(0);
     const xmpOut = await stripGps({ mediaType: "image/jpeg", bytes: await readFile(xmp) });
     expect(xmpOut).not.toBeNull();
-    expect(Bun.spawnSync(["exiftool", "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: xmpOut!.bytes }).stdout.toString().trim()).toBe("");
+    expect(Bun.spawnSync([exiftoolBin()!, "-q", "-q", "-a", "-s", "-G1", "-*GPS*", "-"], { stdin: xmpOut!.bytes }).stdout.toString().trim()).toBe("");
     expect(await stripGps({ mediaType: "image/jpeg", bytes: Buffer.from("not an image") })).toBeNull();
   });
 

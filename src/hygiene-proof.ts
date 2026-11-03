@@ -103,15 +103,19 @@ export async function gpsFix(bytes: Buffer): Promise<{ lat: number; lon: number 
 /**
  * exiftool's path. Arch installs it in /usr/bin/vendor_perl, which a systemd
  * unit's PATH usually lacks (found live 2026-11-02: every keepsake would have
- * been dropped), so those Perl directories are searched too.
+ * been dropped). Root-owned system directories are searched first, so an
+ * `exiftool` dropped into a user-writable PATH entry can't fake the stripping;
+ * PATH comes last.
  */
 export function exiftoolBin(env: Record<string, string | undefined> = process.env): string | null {
   if (env.HYGIENE_EXIFTOOL_BIN) return env.HYGIENE_EXIFTOOL_BIN;
-  const path = [env.PATH ?? "", "/usr/bin/vendor_perl", "/usr/bin/site_perl", "/usr/bin/core_perl"].filter(Boolean).join(":");
+  const system = ["/usr/bin/vendor_perl", "/usr/bin/site_perl", "/usr/bin/core_perl", "/usr/bin", "/usr/local/bin"];
+  const path = [...system, env.PATH ?? ""].filter(Boolean).join(":");
   return Bun.which("exiftool", { PATH: path });
 }
 const EXIFTOOL = exiftoolBin();
 if (!EXIFTOOL) console.error("hygiene-proof: exiftool not found; photo keepsakes will not be saved");
+let exiftoolFailureLogged = false;
 
 /**
  * The same image with its location removed: every EXIF GPS tag and all XMP
@@ -136,6 +140,11 @@ async function exiftool(args: string[], input: Buffer): Promise<Buffer | null> {
     const timer = setTimeout(() => child.kill(), 15_000);
     const [output, code] = await Promise.all([new Response(child.stdout).arrayBuffer(), child.exited]);
     clearTimeout(timer);
+    if (code !== 0 && !exiftoolFailureLogged) {
+      // Once: a broken binary or missing perl would otherwise drop keepsakes with only a vague per-photo line.
+      exiftoolFailureLogged = true;
+      console.error(`hygiene-proof: ${EXIFTOOL} exited ${code}; keepsakes are skipped while it fails`);
+    }
     return code === 0 ? Buffer.from(output) : null;
   } catch {
     return null;
