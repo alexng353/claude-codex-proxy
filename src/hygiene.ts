@@ -219,32 +219,17 @@ export function knownZone(name: string): boolean {
   return kind === "tzif" || kind === "stale";
 }
 
-/** How far ahead a reported zone must keep Vancouver's clock to count as Vancouver. */
-export const HOME_ALIAS_HORIZON_MS = 30 * 86_400_000;
-const HOME_ALIAS_STEP_MS = 3_600_000;
-const homeAliasMemo = new Map<string, string>();
-
 /**
- * `zone`, or Vancouver when `zone` keeps Vancouver's UTC offset from `ms` through the next
- * 30 days. Alex's phone reports America/Cambridge_Bay for BC's permanent UTC-7 (Nov 3); it
- * reads the same until Mar 14 2027, then runs an hour ahead, so only a real offset change
- * (Jakarta) moves the gate's day. A report that diverges within 30 days is kept as named.
+ * `zone`, or Vancouver when `zone` shows Vancouver's clock at `ms`. Alex's phone reported
+ * America/Cambridge_Bay for BC's permanent UTC-7 (Nov 3, old iOS tzdata), so only a real
+ * offset change (Jakarta) moves the gate's day or grants a travel day. Judged at each report,
+ * never ahead: the stored zone stays Vancouver, and if the reported zone's clock ever leaves
+ * Vancouver's (Cambridge_Bay goes to UTC-6 on Mar 14 2027), that report records the change.
+ * A lookahead would instead flip a phone still on the alias a month early (comb, Nov 3).
  */
 export function canonicalZone(zone: string, ms: number): string {
   if (zone === TIME_ZONE || !Number.isFinite(ms)) return zone;
-  const key = `${zone}|${Math.floor(ms / HOME_ALIAS_STEP_MS)}`;
-  const hit = homeAliasMemo.get(key);
-  if (hit) return hit;
-  let result = TIME_ZONE;
-  for (let t = ms; t <= ms + HOME_ALIAS_HORIZON_MS; t += HOME_ALIAS_STEP_MS) {
-    if (offsetAt(t, zone).offsetMs !== offsetAt(t, TIME_ZONE).offsetMs) {
-      result = zone;
-      break;
-    }
-  }
-  if (homeAliasMemo.size >= 256) homeAliasMemo.clear();
-  homeAliasMemo.set(key, result);
-  return result;
+  return offsetAt(ms, zone).offsetMs === offsetAt(ms, TIME_ZONE).offsetMs ? TIME_ZONE : zone;
 }
 
 /**

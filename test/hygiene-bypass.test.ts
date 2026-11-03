@@ -343,5 +343,14 @@ describe("device time zone (X-Device-Time-Zone on GET /status)", () => {
     clock += 60_000;
     expect((await status(CB)).zone).toBe("America/Vancouver");
     expect((await state()).zones.map((z: any) => z.zone)).toEqual(["America/Vancouver", "Asia/Jakarta", "America/Vancouver"]);
+
+    // Reports of the alias through Feb 2027 stay Vancouver (no flip a month early, comb F1);
+    // once its clock differs (Mar 14), the report records a 1 h change, below a travel day.
+    clock = Date.parse("2027-02-20T15:00:00Z");
+    expect((await status(CB)).zone).toBe("America/Vancouver");
+    expect((await state()).zones).toHaveLength(3);
+    clock = Date.parse("2027-03-20T15:00:00Z");
+    expect((await status(CB)).zone).toBe(CB);
+    expect((await state()).zones.map((z: any) => z.zone).at(-1)).toBe(CB);
   });
 });

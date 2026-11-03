@@ -234,7 +234,7 @@ export async function noteDeviceZone(raw: string): Promise<void> {
     }
     return;
   }
-  // An alias with Vancouver's clock (America/Cambridge_Bay) is Vancouver: no change, no travel day.
+  // A zone showing Vancouver's clock now (America/Cambridge_Bay) is Vancouver: no change, no travel day.
   const zone = canonicalZone(named, deps.now());
   const lastZone = (last: ZoneChange | undefined) => last && canonicalZone(last.zone, Date.parse(last.from));
   const needed = (state: GateState, now: number) => {
