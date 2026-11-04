@@ -158,3 +158,61 @@ weigh-ins, including those not yet scanned by the delivery worker.
 A passing proof can still need review before its number reaches Cairn. The gate
 verdict is independent of delivery. See [Weigh-in delivery](weight-sync.md) for
 rules, deployment, and backfill.
+
+### Gate-fault escalation (local operator routes)
+
+`POST /hygiene/debt/:id/resolve` continues to accept existing rulings. New
+rulings should include `reasonClass: "other" | "gate_fault"`. A justified
+`gate_fault` requires an `item` key and an actionable `fixRef`:
+
+```json
+{"verdict":"justified","reasonClass":"gate_fault","reason":"cancel did not stick","item":"morning-walk","fixRef":{"kind":"q","id":"gate-fault-escalation"}}
+```
+
+Alternatively use `{"kind":"chat","id":"<Today chat UUID>","eta":"2026-11-05T14:00:00-07:00"}`.
+The ETA must be in the future. The queue item or chat task-ledger record must
+exist and be open; missing, terminal or unreadable references return HTTP 422
+with an `error`. Chat references pin the ledger record selected at ruling time. Supply `task`
+(the numeric ledger record) to select one explicitly. Without it, the chat
+must have exactly one open ledger record; multiple open records return 422.
+Success remains HTTP 200 with `{ok:true,debt}`; the debt includes the reason
+class, item and fix reference. Omitted reason classes remain supported for
+older callers and stored debts.
+
+A second justified gate fault for the same item within 24 hours suspends it.
+The gate owner receives one message through the existing keyed wake sender;
+delivery happens outside the gate lock, with the existing retry backoff and
+24-hour give-up policy. Permanent delivery failures are not retried. Queue repairs close when their
+state is `done` or `cancelled`; chat repairs close when the pinned ledger record
+is `cancelled`, or when it is `done` and has a receipt. Unavailable repair stores keep the
+suspension active. The wake timer and phone status reads persist closed repairs.
+Both `/hygiene/status` and the authenticated `/hygiene/api/v1/status` include
+`suspensions` (active entries with `item`, `at`, `debtId`, `fixRef`, and optional
+`notificationQueuedAt`) and `cancellations` (item keys mapped to `{at,reason}`).
+This exposes suspension data to Cairn; displaying a dedicated suspension banner
+requires a Cairn client change.
+
+`POST /hygiene/items/:item/cancel` with `{"reason":"no longer required"}`
+cancels a recurring item immediately and returns HTTP 200
+`{ok:true,item,at,reason}`. Repeating a cancellation preserves its original time.
+Keys: `morning-teeth`, `night-teeth`, `shower`, `morning-weight`,
+`morning-creatine`, `morning-walk`. Unknown keys return 404; a missing reason
+returns 422. Cancellation removes existing and future lock text and proof slots;
+old bypass debts remain available for explicit resolution. There is no resume
+endpoint in this change. Gym's deliberate late-cancel rule is unchanged.
+
+The authority reads `~/.local/state/today-ops/queue.sqlite` and
+`~/.local/state/today/daemon.sqlite` in read-only mode. Operators may override
+these locations with `HYGIENE_QUEUE_DB` and `HYGIENE_TASK_DB`.
+
+Shield reports mark their inferred item lists with `itemsComplete:false`;
+an operator may identify a valid fault item missing from that partial list.
+A terminal chat record without a receipt cannot be attached to a new ruling;
+an already attached `done` repair stays suspended until that receipt exists.
+Status exposes `repairStatus:"awaiting_receipt"` and one additional keyed owner
+notice requests the missing receipt. Cancelled chat records close without a receipt.
+
+Recurring slots that first arm within a suspension window remain unenforced
+after the repair closes; previously armed slots can resume. Ordinary leniency
+revisions use `reasonClass:"other"` and preserve the previous classification in
+the debt history, rather than inheriting an untracked fault classification.

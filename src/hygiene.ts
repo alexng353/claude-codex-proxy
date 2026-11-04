@@ -25,6 +25,7 @@
  * - Planned gym sessions (gym.ts): a plan with no Start at the gym in
  *   Uplifting by its start plus a grace locks until a qualifying session.
  */
+import type { FixRef, FixStatus } from "./hygiene-fix";
 import { createHash } from "node:crypto";
 import type { BypassPhraseState } from "./bypass-phrase";
 import { gymDueToday, gymOutstanding, type GymState } from "./gym";
@@ -109,6 +110,13 @@ export type Debt = {
   at: string;
   /** What the bypass skipped, as labels. */
   skipped: string[];
+  /** Stable item keys captured when bypassed; absent in legacy debts. */
+  items?: string[];
+  /** Delayed shield reports infer item keys and may omit locks cleared since the tap. */
+  itemsComplete?: boolean;
+  reasonClass?: "gate_fault" | "other";
+  item?: string;
+  fixRef?: FixRef;
   status: "open" | "justified" | "penance" | "paid";
   reason?: string;
   ruledAt?: string;
@@ -116,6 +124,7 @@ export type Debt = {
   /** Earlier verdicts a revision replaced, oldest first (POST /hygiene/debt/:id/revise). */
   history?: Array<{
     status: Debt["status"];
+    reasonClass?: Debt["reasonClass"];
     reason?: string;
     ruledAt?: string;
     penance?: { description: string; setAt: string; paidAt?: string };
@@ -138,6 +147,8 @@ export type GateState = {
   creatineStartsAt?: string;
   /** First morning outdoor walk to enforce; absent means off. */
   walkStartsAt?: string;
+  cancellations?: Record<string, { at: string; reason: string }>;
+  suspensions?: Array<{ item: string; at: string; debtId: string; fixRef: FixRef; resolvedAt?: string; notificationQueuedAt?: string; repairStatus?: FixStatus; receiptNoticeQueuedAt?: string }>;
   images: ImageRecord[];
   /** Requirement slot -> ISO time it was filled. */
   filled: Record<string, string>;
@@ -378,7 +389,28 @@ const OPT_IN: Record<string, (state: GateState) => string | undefined> = {
   "morning-walk-start": (state) => state.walkStartsAt,
 };
 
-function enforced(state: GateState, slotName: string): boolean {
+export const RECURRING_ITEMS = ["morning-teeth", "night-teeth", "shower", "morning-weight", "morning-creatine", "morning-walk"] as const;
+export function itemKey(slot: string): string {
+  if (slot.startsWith("gym/") || slot.startsWith("penance/")) return slot;
+  return slot.split("/")[1]?.replace(/-walk-start$/, "-walk") ?? slot;
+}
+function itemStopped(state: GateState, item: string, now: number): boolean {
+  const cancelled = state.cancellations?.[item];
+  return (!!cancelled && Date.parse(cancelled.at) <= now) ||
+    !!state.suspensions?.some(s => s.item === item && !s.resolvedAt && Date.parse(s.at) <= now);
+}
+
+/** A repaired item never charges for a slot that first armed while it was suspended. */
+function armedDuringSuspension(state: GateState, name: string): boolean {
+  const item = itemKey(name);
+  if (!RECURRING_ITEMS.some(key => key === item)) return false;
+  const arm = armMs(name);
+  return !!state.suspensions?.some(s => s.item === item && arm >= Date.parse(s.at) &&
+    (!s.resolvedAt || arm < Date.parse(s.resolvedAt)));
+}
+
+function enforced(state: GateState, slotName: string, now: number): boolean {
+  if (itemStopped(state, itemKey(slotName), now) || armedDuringSuspension(state, slotName)) return false;
   if (armMs(slotName) < Date.parse(state.startsAt)) return false;
   // A travel day: no slot armed in the 24 h after a zone change (or the silent flight before it) locks.
   if (inTransit(armMs(slotName))) return false;
@@ -389,9 +421,9 @@ function enforced(state: GateState, slotName: string): boolean {
 }
 
 /** This morning's enforced slots, which DELAY postpones together. */
-function morningSlots(state: GateState, day: string): string[] {
+function morningSlots(state: GateState, day: string, now: number): string[] {
   return [slot.morning(day), slot.weight(day), slot.creatine(day), slot.walk(day)].filter((name) =>
-    enforced(state, name),
+    enforced(state, name, now),
   );
 }
 
@@ -418,13 +450,13 @@ export function delayActive(state: GateState, now: number): boolean {
     state.delay.until !== null &&
     state.delay.day === day &&
     Date.parse(state.delay.until) > now &&
-    morningSlots(state, day).some((name) => !state.filled[name])
+    morningSlots(state, day, now).some((name) => !state.filled[name])
   );
 }
 
 /** True when every outstanding requirement is one of this morning's photos. */
 export function onlyMorningDue(state: GateState, due: Requirement[], now: number): boolean {
-  const morning = morningSlots(state, localTime(now).day);
+  const morning = morningSlots(state, localTime(now).day, now);
   return due.length > 0 && due.every((r) => morning.includes(r.slot));
 }
 
@@ -435,7 +467,7 @@ export function outstanding(state: GateState, now: number): Requirement[] {
   const overdue = ` (overdue from ${dayLabel(yesterday)})`;
   const result: Requirement[] = [];
   const add = (name: string, kind: ProofKind, label: string) => {
-    if (enforced(state, name) && !state.filled[name]) result.push({ slot: name, kind, label });
+    if (enforced(state, name, now) && !state.filled[name]) result.push({ slot: name, kind, label });
   };
   add(slot.shower(yesterday), "shower", `shower photo${overdue}`);
   add(slot.night(yesterday), "teeth", `night teeth photo${overdue}`);
@@ -453,7 +485,7 @@ export function outstanding(state: GateState, now: number): Requirement[] {
       description: debt.penance!.description,
     });
   result.push(...gymOutstanding(state.gym, now));
-  return result;
+  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot));
 }
 
 /** Requirements due later today that do not lock yet. */
@@ -472,16 +504,16 @@ export function dueToday(state: GateState, now: number): Requirement[] {
           : "night teeth photo (17:00 to midnight)",
     });
   const morningPending = minutes < MORNING_MINUTE || delayActive(state, now);
-  if (morningPending && !state.filled[slot.morning(day)] && enforced(state, slot.morning(day)))
+  if (morningPending && !state.filled[slot.morning(day)] && enforced(state, slot.morning(day), now))
     result.push({ slot: slot.morning(day), kind: "teeth", label: "morning teeth photo (from 05:00)" });
-  if (morningPending && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day)))
+  if (morningPending && !state.filled[slot.weight(day)] && enforced(state, slot.weight(day), now))
     result.push({ slot: slot.weight(day), kind: "weight", label: "morning weigh-in photo (from 05:00)" });
-  if (morningPending && !state.filled[slot.creatine(day)] && enforced(state, slot.creatine(day)))
+  if (morningPending && !state.filled[slot.creatine(day)] && enforced(state, slot.creatine(day), now))
     result.push({ slot: slot.creatine(day), kind: "creatine", label: "morning creatine photo (from 05:00)" });
-  if (morningPending && !state.filled[slot.walk(day)] && enforced(state, slot.walk(day)))
+  if (morningPending && !state.filled[slot.walk(day)] && enforced(state, slot.walk(day), now))
     result.push({ slot: slot.walk(day), kind: "walk", label: "15-min outdoor walk (from 05:00)" });
   result.push(...gymDueToday(state.gym, now));
-  return result;
+  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot));
 }
 
 export function openPenance(state: GateState): Debt[] {
@@ -495,30 +527,30 @@ export function openPenance(state: GateState): Debt[] {
 export function candidateSlots(state: GateState, kind: ProofKind, now: number): string[] {
   const { day, minutes } = localTime(now);
   const yesterday = addDays(day, -1);
-  const open = (name: string) => !state.filled[name];
-  if (kind === "penance") return openPenance(state).map((d) => slot.penance(d.id));
+  const open = (name: string) => !state.filled[name] && !itemStopped(state, itemKey(name), now) && !armedDuringSuspension(state, name);
+  if (kind === "penance") return openPenance(state).map((d) => slot.penance(d.id)).filter(open);
   if (kind === "weight")
-    return minutes >= MORNING_MINUTE && open(slot.weight(day)) && enforced(state, slot.weight(day))
+    return minutes >= MORNING_MINUTE && open(slot.weight(day)) && enforced(state, slot.weight(day), now)
       ? [slot.weight(day)]
       : [];
   if (kind === "creatine")
-    return minutes >= MORNING_MINUTE && open(slot.creatine(day)) && enforced(state, slot.creatine(day))
+    return minutes >= MORNING_MINUTE && open(slot.creatine(day)) && enforced(state, slot.creatine(day), now)
       ? [slot.creatine(day)]
       : [];
   if (kind === "walk") {
-    if (minutes < MORNING_MINUTE || !open(slot.walk(day)) || !enforced(state, slot.walk(day))) return [];
+    if (minutes < MORNING_MINUTE || !open(slot.walk(day)) || !enforced(state, slot.walk(day), now)) return [];
     // The second photo's 15 minutes are checked when it arrives, so it can say how long is left.
     return [open(slot.walkStart(day)) ? slot.walkStart(day) : slot.walk(day)];
   }
   if (kind === "shower") {
     const result: string[] = [];
-    if (open(slot.shower(yesterday)) && enforced(state, slot.shower(yesterday)))
+    if (open(slot.shower(yesterday)) && enforced(state, slot.shower(yesterday), now))
       result.push(slot.shower(yesterday));
     if (open(slot.shower(day))) result.push(slot.shower(day));
     return result;
   }
   const result: string[] = [];
-  if (open(slot.night(yesterday)) && enforced(state, slot.night(yesterday)))
+  if (open(slot.night(yesterday)) && enforced(state, slot.night(yesterday), now))
     result.push(slot.night(yesterday));
   if (minutes >= MORNING_MINUTE && open(slot.morning(day))) result.push(slot.morning(day));
   if (minutes >= NIGHT_TEETH_MINUTE && open(slot.night(day))) result.push(slot.night(day));
@@ -1045,6 +1077,7 @@ export function noteText(debt: Debt, baseUrl: string): string {
     "Once he answers, record your ruling with exactly one call:",
     `- justified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"justified","reason":"<one line>"}'`,
     `- unjustified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"unjustified","reason":"<one line>","penance":"<a short, safe, doable photo task, e.g. photo of you on a walk outside>"}'`,
+    `Use reasonClass:"gate_fault" for a broken gate, or "other" otherwise. A justified gate_fault requires item (one of the bypassed item keys: ${(debt.items ?? []).join(", ") || "legacy debt: identify the faulty item"}) and fixRef: {"kind":"q","id":"<existing open queue item>"} or {"kind":"chat","id":"<chat UUID with an open task-ledger record>","eta":"<future ISO time with offset>","task":<ledger record number if the chat has multiple open tasks>}. Create or identify the repair first; do not merely repeat a gate-fault justification. A second fault for the same item within 24 h suspends it until the repair closes.`,
     "An unjustified ruling locks the gate until Alex sends the penance photo.",
     `</${NOTE_TAG}>`,
   ].join("\n");

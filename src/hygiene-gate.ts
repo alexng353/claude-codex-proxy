@@ -8,6 +8,8 @@
  * in /v1/responses. Decisions for new human turns are serialized so two
  * chats cannot spend the same photo or bypass.
  */
+import { createHash } from "node:crypto";
+import { readFixStatus, type FixRef } from "./hygiene-fix";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
@@ -21,6 +23,8 @@ import {
   rememberVerdicts,
 } from "./hygiene-remote";
 import {
+  itemKey,
+  RECURRING_ITEMS,
   BYPASS_MS,
   DELAY_END_MINUTE,
   DELAY_MS,
@@ -99,6 +103,7 @@ import {
 import { refreshIfDeciding, startGymSync, syncGym, upliftingToken, type GymSyncHost } from "./gym-sync";
 import { parseStart } from "./gym-client";
 import {
+  enqueueWake,
   flushWakes as flushWakeQueue,
   heldNoteText,
   holdMessage,
@@ -115,6 +120,7 @@ import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
 export type GateDeps = {
+  fixStatus: typeof readFixStatus;
   now: () => number;
   classify: Classifier;
   dhash: (bytes: Buffer) => Promise<string | null>;
@@ -136,6 +142,7 @@ export type GateDeps = {
 };
 
 const defaults: GateDeps = {
+  fixStatus: readFixStatus,
   now: () => Date.now(),
   classify: claudeClassifier,
   dhash,
@@ -189,7 +196,7 @@ export function loadState(): GateState {
   } catch {}
   if (cache && cache.path === path && cache.mtimeMs === mtimeMs) {
     setZoneHistory(cache.state.zones);
-    return cache.state;
+    return repairView(cache.state);
   }
   let state: GateState;
   if (mtimeMs < 0) state = emptyState(defaultStartsAt(deps.now()));
@@ -202,7 +209,20 @@ export function loadState(): GateState {
   stampPlanSettings(state.gym);
   cache = { path, mtimeMs, state };
   setZoneHistory(state.zones);
-  return state;
+  return repairView(state);
+}
+
+// Read closure on every decision; the retry timer persists it without delaying a newly repaired gate.
+function repairView(state: GateState): GateState {
+  if (!state.suspensions?.some(s => !s.resolvedAt)) return state;
+  const view = structuredClone(state);
+  for (const s of view.suspensions ?? []) {
+    if (!s.resolvedAt) {
+      s.repairStatus = deps.fixStatus(s.fixRef);
+      if (s.repairStatus === "closed") s.resolvedAt = new Date(deps.now()).toISOString();
+    }
+  }
+  return view;
 }
 
 const RETAIN_MS = 400 * 86_400_000;
@@ -377,8 +397,9 @@ const forward = (request: ResponsesRequest, gateUnavailable = false): GateDecisi
 const armed = (state: GateState, now: number) => outstanding(state, now).length > 0 && !bypassActive(state, now);
 
 /** Sends queued wakes now; the server's timer retries any that fail. */
-export function flushWakes(): Promise<void> {
-  return flushWakeQueue(statePath(), deps.wake, deps.now);
+export async function flushWakes(): Promise<void> {
+  if (!remoteGate()) await refreshFaults();
+  await flushWakeQueue(statePath(), deps.wake, deps.now);
 }
 
 function kickWakes(): void {
@@ -560,7 +581,9 @@ async function checkImage(
     state.images.push({ ...record, verdict: "stale", reason: `taken ${minutes} min before sending` });
     return { line: `❌ photo rejected: its camera timestamp is ${minutes} minutes old (limit 30).` };
   }
-  const penance = state.debts.find((d) => d.status === "penance" && d.penance && !d.penance.paidAt);
+  // Classification and credit must refer to the same eligible (possibly explicitly targeted) debt.
+  const penanceSlot = slotsFor("penance")[0];
+  const penance = state.debts.find(d => `penance/${d.id}` === penanceSlot);
   let verdict;
   try {
     verdict = await deps.classify(decoded, {
@@ -701,6 +724,7 @@ function bypassReply(state: GateState, now: number, text: string): string {
     id: `${localTime(now).day}-${state.bypass.count}`,
     at,
     skipped: due.map((r) => r.label),
+    items: [...new Set(due.map(r => itemKey(r.slot)))],
     status: "open",
   };
   state.debts.push(debt);
@@ -795,10 +819,15 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
       debtId = `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`;
       // Locks as best the gate can tell at the tap, else those at the report, else a lock that has since cleared.
       // Inferred from the current state, so it can over-state (the docs say so).
-      const atTap = outstanding(atTapView(state), anchor).map((r) => r.label);
-      const atReport = outstanding(state, now).map((r) => `at report: ${r.label}`);
+      const tapRequirements = outstanding(atTapView(state), anchor);
+      const reportRequirements = outstanding(state, now);
+      const atTap = tapRequirements.map(r => r.label);
+      const atReport = reportRequirements.map(r => `at report: ${r.label}`);
+      // A late report may follow the proof that cleared its lock. Keep that historical key.
+      const clearedSlots = state.images.filter(r => r.verdict === "accepted" && r.slot && Date.parse(r.at) > anchor && Date.parse(r.at) <= now).map(r => r.slot!);
+      const items = [...new Set([...tapRequirements.map(r => r.slot), ...reportRequirements.map(r => r.slot), ...clearedSlots].map(itemKey))];
       const skipped = atTap.length ? atTap : atReport.length ? atReport : ["a lock cleared after the tap"];
-      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped, status: "open" });
+      state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped, ...(items.length ? {items} : {}), itemsComplete: false, status: "open" });
       if (until > now) {
         applied = true;
         state.bypass.count += 1;
@@ -1278,6 +1307,8 @@ export function gateStatus() {
       expires_at: delayActive(state, now) ? state.delay.until : null,
       count: state.delay.count,
     },
+    suspensions: (state.suspensions ?? []).filter(s => !s.resolvedAt),
+    cancellations: state.cancellations ?? {},
     openDebts: state.debts
       .filter((d) => d.status === "open" || d.status === "penance")
       .map(({ id, at, skipped, status, penance }) => ({ id, at, skipped, status, penance })),
@@ -1317,9 +1348,12 @@ export async function creditPenancePhoto(
     const record = [...state.images].reverse().find((r) => r.sha256 === sha && r.verdict === "rejected");
     if (!record) return { status: 404, body: { error: "no refused photo with that hash" } };
     const sent = Date.parse(record.at);
-    if (now - sent > PENANCE_CREDIT_MAX_AGE_MS) return { status: 409, body: { error: "the photo is more than 24 hours old" } };
-    if (sent < Date.parse(debt.penance.setAt)) return { status: 409, body: { error: "the photo was sent before the penance was set" } };
-    const fits = record.kind === "penance" || penanceProofKinds(debt.penance.description).includes(record.kind as ProofKind);
+    if (now - sent > PENANCE_CREDIT_MAX_AGE_MS)
+      return { status: 409, body: { error: "the photo is more than 24 hours old" } };
+    if (sent < Date.parse(debt.penance.setAt))
+      return { status: 409, body: { error: "the photo was sent before the penance was set" } };
+    const fits =
+      record.kind === "penance" || penanceProofKinds(debt.penance.description).includes(record.kind as ProofKind);
     if (!fits)
       return {
         status: 409,
@@ -1329,7 +1363,8 @@ export async function creditPenancePhoto(
     record.verdict = "accepted";
     record.slot = slot;
     record.manual = { verifier: by };
-    record.reason = `${record.reason ?? ""} [credited for the penance at ${new Date(now).toISOString()} by ${by}: ${reason}]`.trim();
+    record.reason =
+      `${record.reason ?? ""} [credited for the penance at ${new Date(now).toISOString()} by ${by}: ${reason}]`.trim();
     state.filled[slot] = record.at;
     debt.penance.paidAt = record.at;
     debt.status = "paid";
@@ -1341,26 +1376,167 @@ export async function creditPenancePhoto(
 
 export async function resolveDebt(
   id: string,
-  body: { verdict?: unknown; reason?: unknown; penance?: unknown },
+  body: {
+    verdict?: unknown;
+    reason?: unknown;
+    penance?: unknown;
+    reasonClass?: unknown;
+    fixRef?: unknown;
+    item?: unknown;
+  },
 ): Promise<{ status: number; body: unknown }> {
   return serialized(async () => {
     const state = structuredClone(loadState());
     const debt = state.debts.find((d) => d.id === id);
     if (!debt) return { status: 404, body: { error: "no such debt" } };
     if (debt.status !== "open") return { status: 409, body: { error: `debt already ${debt.status}` } };
+    if (body.reasonClass !== undefined && body.reasonClass !== "gate_fault" && body.reasonClass !== "other")
+      return { status: 422, body: { error: "reasonClass must be gate_fault or other" } };
+    let fixRef: FixRef | undefined;
+    let item: string | undefined;
+    if (body.verdict === "justified" && body.reasonClass === "gate_fault") {
+      const ref = body.fixRef as { kind?: unknown; id?: unknown; eta?: unknown; task?: unknown } | null;
+      if (
+        !ref ||
+        typeof ref !== "object" ||
+        (ref.kind !== "q" && ref.kind !== "chat") ||
+        typeof ref.id !== "string" ||
+        !/^[a-zA-Z0-9_-]{1,100}$/.test(ref.id)
+      )
+        return { status: 422, body: { error: "gate_fault requires fixRef: {kind:q,id} or {kind:chat,id,eta}" } };
+      if (
+        ref.kind === "chat" &&
+        (!/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(ref.id) ||
+          typeof ref.eta !== "string" ||
+          !/(Z|[+-]\d{2}:\d{2})$/.test(ref.eta) ||
+          !(Date.parse(ref.eta) > deps.now()))
+      )
+        return { status: 422, body: { error: "chat fixRef requires a chat UUID and future ISO eta with offset" } };
+      if (
+        ref.kind === "chat" &&
+        ref.task !== undefined &&
+        (typeof ref.task !== "number" || !Number.isSafeInteger(ref.task) || ref.task < 1)
+      )
+        return { status: 422, body: { error: "chat fixRef.task must be a positive task-ledger record number" } };
+      fixRef =
+        ref.kind === "q"
+          ? { kind: "q", id: ref.id }
+          : {
+              kind: "chat",
+              id: ref.id,
+              eta: ref.eta as string,
+              ...(typeof ref.task === "number" ? { task: ref.task } : {}),
+            };
+      const repairStatus = deps.fixStatus(fixRef);
+      if (repairStatus === "ambiguous")
+        return {
+          status: 422,
+          body: { error: "chat fixRef has multiple open task-ledger records; supply fixRef.task to select the repair" },
+        };
+      if (repairStatus !== "open")
+        return {
+          status: 422,
+          body: {
+            error:
+              "fixRef must identify an existing open q item or chat task-ledger record; missing, closed or unavailable records cannot track a repair",
+          },
+        };
+      item = typeof body.item === "string" ? body.item : debt.items?.length === 1 ? debt.items[0] : undefined;
+      if (
+        !item ||
+        !(RECURRING_ITEMS.some((key) => key === item) ||
+          (item.startsWith("gym/") && state.gym?.plans.some(p => `gym/${p.id}` === item)) ||
+          (item.startsWith("penance/") && state.debts.some(d => `penance/${d.id}` === item && (d.penance || d.history?.some(h => h.penance))))) ||
+        (debt.itemsComplete !== false && debt.items?.length && !debt.items.includes(item))
+      )
+        return { status: 422, body: { error: "gate_fault requires item: a stable key from this debt's items" } };
+    }
     const reason = typeof body.reason === "string" ? body.reason.slice(0, 300) : undefined;
     const now = new Date(deps.now()).toISOString();
     if (body.verdict === "justified") {
-      Object.assign(debt, { status: "justified", reason, ruledAt: now });
+      Object.assign(debt, {
+        status: "justified",
+        reason,
+        ruledAt: now,
+        reasonClass: body.reasonClass,
+        ...(fixRef ? { fixRef, item } : {}),
+      });
     } else if (body.verdict === "unjustified") {
       const penance = typeof body.penance === "string" ? body.penance.trim() : "";
       if (!penance || penance.length > 200)
         return { status: 400, body: { error: "unjustified needs a penance description (1-200 chars)" } };
-      Object.assign(debt, { status: "penance", reason, ruledAt: now, penance: { description: penance, setAt: now } });
+      Object.assign(debt, {
+        status: "penance",
+        reason,
+        reasonClass: body.reasonClass,
+        ruledAt: now,
+        penance: { description: penance, setAt: now },
+      });
     } else return { status: 400, body: { error: 'verdict must be "justified" or "unjustified"' } };
+    if (
+      fixRef &&
+      item &&
+      state.debts.some(
+        (d) =>
+          d.id !== id &&
+          d.status === "justified" &&
+          d.reasonClass === "gate_fault" &&
+          d.item === item &&
+          Date.parse(d.ruledAt ?? "") >= deps.now() - 86_400_000 &&
+          Date.parse(d.ruledAt ?? "") <= deps.now(),
+      ) &&
+      !state.suspensions?.some((s) => s.item === item && !s.resolvedAt)
+    ) {
+      (state.suspensions ??= []).push({ item, at: now, debtId: id, fixRef });
+    }
     saveState(state);
+    release(state, deps.now(), "gate fault ruling");
+    queueFaults(state);
+    kickWakes();
     return { status: 200, body: { ok: true, debt } };
   });
+}
+
+/** Persist closed repairs and retry the durable, idempotently keyed owner notification. */
+export async function refreshFaults(): Promise<void> {
+  const view = loadState();
+  const changed = JSON.stringify(view.suspensions) !== JSON.stringify(cache?.state.suspensions);
+  if (!changed && !view.suspensions?.some((s) => !s.notificationQueuedAt || (s.repairStatus === "awaiting_receipt" && !s.receiptNoticeQueuedAt))) return;
+  await serialized(async () => {
+    const state = structuredClone(loadState());
+    if (JSON.stringify(state.suspensions) !== JSON.stringify(cache?.state.suspensions)) saveState(state);
+    queueFaults(state);
+  });
+}
+
+const GATE_OWNER_THREAD = "1da90fc5-6b97-4945-9127-7e46e50c6a23";
+
+function queueFaults(state: GateState): void {
+  for (const s of state.suspensions ?? []) {
+    for (const marker of ["notificationQueuedAt", "receiptNoticeQueuedAt"] as const) {
+      const needsReceipt = marker === "receiptNoticeQueuedAt";
+      if (s[marker] || (needsReceipt && s.repairStatus !== "awaiting_receipt")) continue;
+      const key = `${s.item}/${s.debtId}/${s.at}${needsReceipt ? "/receipt" : ""}`;
+      const hash = createHash("sha256").update(key).digest("hex").slice(0, 12);
+      // Reuse the wake sender's validated id format; the fault-specific hash prevents unlock collisions.
+      try {
+        enqueueWake(statePath(), {
+          id: `hygiene-unlock-${Date.parse(s.at)}-${hash}`,
+          thread: GATE_OWNER_THREAD,
+          at: new Date(deps.now()).toISOString(),
+          text: needsReceipt
+            ? `Gate repair ${JSON.stringify(s.fixRef)} is done but has no completion receipt. ${s.item} remains suspended (awaiting_receipt). Add the task-ledger receipt so the gate can close this repair.`
+            : `Gate fault repeated within 24 h: ${s.item} was suspended at ${s.at}, pending repair ${JSON.stringify(s.fixRef)}. Debt: ${s.debtId}. Check current gate status before acting.`,
+        });
+        s[marker] = new Date(deps.now()).toISOString();
+        saveState(state);
+      } catch (error) {
+        // The ruling already committed. Its missing queue marker lets the timer retry safely.
+        delete s[marker];
+        console.error("hygiene-gate: could not queue gate-fault notice:", (error as Error).message);
+      }
+    }
+  }
 }
 
 /** A ruling can be revised toward leniency for this long after it was made. */
@@ -1393,12 +1569,15 @@ export async function reviseDebt(
     const revisedAt = new Date(now).toISOString();
     (debt.history ??= []).push({
       status: debt.status,
+      reasonClass: debt.reasonClass,
       reason: debt.reason,
       ruledAt: debt.ruledAt,
       penance: debt.penance,
       revisedAt,
     });
     debt.status = "justified";
+    // A leniency revision is not a tracked fault ruling; do not inherit its prior classification.
+    debt.reasonClass = "other";
     debt.reason = reason;
     debt.ruledAt = revisedAt;
     delete debt.penance;
@@ -1446,6 +1625,22 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
       return Response.json({ checked: !outcome.retry });
     });
   }
+  const cancellation = /^\/hygiene\/items\/([a-z-]+)\/cancel$/.exec(url.pathname);
+  if (cancellation && request.method === "POST") {
+    const item = cancellation[1];
+    if (!RECURRING_ITEMS.some(key => key === item)) return Response.json({error:"unknown recurring item"},{status:404});
+    let body: Record<string, unknown> | null;
+    try { body = await request.json(); } catch { return Response.json({error:"body must be JSON"},{status:400}); }
+    const reason = text(body?.reason,300);
+    if (!reason) return Response.json({error:"reason is required"},{status:422});
+    return serialized(async () => {
+      const state = structuredClone(loadState());
+      (state.cancellations ??= {})[item] ??= {at:new Date(deps.now()).toISOString(),reason};
+      saveState(state);
+      release(state,deps.now(),"item cancelled");
+      return Response.json({ok:true,item,...state.cancellations[item]});
+    });
+  }
   const ruling = /^\/hygiene\/debt\/([A-Za-z0-9-]+)\/resolve$/.exec(url.pathname);
   // Pays the open penance with a photo the gate already saw and wrongly refused. Local route,
   // like /hygiene/debt; logged on the photo's record.
@@ -1467,6 +1662,7 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
     } catch {
       return Response.json({ error: "body must be JSON" }, { status: 400 });
     }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return Response.json({error:"body must be a JSON object"},{status:400});
     const result = await resolveDebt(ruling[1], body);
     return Response.json(result.body, { status: result.status });
   }

@@ -11,7 +11,7 @@ import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, type ProofKind } from "./hygiene";
-import { gateDisabled, gateStatus, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { refreshFaults, gateDisabled, gateStatus, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -118,6 +118,8 @@ function status() {
     bypass: { count: s.bypass.count, active_until: s.bypass.activeUntil },
     delay: s.delay,
     open_debts: s.openDebts,
+    suspensions: s.suspensions,
+    cancellations: s.cancellations,
   };
 }
 
@@ -137,6 +139,7 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     // Cairn sends the phone's IANA zone; the gate's days follow it (Alex travels).
     const zone = request.headers.get("x-device-time-zone");
     if (zone) await noteDeviceZone(zone);
+    await refreshFaults();
     return json(status());
   }
 

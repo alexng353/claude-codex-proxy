@@ -234,6 +234,15 @@ export function releaseHeld(
   }
 }
 
+/** Queue a gate-owner notice with the same retry and deduplication contract as unlock wakes. */
+export function enqueueWake(statePath: string, wake: Wake): void {
+  if (!THREAD_ID.test(wake.thread) || !WAKE_ID.test(wake.id) || !wake.text)
+    throw new Error("invalid gate-owner wake");
+  update(storePath(statePath), store => {
+    if (!store.wakes.some(w => w.id === wake.id)) store.wakes.push(wake);
+  });
+}
+
 let chain: Promise<void> = Promise.resolve();
 
 /** Resolves once the sends already started have finished (for draining). */
