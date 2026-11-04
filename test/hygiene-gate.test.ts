@@ -381,6 +381,84 @@ describe("BYPASS, debt and penance", () => {
     expect(JSON.stringify(next)).not.toContain("hygiene-gate-note");
   });
 
+  const teethPenance = async () => {
+    await decide(request([env, user(BYPASS)]));
+    const ruling = await handleRequest(
+      new Request("http://localhost/hygiene/debt/2026-10-08-1/resolve", {
+        method: "POST",
+        body: JSON.stringify({ verdict: "unjustified", reason: "reflex", penance: "Photo of you brushing your teeth before bed" }),
+      }),
+    );
+    expect(ruling.status).toBe(200);
+  };
+
+  test("a penance that asks for teeth takes a teeth photo while the teeth slot isn't due (Nov 4 01:23)", async () => {
+    await teethPenance();
+    let asked: { kinds: string[]; penance?: string } | undefined;
+    setGateDeps({
+      now: () => clock,
+      bypassWords,
+      dhash: async () => null,
+      captureTime: async () => null,
+      classify: async (_image, wanted) => {
+        asked = wanted;
+        return verdicts.shift()!;
+      },
+    });
+    // The first photo fills morning teeth; the second is classified as teeth again, the way the
+    // classifier answered at 01:23 ("nothing visible shows it is before bed, so it is not penance").
+    verdicts.push(
+      { kind: "teeth", confidence: 0.95, reason: "brushing" },
+      { kind: "teeth", confidence: 0.95, reason: "nothing shows it is before bed, so not penance" },
+    );
+    clock = at(DAY, "06:20");
+    await decide(request([env, user({ photo: "teeth-1" })]));
+    clock = at(DAY, "07:30");
+    const second = await decide(request([env, user("done", { photo: "teeth-2" })]));
+    // Teeth is not among the kinds asked for: only the penance can take this photo.
+    expect(asked).toEqual({ kinds: ["shower", "penance"], penance: "Photo of you brushing your teeth before bed" });
+    expect(second.action).toBe("forward");
+    expect(gateStatus()).toMatchObject({ state: "clear", openDebts: [] });
+    const state = JSON.parse(await readFile(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    expect(state.debts[0]).toMatchObject({ status: "paid" });
+    expect(state.images.at(-1)).toMatchObject({ kind: "penance", verdict: "accepted", slot: "penance/2026-10-08-1" });
+  });
+
+  test("a photo the gate wrongly refused can be credited for the penance, once, from its stored verdict", async () => {
+    await teethPenance();
+    clock = at(DAY, "07:30");
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    const refused = (sha: string, kind: string) => ({
+      sha256: sha.repeat(64),
+      dhash: null,
+      at: new Date(clock - 60_000).toISOString(),
+      source: { thread: "cairn", key: sha },
+      kind,
+      verdict: "rejected",
+      reason: "not penance",
+    });
+    raw.images.push(refused("a", "teeth"), refused("b", "shower"));
+    await writeFile(path, JSON.stringify(raw));
+    resetGateCache();
+    const credit = (sha: string, body: unknown) =>
+      handleRequest(new Request(`http://localhost/hygiene/images/${sha.repeat(64)}/credit-penance`, { method: "POST", body: JSON.stringify(body) }));
+    const reason = { by: "test", reason: "refused by the penance matcher bug" };
+    expect((await credit("a", {})).status).toBe(400);
+    expect((await credit("c", reason)).status).toBe(404);
+    expect((await credit("b", reason)).status).toBe(409);
+    const ok = await credit("a", reason);
+    expect(ok.status).toBe(200);
+    expect(await ok.json()).toMatchObject({ ok: true, debt: "2026-10-08-1", slot: "penance/2026-10-08-1" });
+    expect(gateStatus().openDebts).toEqual([]);
+    const state = JSON.parse(await readFile(path, "utf8"));
+    const record = state.images.find((r: { sha256: string }) => r.sha256 === "a".repeat(64));
+    expect(record).toMatchObject({ verdict: "accepted", slot: "penance/2026-10-08-1", manual: { verifier: "test" } });
+    expect(record.reason).toContain("credited for the penance");
+    expect(state.debts[0]).toMatchObject({ status: "paid", penance: { paidAt: record.at } });
+    expect((await credit("a", reason)).status).toBe(409);
+  });
+
   test("a penance can be revised to justified within 12 h, with a reason; the old verdict is kept", async () => {
     const post = (path: string, body: unknown) =>
       handleRequest(new Request(`http://localhost/hygiene/debt/${path}`, { method: "POST", body: JSON.stringify(body) }));
@@ -1747,7 +1825,7 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" } as Verdict);
     clock = at(DAY, "06:05");
     exif.fresh = clock - 60_000;
-    expect((await decide(request([env, user("done", { photo: photo("fresh") })]))).action).toBe("forward");
+    expect((await decide(request([env, user("done", { photo: "fresh" })]))).action).toBe("forward");
     // That night: a new lock, and the morning's words are refused.
     clock = at("2026-10-09", "00:30");
     const night = text(await decide(request([env, user("hi")])))!;

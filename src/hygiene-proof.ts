@@ -243,6 +243,8 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
     lines.push(
       `- "penance": the photo shows this: ${JSON.stringify(wanted.penance)}`,
       'If the photo matches the penance, answer "penance" even when it also matches another kind.',
+      // Nov 4 01:23: "brushing your teeth before bed" was refused because "nothing visible shows it is before bed".
+      "Judge the penance only on what a photo can show. A time or occasion it names (before bed, tonight, after the gym) is not visible in a photo and is checked by the gate from when the photo was sent; never refuse the penance for it.",
     );
   // Creatine and walk photos have no person in them; only the other kinds need one. A penance
   // says what its photo shows, which may have nobody in it (comb, Nov 3).
@@ -256,6 +258,26 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
     'reading is the displayed weight with its unit (e.g. "72.4 kg" or "231.4 lb") for "weight", otherwise an empty string. Scales often use 7-segment LCD digits: read every digit and the decimal point exactly as shown, and take the unit from the display or the scale\'s unit label. Leave the unit out only if none is visible.',
   );
   return lines.join("\n");
+}
+
+/** Words in a penance description that name an everyday proof kind. */
+const PENANCE_KIND_WORDS: Array<[ProofKind, RegExp]> = [
+  ["teeth", /\b(teeth|tooth|toothbrush|floss(ing)?)\b/i],
+  ["shower", /\b(shower(ing|ed)?|wet hair)\b/i],
+  ["weight", /\b(scale|weigh(-| )?in|weigh(ing)? yourself)\b/i],
+  ["creatine", /\bcreatine\b/i],
+  ["walk", /\b(walk(ing)?|outdoors?|outside)\b/i],
+];
+
+/**
+ * The everyday kinds a penance asks for, e.g. teeth for "Photo of you brushing
+ * your teeth before bed". A classifier verdict of one of these kinds counts as
+ * the penance when that kind isn't otherwise due, so a penance never asks for a
+ * photo the gate then refuses as "not due".
+ */
+export function penanceProofKinds(description: string | undefined): ProofKind[] {
+  if (!description) return [];
+  return PENANCE_KIND_WORDS.filter(([, words]) => words.test(description)).map(([kind]) => kind);
 }
 
 const KG_TO_LB = 2.20462;

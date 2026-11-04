@@ -75,6 +75,7 @@ import {
   dhash,
   hammingDistance,
   parseWeightReading,
+  penanceProofKinds,
   sha256,
   type Classifier,
 } from "./hygiene-proof";
@@ -573,6 +574,20 @@ async function checkImage(
   }
   record.kind = verdict.kind;
   record.reason = verdict.reason;
+  // A penance that asks for an everyday kind ("brushing your teeth before bed") takes that
+  // kind's verdict when the kind itself isn't due, instead of refusing the very photo it asked
+  // for as "not due" (Nov 4 01:23).
+  if (
+    kinds.includes("penance") &&
+    verdict.kind !== "penance" &&
+    verdict.kind !== "none" &&
+    !kinds.includes(verdict.kind as ProofKind) &&
+    penanceProofKinds(penance?.penance?.description).includes(verdict.kind as ProofKind)
+  ) {
+    verdict = { ...verdict, kind: "penance", reason: `${verdict.reason} (counts as the penance)` } as typeof verdict;
+    record.kind = verdict.kind;
+    record.reason = verdict.reason;
+  }
   if (verdict.kind === "none" || !kinds.includes(verdict.kind as ProofKind)) {
     state.images.push(record);
     return {
@@ -1274,6 +1289,56 @@ export function gateStatus() {
   };
 }
 
+/** A refused photo can be credited for the penance up to this long after it was sent. */
+const PENANCE_CREDIT_MAX_AGE_MS = 24 * 3_600_000;
+
+/**
+ * Pays the open penance with a photo the gate already checked and refused, when that
+ * refusal was the gate's own bug (Nov 4 01:23: a teeth photo for a teeth penance was
+ * refused as "teeth isn't due"). Only the gate's stored verdict decides: the photo must
+ * have been classified as the penance or as a kind the penance asks for, sent after the
+ * penance was set, within 24 h, and never counted before. Rejected photos' bytes are not
+ * kept, so this credits the record, not a re-run of the classifier. Logged on the record.
+ */
+export async function creditPenancePhoto(
+  sha: string,
+  body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const by = typeof body.by === "string" ? body.by.trim().slice(0, 80) : "";
+  const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 300) : "";
+  if (!by || !reason) return { status: 400, body: { error: "by and reason are required" } };
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    const debt = state.debts.find((d) => d.status === "penance" && d.penance && !d.penance.paidAt);
+    if (!debt?.penance) return { status: 409, body: { error: "no unpaid penance" } };
+    if (state.images.some((r) => r.sha256 === sha && r.verdict === "accepted"))
+      return { status: 409, body: { error: "that photo already counted for something" } };
+    const record = [...state.images].reverse().find((r) => r.sha256 === sha && r.verdict === "rejected");
+    if (!record) return { status: 404, body: { error: "no refused photo with that hash" } };
+    const sent = Date.parse(record.at);
+    if (now - sent > PENANCE_CREDIT_MAX_AGE_MS) return { status: 409, body: { error: "the photo is more than 24 hours old" } };
+    if (sent < Date.parse(debt.penance.setAt)) return { status: 409, body: { error: "the photo was sent before the penance was set" } };
+    const fits = record.kind === "penance" || penanceProofKinds(debt.penance.description).includes(record.kind as ProofKind);
+    if (!fits)
+      return {
+        status: 409,
+        body: { error: `the photo was classified as ${record.kind ?? "nothing"}, which this penance does not ask for` },
+      };
+    const slot = `penance/${debt.id}`;
+    record.verdict = "accepted";
+    record.slot = slot;
+    record.manual = { verifier: by };
+    record.reason = `${record.reason ?? ""} [credited for the penance at ${new Date(now).toISOString()} by ${by}: ${reason}]`.trim();
+    state.filled[slot] = record.at;
+    debt.penance.paidAt = record.at;
+    debt.status = "paid";
+    saveState(state);
+    release(state, now, "photo accepted");
+    return { status: 200, body: { ok: true, debt: debt.id, slot, gate: gateStatus() } };
+  });
+}
+
 export async function resolveDebt(
   id: string,
   body: { verdict?: unknown; reason?: unknown; penance?: unknown },
@@ -1382,6 +1447,19 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
     });
   }
   const ruling = /^\/hygiene\/debt\/([A-Za-z0-9-]+)\/resolve$/.exec(url.pathname);
+  // Pays the open penance with a photo the gate already saw and wrongly refused. Local route,
+  // like /hygiene/debt; logged on the photo's record.
+  const credit = /^\/hygiene\/images\/([0-9a-f]{64})\/credit-penance$/.exec(url.pathname);
+  if (credit && request.method === "POST") {
+    let body: Record<string, unknown> = {};
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return Response.json({ error: "body must be JSON" }, { status: 400 });
+    }
+    const result = await creditPenancePhoto(credit[1], body);
+    return Response.json(result.body, { status: result.status });
+  }
   if (ruling && request.method === "POST") {
     let body: Record<string, unknown> = {};
     try {

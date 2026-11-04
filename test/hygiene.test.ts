@@ -13,7 +13,7 @@ import {
   zonedTime,
   type GateState,
 } from "../src/hygiene";
-import { captureTime, classifierPrompt, dhashFromGray, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps, exiftoolBin } from "../src/hygiene-proof";
+import { captureTime, classifierPrompt, dhashFromGray, penanceProofKinds, gpsFix, hammingDistance, parseCaptureTime, parseGpsFix, parseVerdict, parseWeightReading, stripGps, exiftoolBin } from "../src/hygiene-proof";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 /** Vancouver wall time on a given day, e.g. at("2026-10-08", "05:00"). */
@@ -197,6 +197,13 @@ describe("requirements", () => {
     const penanceOnly = classifierPrompt({ kinds: ["penance"], penance: "a photo of the sunrise" });
     expect(penanceOnly).toContain("images with no person that match none of the kinds above.");
     expect(penanceOnly).not.toContain("or images with no person.");
+    // A time in the penance can't be seen in a photo; the classifier must not refuse it for that (Nov 4).
+    expect(penanceOnly).toContain("never refuse the penance for it");
+    expect(plain).not.toContain("never refuse the penance");
+    expect(penanceProofKinds("Photo of you brushing your teeth before bed")).toEqual(["teeth"]);
+    expect(penanceProofKinds("photo of you on a walk outside")).toEqual(["walk"]);
+    expect(penanceProofKinds("a photo of the sunrise")).toEqual([]);
+    expect(penanceProofKinds(undefined)).toEqual([]);
     expect(parseVerdict({ kind: "walk", confidence: 0.8, reason: "street", reading: "" }).kind).toBe("walk");
   });
 });
