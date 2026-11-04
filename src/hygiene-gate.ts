@@ -109,6 +109,7 @@ import {
   type WakeSender,
 } from "./hygiene-wake";
 import { relaySender, startPhoneWake, wakeFilePath, type PhoneWakeSender } from "./phone-wake";
+import { ensurePhrase, isBypassAttempt, matchesPhrase, randomWords, retire } from "./bypass-phrase";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -129,6 +130,8 @@ export type GateDeps = {
   wake: WakeSender;
   /** Longest a human turn waits for a fresh Uplifting read before deciding (gym-sync.ts). */
   gymRefreshMs: number;
+  /** Three fresh BYPASS words for a new lock (bypass-phrase.ts). */
+  bypassWords: () => string;
 };
 
 const defaults: GateDeps = {
@@ -142,6 +145,7 @@ const defaults: GateDeps = {
   baseUrl: `http://127.0.0.1:${process.env.PORT ?? 3456}`,
   wake: todayWake,
   gymRefreshMs: 5_000,
+  bypassWords: () => randomWords(),
 };
 let deps: GateDeps = { ...defaults };
 
@@ -565,7 +569,7 @@ async function checkImage(
   } catch (error) {
     // Not recorded: the same photo can be retried once the checker works.
     console.error("hygiene-gate: classifier failed:", (error as Error).message);
-    return { line: "⚠️ couldn't check the photo (classifier error). Send it again, or reply BYPASS.", retry: true };
+    return { line: "⚠️ couldn't check the photo (classifier error). Send it again, or reply the BYPASS line below.", retry: true };
   }
   record.kind = verdict.kind;
   record.reason = verdict.reason;
@@ -648,11 +652,45 @@ async function checkImage(
   return { line: `✅ ${slotLabel(target, state)} photo accepted${reading ? ` (${reading})` : ""}.` };
 }
 
-function bypassReply(state: GateState, now: number): string {
+/** This lock's BYPASS words, issuing fresh ones for a new lock (the caller saves the state). */
+function lockPhrase(state: GateState, due: { slot: string }[], now: number): { words: string; changed: boolean } {
+  return ensurePhrase(state.bypass, due.map((r) => r.slot), now, deps.bypassWords);
+}
+
+/** The line that opens the current lock ("BYPASS w1 w2 w3"), or null when nothing locks. */
+export async function bypassChallenge(): Promise<string | null> {
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    const due = outstanding(state, now);
+    if (!due.length || bypassActive(state, now)) return null;
+    const { words, changed } = lockPhrase(state, due, now);
+    if (changed) saveState(state);
+    return `BYPASS ${words}`;
+  });
+}
+
+/**
+ * A BYPASS attempt. Only this lock's exact "BYPASS w1 w2 w3" opens the gate; a
+ * bare BYPASS, a typo or an earlier lock's words get the lock text again with
+ * the current phrase. Counting, the 1 h window and the debt are unchanged.
+ */
+function bypassReply(state: GateState, now: number, text: string): string {
   if (bypassActive(state, now))
     return `🚪 bypass already open until ${clockLabel(Date.parse(state.bypass.until!))}.`;
   const due = outstanding(state, now);
-  if (!due.length) return "✅ gate is already clear; no bypass used.";
+  if (!due.length) {
+    retire(state.bypass);
+    return "✅ gate is already clear; no bypass used.";
+  }
+  const { words } = lockPhrase(state, due, now);
+  if (!matchesPhrase(text, words)) {
+    const why = /^bypass$/i.test(text.trim().replace(/[.!?,]+$/, ""))
+      ? "🔑 BYPASS needs this lock's three words."
+      : "🔑 That isn't this lock's BYPASS phrase.";
+    return lockedText(due, [why], words);
+  }
+  retire(state.bypass);
   const at = new Date(now).toISOString();
   state.bypass.count += 1;
   state.bypass.until = new Date(now + BYPASS_MS).toISOString();
@@ -765,6 +803,8 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
         state.bypass.history.push(new Date(anchor).toISOString());
         const current = state.bypass.until ? Date.parse(state.bypass.until) : 0;
         if (until > current) state.bypass.until = new Date(until).toISOString();
+        // The gate opened: when it locks again, the lock gets new words.
+        retire(state.bypass);
       }
     }
     // The gate's own end, which a longer bypass already open may set: the phone re-locks from it.
@@ -787,13 +827,15 @@ function delayReply(state: GateState, now: number): string {
     return `⏰ delay already open until ${clockLabel(Date.parse(state.delay.until!))}. Send the morning photo when you can.`;
   if (!due.length) return "✅ gate is already clear; no delay used.";
   if (!morningOnly || minutes < MORNING_MINUTE || minutes >= DELAY_END_MINUTE)
-    return "DELAY only postpones the morning photos (05:00 to 12:00). For anything else, send the photo or reply BYPASS.";
+    return `DELAY only postpones the morning photos (05:00 to 12:00). For anything else, send the photo or reply BYPASS ${lockPhrase(state, due, now).words}.`;
   if (state.delay.history.includes(day))
-    return `DELAY was already used this morning. Send the ${photos}, or reply BYPASS.`;
+    return `DELAY was already used this morning. Send the ${photos}, or reply BYPASS ${lockPhrase(state, due, now).words}.`;
   state.delay.count += 1;
   state.delay.until = new Date(now + DELAY_MS).toISOString();
   state.delay.day = day;
   state.delay.history.push(day);
+  // The gate opens for the delay; when it relocks, that's a new lock with new words.
+  retire(state.bypass);
   return `⏰ delay: gate open until ${clockLabel(now + DELAY_MS)}. Send the ${photos} before then.`;
 }
 
@@ -861,7 +903,7 @@ function checkingReply(
   state: GateState,
   origin: GateOrigin,
 ): GateDecision | null {
-  if (turn.images.length || turn.text === "BYPASS" || isDelayText(turn.text)) return null;
+  if (turn.images.length || isBypassAttempt(turn.text) || isDelayText(turn.text)) return null;
   const now = deps.now();
   if (!armed(state, now) || !photoChecking(statePath())) return null;
   const key = messageKeys(request.input as ResponseInputItem[]).get(turn.newest) ?? "";
@@ -895,8 +937,8 @@ async function decideHumanTurn(
   let dirty = false;
   let gymOpened = false;
 
-  if (turn.text === "BYPASS" && !turn.images.length) {
-    const text = bypassReply(state, now);
+  if (isBypassAttempt(turn.text) && !turn.images.length) {
+    const text = bypassReply(state, now, turn.text);
     saveState(state);
     release(state, now, "BYPASS");
     return { action: "respond", text };
@@ -921,7 +963,8 @@ async function decideHumanTurn(
 
   const due = outstanding(state, now);
   if (due.length && !bypassActive(state, now)) {
-    if (dirty) saveState(state);
+    const { words, changed } = lockPhrase(state, due, now);
+    if (dirty || changed) saveState(state);
     holdMessage(statePath(), {
       thread,
       machine: origin.machine,
@@ -930,8 +973,10 @@ async function decideHumanTurn(
       text: turn.text,
       attachments,
     });
-    return { action: "respond", text: lockedText(due, lines) };
+    return { action: "respond", text: lockedText(due, lines, words) };
   }
+  // The gate is open: this lock's phrase is spent, and the next lock gets new words.
+  if (!due.length && retire(state.bypass)) dirty = true;
 
   // Let the turn through, once per thread telling the model about open debts.
   const newestKey = keys.get(turn.newest);

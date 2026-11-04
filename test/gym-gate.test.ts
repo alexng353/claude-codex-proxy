@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_GYM_SETTINGS, type UpliftingFeed } from "../src/gym";
 import { refreshIfDeciding, setGymFetcher, startGymSync } from "../src/gym-sync";
 import { zonedTime } from "../src/hygiene";
-import { gateRequest, handleHygieneRoute, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
+import { bypassChallenge, gateRequest, handleHygieneRoute, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 const at = (day: string, time: string) => {
@@ -436,9 +436,10 @@ describe("gym on the gate", () => {
 
     clock = at(DAY, "18:31");
     // The turn reads Uplifting first: nothing there, so the plan is missed.
-    expect(await reply("hi")).toBe(
+    const lock = await reply("hi");
+    expect(lock).toBe(
       "💪 gate armed: gym session planned Thu, Nov 5 18:00 (no Start at the gym by 18:30)\n" +
-        "Log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply BYPASS.",
+        `Log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply ${await bypassChallenge()}.`,
     );
     expect(reads).toBeGreaterThan(0);
 

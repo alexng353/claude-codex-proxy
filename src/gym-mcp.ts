@@ -21,7 +21,7 @@ export const TOOLS = [
   {
     name: "gym_plan_add",
     description:
-      "Plan a gym session Alex told you about. If he hasn't tapped Start in Uplifting at Gold's by start + grace, his hygiene gate locks until he logs a qualifying session or replies BYPASS. Only add plans Alex stated.",
+      "Plan a gym session Alex told you about. If he hasn't tapped Start in Uplifting at Gold's by start + grace, his hygiene gate locks until he logs a qualifying session or replies the lock's BYPASS phrase. Only add plans Alex stated.",
     inputSchema: {
       type: "object",
       properties: {

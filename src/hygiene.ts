@@ -19,12 +19,14 @@
  *   are due by midnight. If either is missing at 00:00 the gate locks until
  *   it is supplied. That overdue lock is separate from the next morning's
  *   teeth requirement: one photo fills one requirement.
- * - BYPASS opens the gate for an hour and opens a debt, which the model
- *   rules on and may turn into a penance photo requirement.
+ * - "BYPASS" plus the lock's three words (bypass-phrase.ts) opens the gate for
+ *   an hour and opens a debt, which the model rules on and may turn into a
+ *   penance photo requirement.
  * - Planned gym sessions (gym.ts): a plan with no Start at the gym in
  *   Uplifting by its start plus a grace locks until a qualifying session.
  */
 import { createHash } from "node:crypto";
+import type { BypassPhraseState } from "./bypass-phrase";
 import { gymDueToday, gymOutstanding, type GymState } from "./gym";
 import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from "./types";
 import { existsSync } from "node:fs";
@@ -139,7 +141,8 @@ export type GateState = {
   images: ImageRecord[];
   /** Requirement slot -> ISO time it was filled. */
   filled: Record<string, string>;
-  bypass: { count: number; until: string | null; history: string[] };
+  /** BYPASS uses, the open window, and the current lock's three-word challenge (bypass-phrase.ts). */
+  bypass: { count: number; until: string | null; history: string[] } & BypassPhraseState;
   /** DELAY: one 2-hour postponement of the morning teeth photo per morning. */
   delay: { count: number; until: string | null; day: string | null; history: string[] };
   debts: Debt[];
@@ -997,7 +1000,8 @@ const EMOJI: Record<Requirement["kind"], string> = {
   gym: "💪",
 };
 
-export function lockedText(requirements: Requirement[], results: string[] = []): string {
+/** `phrase`: this lock's three BYPASS words; the gate always passes them. */
+export function lockedText(requirements: Requirement[], results: string[] = [], phrase?: string): string {
   const photos = requirements.some((r) => r.kind !== "gym");
   const gym = requirements.some((r) => r.kind === "gym");
   const unlock = [
@@ -1007,7 +1011,7 @@ export function lockedText(requirements: Requirement[], results: string[] = []):
   return [
     ...results,
     `${EMOJI[requirements[0].kind]} gate armed: ${requirements.map((r) => r.label).join(", ")}`,
-    `${unlock[0].toUpperCase()}${unlock.slice(1)} to unlock, or reply BYPASS.`,
+    `${unlock[0].toUpperCase()}${unlock.slice(1)} to unlock, or reply BYPASS${phrase ? ` ${phrase}` : ""}.`,
   ].join("\n");
 }
 
