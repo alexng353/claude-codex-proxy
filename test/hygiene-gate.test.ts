@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { handleRequest } from "../src/app";
 import { closeIdleWorkers } from "../src/claude";
-import { zonedTime } from "../src/hygiene";
+import { isWithheld, zonedTime } from "../src/hygiene";
 import { setAuthenticator } from "../src/hygiene-api";
 import { wakeCommand } from "../src/hygiene-wake";
 import { flushWakes, gateRequest, gateStatus, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
@@ -429,7 +429,7 @@ describe("BYPASS, debt and penance", () => {
     clock = at(DAY, "07:30");
     const path = process.env.HYGIENE_GATE_STATE!;
     const raw = JSON.parse(await readFile(path, "utf8"));
-    const refused = (sha: string, kind: string) => ({
+    const refused = (sha: string, kind: string, extra: Record<string, unknown> = {}) => ({
       sha256: sha.repeat(64),
       dhash: null,
       at: new Date(clock - 60_000).toISOString(),
@@ -437,8 +437,18 @@ describe("BYPASS, debt and penance", () => {
       kind,
       verdict: "rejected",
       reason: "not penance",
+      confidence: 0.95,
+      ...extra,
     });
-    raw.images.push(refused("a", "teeth"), refused("b", "shower"));
+    raw.images.push(
+      refused("a", "teeth"),
+      refused("b", "shower"),
+      refused("d", "teeth", { at: new Date(clock - 25 * 3_600_000).toISOString() }),
+      refused("e", "teeth", { at: new Date(at(DAY, "05:30")).toISOString() }),
+      refused("f", "teeth", { confidence: 0.3 }),
+      refused("9", "teeth", { confidence: undefined }),
+      refused("8", "teeth", { at: "not a time" }),
+    );
     await writeFile(path, JSON.stringify(raw));
     resetGateCache();
     const credit = (sha: string, body: unknown) =>
@@ -447,16 +457,49 @@ describe("BYPASS, debt and penance", () => {
     expect((await credit("a", {})).status).toBe(400);
     expect((await credit("c", reason)).status).toBe(404);
     expect((await credit("b", reason)).status).toBe(409);
+    // More than 24 h old, sent before the penance was set, not clear enough, no confidence kept, bad time.
+    for (const sha of ["d", "e", "f", "9", "8"]) expect((await credit(sha, reason)).status).toBe(409);
+    expect(gateStatus().openDebts).toHaveLength(1);
     const ok = await credit("a", reason);
     expect(ok.status).toBe(200);
     expect(await ok.json()).toMatchObject({ ok: true, debt: "2026-10-08-1", slot: "penance/2026-10-08-1" });
     expect(gateStatus().openDebts).toEqual([]);
     const state = JSON.parse(await readFile(path, "utf8"));
     const record = state.images.find((r: { sha256: string }) => r.sha256 === "a".repeat(64));
-    expect(record).toMatchObject({ verdict: "accepted", slot: "penance/2026-10-08-1", manual: { verifier: "test" } });
-    expect(record.reason).toContain("credited for the penance");
-    expect(state.debts[0]).toMatchObject({ status: "paid", penance: { paidAt: record.at } });
+    expect(record).toMatchObject({
+      verdict: "accepted",
+      slot: "penance/2026-10-08-1",
+      credited: { by: "test", reason: "refused by the penance matcher bug", at: new Date(clock).toISOString() },
+    });
+    // A credited bathroom photo stays out of the chats it was sent in.
+    expect(record.manual).toBeUndefined();
+    expect(isWithheld(record)).toBe(true);
+    // Paid now, not at the photo's time.
+    expect(state.debts[0]).toMatchObject({ status: "paid", penance: { paidAt: new Date(clock).toISOString() } });
     expect((await credit("a", reason)).status).toBe(409);
+  });
+
+  test("a photo credited by 2583b55 (marked manual) is moved to credited on load, so it is withheld again", async () => {
+    const path = process.env.HYGIENE_GATE_STATE!;
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    raw.images.push({
+      sha256: "a".repeat(64),
+      dhash: null,
+      at: new Date(clock).toISOString(),
+      source: { thread: THREAD, key: "k" },
+      kind: "teeth",
+      verdict: "accepted",
+      slot: "penance/x",
+      manual: { verifier: "gym-gate" },
+      reason: "brushing [credited for the penance at 2026-10-08T13:00:00.000Z by gym-gate: matcher bug]",
+    });
+    await writeFile(path, JSON.stringify(raw));
+    resetGateCache();
+    const state = await (await handleRequest(new Request("http://localhost/hygiene/state"))).json();
+    const record = state.images.at(-1);
+    expect(record.manual).toBeUndefined();
+    expect(record.credited).toEqual({ by: "gym-gate", reason: "matcher bug", at: "2026-10-08T13:00:00.000Z" });
+    expect(isWithheld(record)).toBe(true);
   });
 
   test("a penance can be revised to justified within 12 h, with a reason; the old verdict is kept", async () => {
@@ -516,7 +559,7 @@ describe("BYPASS, debt and penance", () => {
     const state = JSON.parse(raw);
     const accepted = state.images.find((i: { verdict: string }) => i.verdict === "accepted");
     expect(accepted).toMatchObject({ slot: `${DAY}/morning-teeth`, kind: "teeth" });
-    expect(Object.keys(accepted).sort()).toEqual(["at", "dhash", "file", "kind", "locked", "reason", "sha256", "slot", "source", "verdict"]);
+    expect(Object.keys(accepted).sort()).toEqual(["at", "confidence", "dhash", "file", "kind", "locked", "reason", "sha256", "slot", "source", "verdict"]);
     expect(accepted.locked).toBe(true);
     const root = process.env.HYGIENE_PHOTO_DIR!;
     expect(accepted.file).toBe(join(root, "2026", "10", "08", `teeth-060000-${accepted.sha256.slice(0, 8)}.jpg`));

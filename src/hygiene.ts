@@ -87,6 +87,14 @@ export type ImageRecord = {
    * never rewrites the history it already appeared in.
    */
   manual?: { verifier: string };
+  /**
+   * Paid an open penance from its stored verdict after the gate refused it by mistake
+   * (POST /hygiene/images/:sha/credit-penance). Unlike `manual`, the photo stays withheld
+   * from chats: its bytes may still be in a thread's history.
+   */
+  credited?: { by: string; reason: string; at: string };
+  /** The classifier's probability for `kind`, when one ran. */
+  confidence?: number;
   /** Where an accepted photo was saved (original bytes, EXIF intact). */
   file?: string;
   /** The gate was locked (and not bypassed) when this photo was checked. */

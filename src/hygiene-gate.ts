@@ -207,6 +207,14 @@ export function loadState(): GateState {
   }
   // Older plans get the proof mode and tag they were made under (gym.ts stampPlanSettings).
   stampPlanSettings(state.gym);
+  // 2583b55 marked a credited penance photo `manual`, which un-withholds it from chats.
+  // Move such records to `credited` (comb of 2583b55, Nov 4).
+  for (const r of state.images) {
+    const m = r.manual && /\[credited for the penance at (\S+) by (.+?): (.*)\]$/.exec(r.reason ?? "");
+    if (!m) continue;
+    r.credited = { by: m[2], reason: m[3], at: m[1] };
+    delete r.manual;
+  }
   cache = { path, mtimeMs, state };
   setZoneHistory(state.zones);
   return repairView(state);
@@ -597,6 +605,8 @@ async function checkImage(
   }
   record.kind = verdict.kind;
   record.reason = verdict.reason;
+  // Kept so a later credit can tell "the wrong kind" from "not clear enough".
+  if (Number.isFinite(verdict.confidence)) record.confidence = verdict.confidence;
   // A penance that asks for an everyday kind ("brushing your teeth before bed") takes that
   // kind's verdict when the kind itself isn't due, instead of refusing the very photo it asked
   // for as "not due" (Nov 4 01:23).
@@ -1348,6 +1358,7 @@ export async function creditPenancePhoto(
     const record = [...state.images].reverse().find((r) => r.sha256 === sha && r.verdict === "rejected");
     if (!record) return { status: 404, body: { error: "no refused photo with that hash" } };
     const sent = Date.parse(record.at);
+    if (!Number.isFinite(sent)) return { status: 409, body: { error: "that photo's record has no usable timestamp" } };
     if (now - sent > PENANCE_CREDIT_MAX_AGE_MS)
       return { status: 409, body: { error: "the photo is more than 24 hours old" } };
     if (sent < Date.parse(debt.penance.setAt))
@@ -1359,16 +1370,23 @@ export async function creditPenancePhoto(
         status: 409,
         body: { error: `the photo was classified as ${record.kind ?? "nothing"}, which this penance does not ask for` },
       };
+    // A photo refused as "not clear enough" was judged on its merits, not by the matcher bug.
+    // Records from before confidences were stored can't show that, so they can't be credited.
+    if (!((record.confidence ?? 0) >= MIN_CONFIDENCE))
+      return { status: 409, body: { error: "the gate refused that photo as not clear enough (or kept no confidence), not as the wrong kind" } };
     const slot = `penance/${debt.id}`;
+    const atNow = new Date(now).toISOString();
     record.verdict = "accepted";
     record.slot = slot;
-    record.manual = { verifier: by };
-    record.reason =
-      `${record.reason ?? ""} [credited for the penance at ${new Date(now).toISOString()} by ${by}: ${reason}]`.trim();
-    state.filled[slot] = record.at;
-    debt.penance.paidAt = record.at;
+    // Not `manual`: that would un-withhold the photo from any chat it was sent in.
+    record.credited = { by, reason, at: atNow };
+    // Paid now, not at the photo's time, so a shield tap made while the penance locked the gate
+    // is still charged (shieldTapFree reads both).
+    state.filled[slot] = atNow;
+    debt.penance.paidAt = atNow;
     debt.status = "paid";
     saveState(state);
+    console.error(`hygiene-gate: penance ${debt.id} credited from photo ${sha.slice(0, 12)} by ${by}: ${reason.slice(0, 120)}`);
     release(state, now, "photo accepted");
     return { status: 200, body: { ok: true, debt: debt.id, slot, gate: gateStatus() } };
   });
