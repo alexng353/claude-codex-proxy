@@ -1760,9 +1760,28 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
     const reply = text(await decide(request([env, user("bypass the cache in foo.ts")])))!;
     expect(reply).toStartWith("🪥 gate armed");
     expect(held()).toContain("bypass the cache in foo.ts");
-    // With the gate clear it goes to the model as usual.
+    expect(text(await decide(request([env, user(BYPASS)])))).toStartWith("🚪 bypass #1");
+    // With a bypass open, or nothing locked, text that only looks like an attempt goes to the model.
+    for (const message of ["BYPASS phrase is annoying, change it", "bypass cookie"])
+      expect((await decide(request([env, user(message)]))).action).toBe("forward");
+    expect(text(await decide(request([env, user("BYPASS")])))).toBe("🚪 bypass already open until 07:00.");
+    expect(text(await decide(request([env, user(BYPASS)])))).toBe("🚪 bypass already open until 07:00.");
+  });
+
+  test("on a clear gate only a bare BYPASS or a full phrase is answered; anything else goes to the model", async () => {
     clock = at(DAY, "04:00");
-    expect((await decide(request([env, user("bypass the cache in foo.ts")]))).action).toBe("forward");
+    for (const message of ["bypass the cache in foo.ts", "BYPASS phrase is annoying, change it", "bypass cookie"])
+      expect((await decide(request([env, user(message)]))).action).toBe("forward");
+    for (const attempt of ["BYPASS", "BYPASS cedar comet tulip"])
+      expect(text(await decide(request([env, user(attempt)])))).toBe("✅ gate is already clear; no bypass used.");
+    expect(gateStatus().bypass.count).toBe(0);
+  });
+
+  test("a typo'd phrase is refused as an attempt, not held as a message", async () => {
+    clock = at(DAY, "06:00");
+    const lock = text(await decide(request([env, user("hi")])))!;
+    expect(text(await decide(request([env, user("Bypass mapel river otter")])))).toBe(`🔑 That isn't this lock's BYPASS phrase.\n${lock}`);
+    expect(held()).not.toContain("mapel");
   });
 
   test("a DELAY opens the gate, so the relock after it has new words even with no turn in between", async () => {

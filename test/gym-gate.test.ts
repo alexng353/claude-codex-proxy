@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DEFAULT_GYM_SETTINGS, type UpliftingFeed } from "../src/gym";
 import { refreshIfDeciding, setGymFetcher, startGymSync } from "../src/gym-sync";
 import { zonedTime } from "../src/hygiene";
-import { bypassChallenge, gateRequest, handleHygieneRoute, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
+import { gateRequest, handleHygieneRoute, resetGateCache, setGateDeps, submitProof } from "../src/hygiene-gate";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 const at = (day: string, time: string) => {
@@ -49,7 +49,7 @@ beforeEach(async () => {
   clock = at(DAY, "12:00");
   uplifting = { checkins: [], workouts: [] };
   reads = 0;
-  setGateDeps({ now: () => clock, wake: async () => "sent" });
+  setGateDeps({ now: () => clock, wake: async () => "sent", bypassWords: () => "maple river otter" });
   setGymFetcher(async () => {
     reads++;
     if (uplifting instanceof Error) throw uplifting;
@@ -436,10 +436,9 @@ describe("gym on the gate", () => {
 
     clock = at(DAY, "18:31");
     // The turn reads Uplifting first: nothing there, so the plan is missed.
-    const lock = await reply("hi");
-    expect(lock).toBe(
+    expect(await reply("hi")).toBe(
       "💪 gate armed: gym session planned Thu, Nov 5 18:00 (no Start at the gym by 18:30)\n" +
-        `Log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply ${await bypassChallenge()}.`,
+        "Log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on) to unlock, or reply BYPASS maple river otter.",
     );
     expect(reads).toBeGreaterThan(0);
 

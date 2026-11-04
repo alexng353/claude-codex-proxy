@@ -109,7 +109,7 @@ import {
   type WakeSender,
 } from "./hygiene-wake";
 import { relaySender, startPhoneWake, wakeFilePath, type PhoneWakeSender } from "./phone-wake";
-import { ensurePhrase, isBypassAttempt, matchesPhrase, randomWords, retire } from "./bypass-phrase";
+import { ensurePhrase, isBareBypass, isBypassAttempt, matchesPhrase, randomWords, retire } from "./bypass-phrase";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -657,19 +657,6 @@ function lockPhrase(state: GateState, due: { slot: string }[], now: number): { w
   return ensurePhrase(state.bypass, due.map((r) => r.slot), now, deps.bypassWords);
 }
 
-/** The line that opens the current lock ("BYPASS w1 w2 w3"), or null when nothing locks. */
-export async function bypassChallenge(): Promise<string | null> {
-  return serialized(async () => {
-    const state = structuredClone(loadState());
-    const now = deps.now();
-    const due = outstanding(state, now);
-    if (!due.length || bypassActive(state, now)) return null;
-    const { words, changed } = lockPhrase(state, due, now);
-    if (changed) saveState(state);
-    return `BYPASS ${words}`;
-  });
-}
-
 /**
  * A BYPASS attempt. Only this lock's exact "BYPASS w1 w2 w3" opens the gate; a
  * bare BYPASS, a typo or an earlier lock's words get the lock text again with
@@ -937,7 +924,11 @@ async function decideHumanTurn(
   let dirty = false;
   let gymOpened = false;
 
-  if (isBypassAttempt(turn.text) && !turn.images.length) {
+  // A bare BYPASS or a full phrase is answered in every state, as a bare BYPASS was
+  // before; looser shapes only while the gate is armed, so a clear or open gate never
+  // swallows ordinary text.
+  const locked = outstanding(state, now).length > 0 && !bypassActive(state, now);
+  if (!turn.images.length && (isBareBypass(turn.text) || (locked && isBypassAttempt(turn.text)))) {
     const text = bypassReply(state, now, turn.text);
     saveState(state);
     release(state, now, "BYPASS");

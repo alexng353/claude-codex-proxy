@@ -102,16 +102,32 @@ export function normalizeAttempt(text: string): string {
 }
 
 /**
- * Whether a turn is a BYPASS attempt (right, wrong, stale or bare), so it is
- * answered by the gate and never held or forwarded as a message: a bare
- * "bypass" in any case, anything starting with the word BYPASS in capitals (as
- * before), or "bypass" followed by up to three words from the list (a phone
- * capitalises the first letter). "bypass the cache" is an ordinary message.
+ * A bare "BYPASS", or "BYPASS" plus exactly three words from the list (any
+ * case): plainly an attempt, so the gate answers it in every state, as it did
+ * a bare BYPASS before ("already clear", "already open", or the lock text).
+ */
+export function isBareBypass(text: string): boolean {
+  const [first, ...words] = normalizeAttempt(text).split(" ");
+  return first === "bypass" && (words.length === 0 || (words.length === 3 && words.every((word) => WORD_SET.has(word))));
+}
+
+/**
+ * Whether a turn is a BYPASS attempt (right, wrong, stale or bare), so a
+ * locked gate answers it instead of holding it as a message. Only counts while
+ * the gate is armed (the caller checks), so a clear gate never swallows text:
+ * - a bare "bypass", any case;
+ * - anything starting with the word BYPASS in capitals;
+ * - "bypass" plus up to three words that are all in the list (a phone
+ *   capitalises the first letter);
+ * - "bypass" plus exactly three words, two of them in the list (a typo).
+ * "bypass the cache in foo.ts" is an ordinary message.
  */
 export function isBypassAttempt(text: string): boolean {
-  if (/^BYPASS(\s|[.!?,]*$)/.test(text.trim())) return true;
-  const parts = normalizeAttempt(text).split(" ");
-  return parts[0] === "bypass" && parts.length <= 4 && parts.slice(1).every((word) => WORD_SET.has(word));
+  if (isBareBypass(text) || /^BYPASS(\s|[.!?,]*$)/.test(text.trim())) return true;
+  const [first, ...words] = normalizeAttempt(text).split(" ");
+  if (first !== "bypass" || words.length > 3) return false;
+  const known = words.filter((word) => WORD_SET.has(word)).length;
+  return known === words.length || (words.length === 3 && known >= 2 && words.every((word) => /^[a-z]{2,10}$/.test(word)));
 }
 
 /** Whether `text` is exactly this phrase's BYPASS line (case and spacing aside). */

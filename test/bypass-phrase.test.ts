@@ -32,9 +32,9 @@ describe("BYPASS words", () => {
 
 describe("attempts and matching", () => {
   test("what counts as a BYPASS attempt", () => {
-    for (const yes of ["BYPASS", "bypass", "Bypass.", "BYPASS please", "BYPASS maple river otter", "Bypass maple river otter", "bypass  cedar"])
+    for (const yes of ["BYPASS", "bypass", "Bypass.", "BYPASS please", "BYPASS maple river otter", "Bypass maple river otter", "bypass  cedar", "Bypass mapel river otter"])
       expect(isBypassAttempt(yes)).toBe(true);
-    for (const no of ["bypass the cache in foo.ts", "bypassing", "BYPASSES", "can I bypass", "bypass maple river otter tulip", ""])
+    for (const no of ["bypass the cache in foo.ts", "bypass the cache now", "bypass the river", "bypassing", "BYPASSES", "can I bypass", "bypass maple river otter tulip", ""])
       expect(isBypassAttempt(no)).toBe(false);
   });
 
