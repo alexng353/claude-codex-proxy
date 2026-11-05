@@ -63,6 +63,15 @@ import {
   setZoneHistory,
   zoneAt,
   TIME_ZONE,
+  MAX_MOVES_PER_DAY,
+  chargeBrokenMoves,
+  movableSlots,
+  moveSlots,
+  movesToday,
+  parseMoveText,
+  resolveMoveTime,
+  type MoveCommand,
+  type SlotMove,
   type Debt,
   type GateState,
   type ImageRecord,
@@ -96,7 +105,9 @@ import {
   addPause,
   endPause,
   gymSettings,
+  reschedulePlan,
   when as vancouverLabel,
+  type GymPlan,
   type GymState,
   type PlanEdit,
 } from "./gym";
@@ -241,6 +252,7 @@ function saveState(state: GateState): void {
   const cutoff = deps.now() - RETAIN_MS;
   state.images = state.images.filter((image) => Date.parse(image.at) >= cutoff);
   state.bypass.history = state.bypass.history.filter((at) => Date.parse(at) >= cutoff);
+  if (state.moves) state.moves = state.moves.filter((m) => Date.parse(m.at) >= cutoff);
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   renameSync(temporary, path);
@@ -781,6 +793,8 @@ function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
   if (state.gym?.sessions.some((s) => after(s.seenAt))) return false;
   if (state.gym?.checkins.some((c) => after(c.receivedAt))) return false;
   if (state.delay.until && Date.parse(state.delay.until) - DELAY_MS > anchor) return false;
+  // A MOVE after the tap may have cleared a lock that held at the tap.
+  if (state.moves?.some((m) => after(m.at))) return false;
   return true;
 }
 
@@ -880,6 +894,91 @@ function delayReply(state: GateState, now: number): string {
   return `⏰ delay: gate open until ${clockLabel(now + DELAY_MS)}. Send the ${photos} before then.`;
 }
 
+export type MoveOutcome =
+  | { ok: true; message: string; moved: SlotMove[]; plan?: GymPlan }
+  | { ok: false; error: string };
+
+/**
+ * MOVE/LATER (hygiene.ts): reschedules photo requirements, or today's gym plan,
+ * to later today. Never a BYPASS: the bypass count and debts are untouched.
+ * Mutates `state` only on success (the caller saves it).
+ */
+function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string): MoveOutcome {
+  const time = resolveMoveTime(cmd.time, now, cmd.otherDay);
+  if ("error" in time) return { ok: false, error: time.error };
+  if (cmd.gym) {
+    const today = localTime(now).day;
+    const todays = evaluateGym(state.gym, now)
+      .filter((r) => localTime(Date.parse(r.plan.start)).day === today && r.status !== "cancelled")
+      .sort((a, b) => Date.parse(a.plan.start) - Date.parse(b.plan.start));
+    const open = todays.find((r) => r.status === "upcoming" || r.status === "in-progress");
+    if (!open) {
+      const missed = todays.find((r) => r.status === "missed");
+      return {
+        ok: false,
+        error: missed
+          ? `today's gym plan (${clockLabel(Date.parse(missed.plan.start))}) was already missed; a move never erases a miss. Log a session in Uplifting, or reply BYPASS`
+          : "there is no gym plan left today to move",
+      };
+    }
+    const r = reschedulePlan(state.gym!, open.plan.id, new Date(time.at).toISOString(), now, by);
+    if (!r.ok) return { ok: false, error: r.error };
+    return { ok: true, message: `🏋️ gym ${r.message}. No bypass, no debt.`, moved: [], plan: r.plan };
+  }
+  const locking = outstanding(state, now).map((r) => r.slot);
+  const movable = movableSlots(state, now);
+  let names: string[];
+  if (cmd.items === null) {
+    names = locking.filter((s) => movable.includes(s));
+    if (!names.length)
+      return {
+        ok: false,
+        error: locking.length
+          ? "only photo requirements can move; a penance or a missed gym session can't"
+          : "nothing locks now, so there is nothing to move. To move a photo before it is due, name it: MOVE teeth 08:00",
+      };
+  } else {
+    const named = movable.filter((s) => cmd.items!.includes(itemKey(s)));
+    const lockingNamed = named.filter((s) => locking.includes(s));
+    names = lockingNamed.length ? lockingNamed : named;
+    if (!names.length) return { ok: false, error: "nothing by that name is due today that can move (tonight's photos are due by midnight already)" };
+  }
+  const r = moveSlots(state, names, time.at, now, by);
+  if (!r.ok) return { ok: false, error: r.error };
+  const left = Math.min(...names.map((n) => MAX_MOVES_PER_DAY - movesToday(state, n, now).length));
+  return {
+    ok: true,
+    message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); if it isn't done by midnight it counts as a skip.`,
+    moved: r.moved,
+  };
+}
+
+function moveReply(state: GateState, now: number, cmd: MoveCommand, by: string): string {
+  const outcome = applyMove(state, now, cmd, by);
+  const line = outcome.ok ? outcome.message : `⏩ can't move: ${outcome.error}.`.replace(/\.\.$/, ".");
+  const due = outstanding(state, now);
+  if (!due.length) {
+    retire(state.bypass);
+    return line;
+  }
+  if (bypassActive(state, now)) return line;
+  return lockedText(due, [line], lockPhrase(state, due, now).words);
+}
+
+/** Cairn's Move button (POST /hygiene/api/v1/move): the same move as the chat reply. */
+export async function moveRequest(cmd: MoveCommand, by: string): Promise<MoveOutcome> {
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    const outcome = applyMove(state, now, cmd, by);
+    if (!outcome.ok) return outcome;
+    if (!outstanding(state, now).length) retire(state.bypass);
+    saveState(state);
+    release(state, now, "MOVE");
+    return outcome;
+  });
+}
+
 /**
  * The gate's answer for one Responses request. Never throws: a bug here must
  * not take down inference, so failures forward the request untouched.
@@ -944,7 +1043,7 @@ function checkingReply(
   state: GateState,
   origin: GateOrigin,
 ): GateDecision | null {
-  if (turn.images.length || isBypassAttempt(turn.text) || isDelayText(turn.text)) return null;
+  if (turn.images.length || isBypassAttempt(turn.text) || isDelayText(turn.text) || parseMoveText(turn.text)) return null;
   const now = deps.now();
   if (!armed(state, now) || !photoChecking(statePath())) return null;
   const key = messageKeys(request.input as ResponseInputItem[]).get(turn.newest) ?? "";
@@ -977,6 +1076,8 @@ async function decideHumanTurn(
   const keys = messageKeys(input);
   let dirty = false;
   let gymOpened = false;
+  // A move whose day ended unkept is charged first, so this turn carries its note.
+  if (chargeBrokenMoves(state, now).length) dirty = true;
 
   // A bare BYPASS or a full phrase is answered in every state, as a bare BYPASS was
   // before; looser shapes only while the gate is armed, so a clear or open gate never
@@ -992,6 +1093,13 @@ async function decideHumanTurn(
     const text = delayReply(state, now);
     saveState(state);
     release(state, now, "DELAY");
+    return { action: "respond", text };
+  }
+  const move = turn.images.length ? null : parseMoveText(turn.text);
+  if (move) {
+    const text = moveReply(state, now, move, `chat:${thread || "unknown"}`);
+    saveState(state);
+    release(state, now, "MOVE");
     return { action: "respond", text };
   }
 
@@ -1317,6 +1425,8 @@ export function gateStatus() {
       expires_at: delayActive(state, now) ? state.delay.until : null,
       count: state.delay.count,
     },
+    // MOVE/LATER made today (local day), oldest first; each item moves at most MAX_MOVES_PER_DAY times a day.
+    moves: (state.moves ?? []).filter((m) => localTime(Date.parse(m.at)).day === localTime(now).day),
     suspensions: (state.suspensions ?? []).filter(s => !s.resolvedAt),
     cancellations: state.cancellations ?? {},
     openDebts: state.debts

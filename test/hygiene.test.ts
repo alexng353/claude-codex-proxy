@@ -133,7 +133,7 @@ describe("requirements", () => {
     s.filled["2026-10-07/shower"] = "x";
     s.filled["2026-10-07/night-teeth"] = "x";
     expect(lockedText(outstanding(s, at(DAY, "06:00")))).toBe(
-      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS.",
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
   });
 

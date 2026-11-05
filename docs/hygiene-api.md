@@ -74,6 +74,7 @@ Response (`200`, also when the photo fails):
   "due_today": [{ "slot": "2026-10-07/shower", "kind": "shower", "label": "shower photo (before midnight)" }],
   "bypass": { "count": 0, "active_until": null },
   "delay": { "active": false, "expires_at": null, "count": 0 },
+  "moves": [],
   "open_debts": []
 }
 ```
@@ -87,6 +88,7 @@ Response (`200`, also when the photo fails):
 - **`due_today`** lists what is due later today but does not lock yet, including today's planned gym sessions and one in progress.
 - **`open_debts`** lists BYPASS uses that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt } }`. A penance photo is sent as kind `penance` (oldest first) or in a chat.
 - **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters. The one exception is the app shield's emergency button, below.
+- **`moves`** (since 2026-11-05) lists today's MOVE/LATER moves, oldest first: `{ slot, from, to, by, at }`. A moved requirement leaves `outstanding` until its new time and shows in `due_today` with `: moved to HH:MM` in its label. Each item moves at most twice a day; count an item's entries here to show how many are left. Moves are made with `POST /move` or typed in a chat.
 
 ## POST /bypass
 
@@ -101,6 +103,21 @@ Cairn's app shield sends this when Alex taps "Emergency, 15 min", possibly long 
 - **Every tap is charged unless the gate can show it was free.** Charged: a debt like BYPASS (the model asks why on Alex's next turn; an unjustified ruling sets a penance), and the gate opens if the window hasn't ended yet (`applied: true`). Free (`applied: false`, `debt_id: null`): a bypass that had already started still covered the tap, or nothing locks the gate now, nothing locked it at the tap as far as the current state shows, and nothing that could have cleared a lock happened after the tap (no proof accepted, penance paid, gym session seen, gym check-in received or DELAY started). A lock that ended on its own (midnight, a stale or failed gym read) still charges. The debt's `skipped` lists the locks at the tap as inferred from the current state (it can over-state, e.g. a penance set later), or `at report: ...` when only the report time shows one. The gate keeps no full history, so it can't replay its state at the tap; when in doubt it charges, and "the shield was stale" is an answer the model can accept. Proof or a BYPASS sent after the tap doesn't make it free.
 - **Idempotent on `source` + `at`:** a repeat within 7 days returns the first answer with `duplicate: true`.
 - **Response 200:** `{ ok: true, applied, duplicate, until: ISO | null, debt_id: string | null, gate: <same shape as GET /status> }`. `until` is the gate's bypass end when applied (a longer one already open wins), else null. **400** `{error}` for bad input, **401/403** for auth, **503** while the gate is disabled.
+
+## POST /move
+
+Cairn's Hygiene "Move" button: the chat's `MOVE`/`LATER` reply (README, MOVE / LATER), added 2026-11-05. It reschedules a photo requirement, or today's gym plan, to later the same day. It is never a BYPASS: the bypass counter and debts are unchanged.
+
+```json
+{ "item": "teeth", "to": "18:30" }
+```
+
+- **`item`** is optional. Omitted, `null`, `""` or `"all"` moves every photo requirement that locks now. Otherwise one or more words: `teeth`, `morning`, `night`, `shower`, `weight`, `creatine`, `walk` (combine to narrow: `"morning teeth"`, `"night teeth"`), or `gym` for today's next gym plan. A named item that does not lock yet (this morning's photos before 05:00) can move too.
+- **`to`** is a 24-hour `HH:MM` (or `6:30pm`) on the phone's local day, or ISO 8601 with an offset. It must be later than now and than the item's current due time, and before midnight.
+- **Limits:** each item moves at most twice per local day. Penances and missed gym plans never move; a gym plan that has started moves only before its start-by time (start + grace) or while its Start at the gym is open.
+- **A move is a promise.** If the day ends with the moved photo still missing, the gate charges an open debt (`source: "move"`) on the next gated turn, which the model rules on like a BYPASS.
+- **Response 200:** `{ ok: true, message, moved: [{ slot, from, to, by, at }], plan?: <gym plan>, gate: <same shape as GET /status> }`. `message` is a line to show as it is. `by` is `cairn:<device name>`. A gym move returns `moved: []` and the moved `plan`.
+- **400** `{error}`: bad input, or the move was refused (another day, a time already past, a third move, nothing movable). The error says why; show it as it is. **401/403** for auth, **503** while the gate is disabled.
 
 ## Phone wake (proxy to Cairn relay)
 

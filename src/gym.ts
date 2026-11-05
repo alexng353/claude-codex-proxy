@@ -629,8 +629,8 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
   const started = now >= ms(plan.start);
   const by = edit.by ? { by: edit.by } : {};
   if (edit.action === "move") {
-    if (started)
-      return { ok: false, error: "this plan has already started, so it can't move. Cancel it (that counts as a miss) and add a new one." };
+    // A plan under way moves only the bounded way: same day, within its start-by time, twice a day.
+    if (started) return reschedulePlan(gym, edit.id, edit.start, now, edit.by, edit.note);
     const start = Date.parse(edit.start);
     if (!Number.isFinite(start)) return { ok: false, error: "start must be an ISO time" };
     if (start <= now) return { ok: false, error: "start must be in the future" };
@@ -657,6 +657,52 @@ function nextId(gym: GymState, start: number): string {
   let n = 1;
   while (gym.plans.some((p) => p.id === `${base}-${n}`)) n++;
   return `${base}-${n}`;
+}
+
+/** At most this many moves of one plan per local day through the bounded move (hygiene.ts MAX_MOVES_PER_DAY). */
+export const MAX_PLAN_MOVES_PER_DAY = 2;
+
+/**
+ * The bounded move (MOVE gym 19:00 on the gate, Cairn's Move, or editPlan on a
+ * plan under way): today's plan to a later time today, at most
+ * MAX_PLAN_MOVES_PER_DAY moves of it today (any move logged today counts).
+ * A plan that has started can move only before its start-by time (start +
+ * grace) or while its Start at the gym is open: past that it is a miss, or one
+ * waiting for Uplifting's read, and a move must never erase a miss.
+ */
+export function reschedulePlan(gym: GymState, id: string, startIso: string, now: number, by?: string, note?: string): PlanEditResult {
+  const plan = gym.plans.find((p) => p.id === id);
+  if (!plan) return { ok: false, error: `no plan ${id}` };
+  if (plan.status === "cancelled") return { ok: false, error: `plan ${id} is already cancelled` };
+  const start = Date.parse(startIso);
+  if (!Number.isFinite(start)) return { ok: false, error: "start must be an ISO time" };
+  if (start <= now) return { ok: false, error: "start must be in the future" };
+  const today = localTime(now).day;
+  if (localTime(ms(plan.start)).day !== today) return { ok: false, error: `plan ${id} isn't today's (${when(plan.start)})` };
+  if (localTime(start).day !== today)
+    return { ok: false, error: "a plan that has started (or a MOVE on the gate) moves only within the same day, before midnight" };
+  const result = evaluateGym(gym, now).find((r) => r.plan.id === id)!;
+  if (result.status !== "upcoming" && result.status !== "in-progress")
+    return { ok: false, error: `plan ${id} is ${result.status}; there is nothing to move` };
+  if (now >= ms(plan.start) && now >= result.deadline && result.status !== "in-progress")
+    return {
+      ok: false,
+      error: `plan ${id} is past its start-by time (${clockLabel(result.deadline)}), so it can't move: a move never erases a miss. Log a session in Uplifting, or reply BYPASS.`,
+    };
+  const paused = pauseAt(gym, start);
+  if (paused) return { ok: false, error: pausedError(paused) };
+  const earlier = plan.log.filter((e) => e.action === "move" && localTime(ms(e.at)).day === today);
+  if (earlier.length >= MAX_PLAN_MOVES_PER_DAY)
+    return {
+      ok: false,
+      error: `plan ${id} was already moved twice today (to ${earlier.map((e) => clockLabel(ms(e.to!))).join(", then ")}); go at ${clockLabel(ms(plan.start))}, or reply BYPASS`,
+    };
+  const nowIso = new Date(now).toISOString();
+  const iso = new Date(start).toISOString();
+  const text = note?.slice(0, 200);
+  plan.log.push({ at: nowIso, action: "move", from: plan.start, to: iso, ...(by ? { by } : {}), ...(text ? { note: text } : {}) });
+  plan.start = iso;
+  return { ok: true, plan, message: `moved to ${when(plan.start)}, start by ${clockLabel(start + plan.graceMin * MIN)}` };
 }
 
 // ---- Travel pauses ----

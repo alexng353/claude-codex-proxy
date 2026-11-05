@@ -245,7 +245,7 @@ describe("edits", () => {
     expect(statusAt(late.gym, at(DAY, "18:31"))).toEqual(["missed"]);
   });
 
-  test("move before the start shifts the deadline; after the start it is refused", () => {
+  test("move before the start shifts the deadline; after the start it is bounded to the same day and the start-by time", () => {
     const { gym, id } = planned();
     expect(editPlan(gym, { action: "move", id, start: iso(at(DAY, "20:00")) }, at(DAY, "17:00"))).toMatchObject({
       ok: true,
@@ -253,8 +253,11 @@ describe("edits", () => {
     });
     feed(gym, at(DAY, "18:31"), {});
     expect(statusAt(gym, at(DAY, "18:31"))).toEqual(["upcoming"]);
-    expect(editPlan(gym, { action: "move", id, start: iso(at(DAY, "22:00")) }, at(DAY, "20:01"))).toMatchObject({ ok: false });
-    expect(gym.plans[0].log.map((e) => e.action)).toEqual(["add", "move"]);
+    // Started (20:00) but inside its start-by time (20:30): the bounded move takes it.
+    expect(editPlan(gym, { action: "move", id, start: iso(at(DAY, "22:00")) }, at(DAY, "20:01"))).toMatchObject({ ok: true });
+    // Past 22:30 it is a miss (or one waiting for the read): never moved.
+    expect(editPlan(gym, { action: "move", id, start: iso(at(DAY, "23:30")) }, at(DAY, "22:31"))).toMatchObject({ ok: false });
+    expect(gym.plans[0].log.map((e) => e.action)).toEqual(["add", "move", "move"]);
   });
 
   test("plans must start in the future, with a sane grace", () => {

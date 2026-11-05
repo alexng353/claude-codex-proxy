@@ -35,7 +35,8 @@ export const TOOLS = [
   },
   {
     name: "gym_plan_move",
-    description: "Move a plan before its start, at Alex's request. Refused once the planned start has passed.",
+    description:
+      "Move a plan at Alex's request. Before its start it can move to any future time. Once it has started it can move only to later the same day, before its start-by time (start + grace), at most twice a day; past that it is a miss and can't move.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" }, start: { type: "string", description: WHEN }, note: { type: "string" } },

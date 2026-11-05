@@ -22,6 +22,9 @@
  * - "BYPASS" plus the lock's three words (bypass-phrase.ts) opens the gate for
  *   an hour and opens a debt, which the model rules on and may turn into a
  *   penance photo requirement.
+ * - "LATER 18:30" or "MOVE teeth 21:00" reschedules a photo requirement to
+ *   later the same day: no bypass, no debt, at most twice per item per day.
+ *   A move not kept by midnight becomes an open debt, like a BYPASS.
  * - Planned gym sessions (gym.ts): a plan with no Start at the gym in
  *   Uplifting by its start plus a grace locks until a qualifying session.
  */
@@ -125,6 +128,9 @@ export type Debt = {
   reasonClass?: "gate_fault" | "other";
   item?: string;
   fixRef?: FixRef;
+  /** "move": charged because a MOVE/LATER passed midnight unkept (`moveSlot`), not a BYPASS. */
+  source?: "move";
+  moveSlot?: string;
   status: "open" | "justified" | "penance" | "paid";
   reason?: string;
   ruledAt?: string;
@@ -164,6 +170,8 @@ export type GateState = {
   bypass: { count: number; until: string | null; history: string[] } & BypassPhraseState;
   /** DELAY: one 2-hour postponement of the morning teeth photo per morning. */
   delay: { count: number; until: string | null; day: string | null; history: string[] };
+  /** MOVE/LATER: photo requirements rescheduled within the day, oldest first. Absent until the first. */
+  moves?: SlotMove[];
   debts: Debt[];
   notes: HiddenNote[];
   /**
@@ -493,7 +501,8 @@ export function outstanding(state: GateState, now: number): Requirement[] {
       description: debt.penance!.description,
     });
   result.push(...gymOutstanding(state.gym, now));
-  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot));
+  // A slot moved to later today locks from its new time instead.
+  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !movedAway(state, r.slot, now));
 }
 
 /** Requirements due later today that do not lock yet. */
@@ -520,8 +529,219 @@ export function dueToday(state: GateState, now: number): Requirement[] {
     result.push({ slot: slot.creatine(day), kind: "creatine", label: "morning creatine photo (from 05:00)" });
   if (morningPending && !state.filled[slot.walk(day)] && enforced(state, slot.walk(day), now))
     result.push({ slot: slot.walk(day), kind: "walk", label: "15-min outdoor walk (from 05:00)" });
+  for (const name of new Set((state.moves ?? []).map((m) => m.slot))) {
+    if (!movedAway(state, name, now) || state.filled[name] || !enforced(state, name, now)) continue;
+    const label = `${slotLabel(name, state)}: moved to ${clockLabel(movedTo(state, name)!)}`;
+    const existing = result.find((r) => r.slot === name);
+    if (existing) existing.label = label;
+    else result.push({ slot: name, kind: slotKind(name), label });
+  }
   result.push(...gymDueToday(state.gym, now));
   return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot));
+}
+
+// ---- MOVE / LATER: rescheduling within the day ----
+
+/**
+ * Alex, Nov 5 12:03: "a lot of the reason I use bypass is to move things
+ * around now." A move shifts when a photo requirement locks, to later the same
+ * local day, without a BYPASS or a debt. Bounded: MAX_MOVES_PER_DAY per item
+ * per day, every move logged (from, to, by, at). A move is a promise: if the
+ * day ends with the photo missing, it is charged as an open debt
+ * (chargeBrokenMoves), so moving to 23:59 is never a free skip. Penances and
+ * gym misses never move; gym plans move through gym.ts reschedulePlan.
+ */
+export const MAX_MOVES_PER_DAY = 2;
+
+export type SlotMove = { slot: string; from: string; to: string; by: string; at: string };
+
+/** When a moved slot locks from, or null if it was never moved. */
+export function movedTo(state: GateState, slotName: string): number | null {
+  const last = state.moves?.filter((m) => m.slot === slotName).at(-1);
+  return last ? Date.parse(last.to) : null;
+}
+
+function movedAway(state: GateState, slotName: string, now: number): boolean {
+  const to = movedTo(state, slotName);
+  return to !== null && to > now;
+}
+
+function slotKind(name: string): ProofKind {
+  const item = itemKey(name);
+  if (item === "shower") return "shower";
+  if (item === "morning-weight") return "weight";
+  if (item === "morning-creatine") return "creatine";
+  if (item === "morning-walk") return "walk";
+  return "teeth";
+}
+
+/** Slots a move can shift now: today's morning requirements and yesterday's overdue night ones, unfilled and enforced. */
+export function movableSlots(state: GateState, now: number): string[] {
+  const { day } = localTime(now);
+  const yesterday = addDays(day, -1);
+  return [slot.shower(yesterday), slot.night(yesterday), slot.morning(day), slot.weight(day), slot.creatine(day), slot.walk(day)].filter(
+    (name) => !state.filled[name] && enforced(state, name, now),
+  );
+}
+
+/** Moves of `slotName` recorded on the local day of `now`. */
+export function movesToday(state: GateState, slotName: string, now: number): SlotMove[] {
+  const today = localTime(now).day;
+  return (state.moves ?? []).filter((m) => m.slot === slotName && localTime(Date.parse(m.at)).day === today);
+}
+
+export type MoveCommand = {
+  /** Item keys named (`morning-teeth`, ...), or null for everything that locks now. */
+  items: string[] | null;
+  gym: boolean;
+  time: string;
+  /** A day other than today was named ("tomorrow"): refused, with a clear message. */
+  otherDay: boolean;
+};
+
+const MORNING_ITEMS = ["morning-teeth", "morning-weight", "morning-creatine", "morning-walk"];
+const ITEM_WORDS: Record<string, string[]> = {
+  teeth: ["morning-teeth", "night-teeth"],
+  brush: ["morning-teeth", "night-teeth"],
+  shower: ["shower"],
+  weight: ["morning-weight"],
+  "weigh-in": ["morning-weight"],
+  weighin: ["morning-weight"],
+  scale: ["morning-weight"],
+  creatine: ["morning-creatine"],
+  walk: ["morning-walk"],
+  morning: MORNING_ITEMS,
+  night: ["night-teeth"],
+};
+const ALL_WORDS = new Set(["all", "everything"]);
+const FILLER = new Set(["to", "at", "until", "till", "til"]);
+const OTHER_DAY = /^(tomorrow|tmrw|tmr|tomorow)$/i;
+const TIME = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$|^(\d{2})(\d{2})$/i;
+
+/** Item words ("morning teeth", "gym", "all") to a command's items; null when a word is unknown. */
+export function parseMoveItems(words: string[]): Pick<MoveCommand, "items" | "gym"> | null {
+  const lower = words.map((w) => w.toLowerCase()).filter(Boolean);
+  if (!lower.length || lower.every((w) => ALL_WORDS.has(w))) return { items: null, gym: false };
+  if (lower.length === 1 && lower[0] === "gym") return { items: [], gym: true };
+  let items: string[] | null = null;
+  for (const word of lower) {
+    const named = ITEM_WORDS[word];
+    if (!named) return null;
+    items = items ? items.filter((i) => named.includes(i)) : [...named];
+  }
+  return items && items.length ? { items, gym: false } : null;
+}
+
+/**
+ * A MOVE/LATER reply: `LATER 18:30`, `MOVE gym 19:00`, `MOVE morning teeth to 21:00`.
+ * Only that exact shape counts (every word an item, a filler or the time), so
+ * ordinary text such as "later today I'll fix it" reaches the chat as before.
+ */
+export function parseMoveText(text: string): MoveCommand | null {
+  const words = text.trim().replace(/[.!]+$/, "").replace(/(\d)\s+(am|pm)\b/gi, "$1$2").split(/\s+/);
+  if (words.length < 2 || words.length > 6 || !/^(later|move)$/i.test(words[0])) return null;
+  const rest = words.slice(1).filter((w) => !FILLER.has(w.toLowerCase()));
+  const otherDay = rest.some((w) => OTHER_DAY.test(w));
+  const times = rest.filter((w) => TIME.test(w));
+  if (times.length !== 1) return null;
+  const parsed = parseMoveItems(rest.filter((w) => !OTHER_DAY.test(w) && !TIME.test(w)));
+  if (!parsed) return null;
+  return { ...parsed, time: times[0], otherDay };
+}
+
+const SAME_DAY = "a move stays on the same day, before midnight; to skip instead, reply BYPASS";
+
+/** A reply's or Cairn's time (24-hour HH:MM, H:MMam/pm, or ISO with an offset) to an instant later today. */
+export function resolveMoveTime(raw: string, now: number, otherDay = false): { at: number } | { error: string } {
+  if (otherDay) return { error: `MOVE only reschedules within the same day: ${SAME_DAY}.` };
+  const today = localTime(now).day;
+  let at: number;
+  const m = TIME.exec(raw.trim());
+  if (m) {
+    let hour = Number(m[1] ?? m[4]);
+    const minute = Number(m[2] ?? m[5] ?? 0);
+    const half = m[3]?.toLowerCase();
+    if (half) {
+      if (hour < 1 || hour > 12) return { error: `can't read the time ${raw}` };
+      hour = (hour % 12) + (half === "pm" ? 12 : 0);
+    }
+    if (hour === 24 && minute === 0) return { error: `24:00 is tomorrow: ${SAME_DAY}.` };
+    if (hour > 23 || minute > 59) return { error: `can't read the time ${raw}; use 24-hour time such as 18:30` };
+    at = zonedTime(today, hour * 60 + minute);
+  } else {
+    at = Date.parse(raw);
+    if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw.trim()) || !Number.isFinite(at))
+      return { error: `can't read the time ${raw}; use 24-hour time such as 18:30, or ISO with an offset` };
+    if (localTime(at).day !== today) return { error: `${raw} isn't today: ${SAME_DAY}.` };
+  }
+  if (at <= now) return { error: `${clockLabel(at)} is already past; pick a later time today (24-hour, e.g. 18:30)` };
+  return { at };
+}
+
+export type MoveResult = { ok: true; moved: SlotMove[] } | { ok: false; error: string };
+
+/** Moves every slot in `names` to `to`, or none of them. `to` must be later today (resolveMoveTime). */
+export function moveSlots(state: GateState, names: string[], to: number, now: number, by: string): MoveResult {
+  if (!(to > now) || localTime(to).day !== localTime(now).day) return { ok: false, error: `${SAME_DAY}.` };
+  const movable = movableSlots(state, now);
+  const problems: string[] = [];
+  for (const name of names) {
+    const what = slotLabel(name, state);
+    const earlier = movesToday(state, name, now);
+    const current = movedTo(state, name) ?? armMs(name);
+    if (!movable.includes(name)) problems.push(`${what} can't move`);
+    else if (earlier.length >= MAX_MOVES_PER_DAY)
+      problems.push(
+        `${what} was already moved twice today (to ${earlier.map((e) => clockLabel(Date.parse(e.to))).join(", then ")}); send the photo, or reply BYPASS`,
+      );
+    else if (to <= current) problems.push(`${what} isn't due until ${clockLabel(current)}, so ${clockLabel(to)} moves nothing`);
+  }
+  if (problems.length) return { ok: false, error: problems.join("; ") };
+  const at = new Date(now).toISOString();
+  const moved = names.map((name) => ({
+    slot: name,
+    from: new Date(movedTo(state, name) ?? armMs(name)).toISOString(),
+    to: new Date(to).toISOString(),
+    by: by.slice(0, 120),
+    at,
+  }));
+  (state.moves ??= []).push(...moved);
+  return { ok: true, moved };
+}
+
+/**
+ * Charges each move whose day ended with its photo missing as an open debt,
+ * once, unless a BYPASS debt already covered that item after the moved time.
+ * Returns the new debts (the caller saves the state).
+ */
+export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
+  const charged: Debt[] = [];
+  for (const name of new Set((state.moves ?? []).map((m) => m.slot))) {
+    const to = movedTo(state, name)!;
+    const day = localTime(to).day;
+    const end = zonedTime(addDays(day, 1), 0);
+    if (now < end || state.filled[name]) continue;
+    if (itemStopped(state, itemKey(name), end) || !enforced(state, name, to)) continue;
+    if (state.debts.some((d) => d.source === "move" && d.moveSlot === name)) continue;
+    const item = itemKey(name);
+    const bypassed = state.debts.some(
+      (d) => d.source !== "move" && Date.parse(d.at) >= to && Date.parse(d.at) < end && (d.items ?? []).includes(item),
+    );
+    if (bypassed) continue;
+    const prefix = `${day}-move-`;
+    const debt: Debt = {
+      id: `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`,
+      at: new Date(end).toISOString(),
+      skipped: [`${slotLabel(name, state)} (moved to ${clockLabel(to)}, not done by midnight)`],
+      items: [item],
+      source: "move",
+      moveSlot: name,
+      status: "open",
+    };
+    state.debts.push(debt);
+    charged.push(debt);
+  }
+  return charged;
 }
 
 export function openPenance(state: GateState): Debt[] {
@@ -653,6 +873,10 @@ export function gateEvents(state: GateState, since: number, until: number): Gate
     });
   }
   // Only the latest DELAY keeps a time; there is one per morning, so each is read before the next.
+  for (const m of state.moves ?? []) {
+    if (!within(Date.parse(m.at))) continue;
+    out.push({ key: `move:${m.slot}:${m.at}`, at: m.at, text: `MOVE ${slotLabel(m.slot, state)} to ${clockLabel(Date.parse(m.to))}` });
+  }
   if (state.delay.until) {
     const ends = Date.parse(state.delay.until);
     const at = ends - DELAY_MS;
@@ -1044,6 +1268,8 @@ const EMOJI: Record<Requirement["kind"], string> = {
 export function lockedText(requirements: Requirement[], results: string[] = [], phrase?: string): string {
   const photos = requirements.some((r) => r.kind !== "gym");
   const gym = requirements.some((r) => r.kind === "gym");
+  // MOVE/LATER only shifts photo requirements; a penance or a gym miss never moves.
+  const movable = requirements.some((r) => r.kind !== "gym" && r.kind !== "penance");
   const unlock = [
     ...(photos ? ["send a fresh photo"] : []),
     ...(gym ? ["log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on)"] : []),
@@ -1052,8 +1278,11 @@ export function lockedText(requirements: Requirement[], results: string[] = [], 
     ...results,
     `${EMOJI[requirements[0].kind]} gate armed: ${requirements.map((r) => r.label).join(", ")}`,
     `${unlock[0].toUpperCase()}${unlock.slice(1)} to unlock, or reply BYPASS${phrase ? ` ${phrase}` : ""}.`,
+    ...(movable ? [LATER_HINT] : []),
   ].join("\n");
 }
+
+export const LATER_HINT = "Doing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).";
 
 export function imageMarker(record: ImageRecord, state?: GateState): string {
   const what =
@@ -1077,11 +1306,15 @@ export const isWithheld = (record: ImageRecord) =>
 export function noteText(debt: Debt, baseUrl: string): string {
   const at = Date.parse(debt.at);
   const endpoint = `${baseUrl}/hygiene/debt/${debt.id}/resolve`;
+  const what =
+    debt.source === "move"
+      ? `Alex had moved a photo with MOVE/LATER and the day ended without it, which counts as a skip (charged at ${clockLabel(at)} on ${dayLabel(localTime(at).day)}): ${debt.skipped.join(", ")}.`
+      : `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex replied BYPASS to skip: ${debt.skipped.join(", ")}.`;
   return [
     `<${NOTE_TAG}>`,
     "Supplied automatically by Alex's hygiene gate; Alex did not type this.",
-    `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex replied BYPASS to skip: ${debt.skipped.join(", ")}.`,
-    "Ask him briefly why the bypass was necessary and judge the answer honestly. Keep helping with his request meanwhile.",
+    what,
+    `Ask him briefly why the ${debt.source === "move" ? "skip" : "bypass"} was necessary and judge the answer honestly. Keep helping with his request meanwhile.`,
     "Once he answers, record your ruling with exactly one call:",
     `- justified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"justified","reason":"<one line>"}'`,
     `- unjustified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"unjustified","reason":"<one line>","penance":"<a short, safe, doable photo task, e.g. photo of you on a walk outside>"}'`,

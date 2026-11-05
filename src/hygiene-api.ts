@@ -10,8 +10,8 @@
 import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { addDays, localTime, type ProofKind } from "./hygiene";
-import { refreshFaults, gateDisabled, gateStatus, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { addDays, localTime, parseMoveItems, type ProofKind } from "./hygiene";
+import { refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -117,6 +117,7 @@ function status() {
     due_today: s.dueToday,
     bypass: { count: s.bypass.count, active_until: s.bypass.activeUntil },
     delay: s.delay,
+    moves: s.moves,
     open_debts: s.openDebts,
     suspensions: s.suspensions,
     cancellations: s.cancellations,
@@ -157,6 +158,25 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     const result = await shieldBypass({ minutes: body.minutes, source: body.source, at: body.at });
     if (!result.ok) return json({ error: result.error }, result.status);
     return json({ ...result, gate: status() });
+  }
+
+  // Cairn's Move button: the chat's MOVE/LATER (docs/hygiene-api.md). Never a bypass.
+  if (path === "/move" && request.method === "POST") {
+    if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
+    let body: { item?: unknown; to?: unknown };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return json({ error: "body must be JSON" }, 400);
+    }
+    if (typeof body?.to !== "string" || (body.item !== undefined && body.item !== null && typeof body.item !== "string"))
+      return json({ error: "to (string) is required; item is an optional string" }, 400);
+    const items = parseMoveItems(typeof body.item === "string" ? body.item.trim().split(/\s+/) : []);
+    if (!items)
+      return json({ error: "item must be teeth, morning teeth, night teeth, shower, weight, creatine, walk, morning, gym or all" }, 400);
+    const result = await moveRequest({ ...items, time: body.to.slice(0, 40), otherDay: false }, `cairn:${who.name}`.slice(0, 80));
+    if (!result.ok) return json({ error: result.error }, 400);
+    return json({ ok: true, message: result.message, moved: result.moved, ...(result.plan ? { plan: result.plan } : {}), gate: status() });
   }
 
   if (path === "/proofs" && request.method === "POST") {

@@ -155,7 +155,7 @@ describe("gate decisions", () => {
     expect((await decide(request([env, user("hi")]))).action).toBe("forward");
     clock = at(DAY, "05:00");
     expect(text(await decide(request([env, user("hi")])))).toBe(
-      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
   });
 
@@ -583,11 +583,11 @@ describe("weigh-in", () => {
   test("locks alongside morning teeth; each photo fills its own slot and the reading is kept", async () => {
     await enable();
     expect(text(await decide(request([env, user("hi")])))).toBe(
-      "🪥 gate armed: morning teeth photo, morning weigh-in photo (scale reading)\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🪥 gate armed: morning teeth photo, morning weigh-in photo (scale reading)\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
     expect(text(await decide(request([env, user({ photo: "teeth" })])))).toBe(
-      "✅ morning teeth (Oct 8) photo accepted.\n🏋️ gate armed: morning weigh-in photo (scale reading)\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "✅ morning teeth (Oct 8) photo accepted.\n🏋️ gate armed: morning weigh-in photo (scale reading)\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     verdicts.push({ kind: "weight", confidence: 0.9, reason: "scale display", reading: "72.4 kg" });
     const unlocked = await decide(request([env, user({ photo: "teeth" }), assistant("🏋️"), user({ photo: "scale" })]));
@@ -599,7 +599,7 @@ describe("weigh-in", () => {
   test("is off until weighInStartsAt, and only arms from 05:00", async () => {
     await enable(at("2026-10-09", "05:00"));
     expect(text(await decide(request([env, user("hi")])))).toBe(
-      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     clock = at("2026-10-09", "04:00");
     expect(gateStatus().dueToday.map((r) => r.slot)).toContain("2026-10-09/morning-weight");
@@ -636,7 +636,7 @@ describe("creatine and outdoor walk", () => {
   test("creatine is one photo; the walk is two outdoor photos 15 min apart by receipt time", async () => {
     await enable();
     expect(text(await decide(request([env, user("hi")])))).toBe(
-      "🪥 gate armed: morning teeth photo, morning creatine photo (scoop or glass), 15-min outdoor walk (an outdoor photo at the start, another 15+ min later)\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🪥 gate armed: morning teeth photo, morning creatine photo (scoop or glass), 15-min outdoor walk (an outdoor photo at the start, another 15+ min later)\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
     expect(text(await send("teeth"))).toStartWith("✅ morning teeth (Oct 8) photo accepted.\n💊 gate armed");
@@ -645,7 +645,7 @@ describe("creatine and outdoor walk", () => {
     clock = at(DAY, "06:05");
     verdicts.push({ kind: "walk", confidence: 0.9, reason: "street" });
     expect(text(await send("street"))).toBe(
-      "🚶 walk started at 06:05. Send another outdoor photo from 06:20 to finish it.\n🚶 gate armed: outdoor walk: second outdoor photo from 06:20\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🚶 walk started at 06:05. Send another outdoor photo from 06:20 to finish it.\n🚶 gate armed: outdoor walk: second outdoor photo from 06:20\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     clock = at(DAY, "06:12");
     verdicts.push({ kind: "walk", confidence: 0.9, reason: "park" });
@@ -688,7 +688,7 @@ describe("creatine and outdoor walk", () => {
   test("off until enabled; DELAY postpones them with the other morning photos", async () => {
     await enable(at("2026-10-09", "05:00"));
     expect(text(await decide(request([env, user("hi")])))).toBe(
-      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     const path = process.env.HYGIENE_GATE_STATE!;
     const raw = JSON.parse(await readFile(path, "utf8"));
@@ -819,7 +819,7 @@ describe("dthread messages", () => {
 
   test("an armed gate locks a dthread turn with its usual reply", async () => {
     expect(text(await decide(sent(dthread("fix the bug & ship it"))))).toBe(
-      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.",
+      "🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).",
     );
     clock = at(DAY, "04:59");
     expect((await decide(sent(dthread("hi")))).action).toBe("forward");
@@ -1834,7 +1834,7 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
   test("the lock shows the phrase; bare, wrong and stale phrases are refused; the right one opens; the next lock rotates", async () => {
     clock = at(DAY, "06:00");
     const lock = text(await decide(request([env, user("hi")])))!;
-    expect(lock).toBe("🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.");
+    expect(lock).toBe("🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS maple river otter.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).");
     // The same lock keeps its words.
     expect(text(await decide(request([env, user("hi"), assistant(lock), user("again")])))).toBe(lock);
 
@@ -1856,7 +1856,7 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
     // The bypass ends with the photo still due: the gate arms again with new words.
     clock = at(DAY, "07:01");
     const next = text(await decide(request([env, user("hi")])))!;
-    expect(next).toBe("🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS cedar comet tulip.");
+    expect(next).toBe("🪥 gate armed: morning teeth photo\nSend a fresh photo to unlock, or reply BYPASS cedar comet tulip.\nDoing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).");
     expect(text(await decide(request([env, user("BYPASS maple river otter")])))).toBe(`🔑 That isn't this lock's BYPASS phrase.\n${next}`);
     expect(text(await decide(request([env, user("BYPASS cedar comet tulip")])))).toStartWith("🚪 bypass #2");
     expect(gateStatus().bypass.count).toBe(2);
@@ -1864,7 +1864,7 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
 
   test("a lock that clears and arms again later never reuses its words", async () => {
     clock = at(DAY, "06:00");
-    expect(text(await decide(request([env, user("hi")])))).toEndWith("BYPASS maple river otter.");
+    expect(text(await decide(request([env, user("hi")])))).toContain("BYPASS maple river otter.");
     verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" } as Verdict);
     clock = at(DAY, "06:05");
     exif.fresh = clock - 60_000;
@@ -1872,7 +1872,7 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
     // That night: a new lock, and the morning's words are refused.
     clock = at("2026-10-09", "00:30");
     const night = text(await decide(request([env, user("hi")])))!;
-    expect(night).toEndWith("or reply BYPASS cedar comet tulip.");
+    expect(night).toContain("or reply BYPASS cedar comet tulip.");
     expect(text(await decide(request([env, user("BYPASS maple river otter")])))).toStartWith("🔑 That isn't this lock's BYPASS phrase.");
   });
 
@@ -1907,9 +1907,9 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
 
   test("a DELAY opens the gate, so the relock after it has new words even with no turn in between", async () => {
     clock = at(DAY, "07:45");
-    expect(text(await decide(request([env, user("hi")])))).toEndWith("BYPASS maple river otter.");
+    expect(text(await decide(request([env, user("hi")])))).toContain("BYPASS maple river otter.");
     expect(text(await decide(request([env, user("DELAY")])))).toStartWith("⏰ delay");
     clock = at(DAY, "09:46");
-    expect(text(await decide(request([env, user("back")])))).toEndWith("BYPASS cedar comet tulip.");
+    expect(text(await decide(request([env, user("back")])))).toContain("BYPASS cedar comet tulip.");
   });
 });
