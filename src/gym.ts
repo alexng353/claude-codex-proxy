@@ -9,7 +9,7 @@
  * Decided by Alex 2026-11-02 04:04-04:05: send the location, plans come from
  * him, lock on the schedule, enforce from today.
  */
-import { clockLabel, inTransit, localTime, zoneNote } from "./hygiene";
+import { MAX_MOVES_PER_DAY, clockLabel, inTransit, localTime, zoneNote } from "./hygiene";
 
 export type GymPlanEvent = {
   at: string;
@@ -506,7 +506,17 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
 /** A cancel recorded at or after the planned start. */
 export function cancelledLate(plan: GymPlan): boolean {
   const cancel = [...plan.log].reverse().find((e) => e.action === "cancel");
-  return !!cancel && ms(cancel.at) >= ms(plan.start);
+  return !!cancel && (ms(cancel.at) >= ms(plan.start) || startedBefore(plan, ms(cancel.at)));
+}
+
+/**
+ * The plan had started by `at`: its start had passed, or a move made at or
+ * after the start it moved from (a bounded move of a plan under way) came by
+ * then. A started plan stays started however far it is moved, so a move never
+ * reopens the unbounded edits, the clean cancel or the pause it had lost.
+ */
+export function startedBefore(plan: GymPlan, at: number): boolean {
+  return at >= ms(plan.start) || plan.log.some((e) => e.action === "move" && !!e.from && ms(e.at) >= ms(e.from) && ms(e.at) <= at);
 }
 
 /** Vancouver label for a time, e.g. "Thu, Nov 5 18:00". */
@@ -626,11 +636,12 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
   const plan = gym.plans.find((p) => p.id === edit.id);
   if (!plan) return { ok: false, error: `no plan ${edit.id}` };
   if (plan.status === "cancelled") return { ok: false, error: `plan ${edit.id} is already cancelled` };
-  const started = now >= ms(plan.start);
+  const started = startedBefore(plan, now);
   const by = edit.by ? { by: edit.by } : {};
   if (edit.action === "move") {
-    // A plan under way moves only the bounded way: same day, within its start-by time, twice a day.
-    if (started) return reschedulePlan(gym, edit.id, edit.start, now, edit.by, edit.note);
+    // Today's plan, and any plan under way, moves only the bounded way: same day, before its
+    // start-by time, MAX_MOVES_PER_DAY times a day. Plans for later days move freely.
+    if (started || localTime(ms(plan.start)).day === localTime(now).day) return reschedulePlan(gym, edit.id, edit.start, now, edit.by, edit.note);
     const start = Date.parse(edit.start);
     if (!Number.isFinite(start)) return { ok: false, error: "start must be an ISO time" };
     if (start <= now) return { ok: false, error: "start must be in the future" };
@@ -659,16 +670,14 @@ function nextId(gym: GymState, start: number): string {
   return `${base}-${n}`;
 }
 
-/** At most this many moves of one plan per local day through the bounded move (hygiene.ts MAX_MOVES_PER_DAY). */
-export const MAX_PLAN_MOVES_PER_DAY = 2;
-
 /**
- * The bounded move (MOVE gym 19:00 on the gate, Cairn's Move, or editPlan on a
- * plan under way): today's plan to a later time today, at most
- * MAX_PLAN_MOVES_PER_DAY moves of it today (any move logged today counts).
- * A plan that has started can move only before its start-by time (start +
- * grace) or while its Start at the gym is open: past that it is a miss, or one
- * waiting for Uplifting's read, and a move must never erase a miss.
+ * The bounded move (MOVE gym 19:00 on the gate, Cairn's Move, or editPlan on
+ * today's plan): to another time today, at most MAX_MOVES_PER_DAY moves of it
+ * today (any move logged today counts). A plan that has started can move only
+ * before its start-by time (start + grace): past that it is a miss, or one
+ * waiting for Uplifting's read, and a move must never erase a miss. A plan
+ * with an open Start at the gym never moves: the workout under way would stop
+ * counting for it.
  */
 export function reschedulePlan(gym: GymState, id: string, startIso: string, now: number, by?: string, note?: string): PlanEditResult {
   const plan = gym.plans.find((p) => p.id === id);
@@ -680,11 +689,13 @@ export function reschedulePlan(gym: GymState, id: string, startIso: string, now:
   const today = localTime(now).day;
   if (localTime(ms(plan.start)).day !== today) return { ok: false, error: `plan ${id} isn't today's (${when(plan.start)})` };
   if (localTime(start).day !== today)
-    return { ok: false, error: "a plan that has started (or a MOVE on the gate) moves only within the same day, before midnight" };
+    return { ok: false, error: "today's plan moves only within today, before midnight; to skip it, cancel it (after its start that counts as a miss)" };
   const result = evaluateGym(gym, now).find((r) => r.plan.id === id)!;
-  if (result.status !== "upcoming" && result.status !== "in-progress")
+  if (result.status === "in-progress")
+    return { ok: false, error: `plan ${id} has an open Start at the gym; finish the session in Uplifting (a move would stop it counting)` };
+  if (result.status !== "upcoming")
     return { ok: false, error: `plan ${id} is ${result.status}; there is nothing to move` };
-  if (now >= ms(plan.start) && now >= result.deadline && result.status !== "in-progress")
+  if (startedBefore(plan, now) && now >= result.deadline)
     return {
       ok: false,
       error: `plan ${id} is past its start-by time (${clockLabel(result.deadline)}), so it can't move: a move never erases a miss. Log a session in Uplifting, or reply BYPASS.`,
@@ -692,10 +703,10 @@ export function reschedulePlan(gym: GymState, id: string, startIso: string, now:
   const paused = pauseAt(gym, start);
   if (paused) return { ok: false, error: pausedError(paused) };
   const earlier = plan.log.filter((e) => e.action === "move" && localTime(ms(e.at)).day === today);
-  if (earlier.length >= MAX_PLAN_MOVES_PER_DAY)
+  if (earlier.length >= MAX_MOVES_PER_DAY)
     return {
       ok: false,
-      error: `plan ${id} was already moved twice today (to ${earlier.map((e) => clockLabel(ms(e.to!))).join(", then ")}); go at ${clockLabel(ms(plan.start))}, or reply BYPASS`,
+      error: `plan ${id} was already moved ${MAX_MOVES_PER_DAY === 2 ? "twice" : `${MAX_MOVES_PER_DAY} times`} today (to ${earlier.map((e) => clockLabel(ms(e.to!))).join(", then ")}); go at ${clockLabel(ms(plan.start))}, or reply BYPASS`,
     };
   const nowIso = new Date(now).toISOString();
   const iso = new Date(start).toISOString();
@@ -737,7 +748,7 @@ export function addPause(gym: GymState, input: { from: string; to: string; reaso
   const effectiveFrom = Math.max(from, now);
   // A plan that already started inside the asked window stays judged as it is.
   const started = gym.plans.find(
-    (p) => !(p.status === "cancelled" && !cancelledLate(p)) && from <= ms(p.start) && ms(p.start) <= now && ms(p.start) < to,
+    (p) => !(p.status === "cancelled" && !cancelledLate(p)) && from <= ms(p.start) && ms(p.start) < to && startedBefore(p, now),
   );
   if (started) return { ok: false, error: `plan ${started.id} (${when(started.start)}) has already started; a pause can't reach back over it` };
   const overlap = (gym.pauses ?? []).find((p) => ms(p.from) < to && effectiveFrom < ms(p.to));

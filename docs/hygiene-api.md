@@ -75,6 +75,7 @@ Response (`200`, also when the photo fails):
   "bypass": { "count": 0, "active_until": null },
   "delay": { "active": false, "expires_at": null, "count": 0 },
   "moves": [],
+  "max_moves_per_day": 2,
   "open_debts": []
 }
 ```
@@ -86,9 +87,9 @@ Response (`200`, also when the photo fails):
   - `disabled`: the kill switch is on
 - **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight`, `creatine`, `walk`, `penance` or `gym`. A `gym` item (slot `gym/<plan id>`, since 2026-11-02) is a planned gym session with no qualifying Uplifting session, for at most 24 h. This API has no gym kind for proofs; a geotagged gym photo counts only when sent in a chat (README, gym sessions).
 - **`due_today`** lists what is due later today but does not lock yet, including today's planned gym sessions and one in progress.
-- **`open_debts`** lists BYPASS uses that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt } }`. A penance photo is sent as kind `penance` (oldest first) or in a chat.
+- **`open_debts`** lists BYPASS uses (and, since 2026-11-05, moves not kept by midnight) that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt }, source: "bypass" | "move" }`. A penance photo is sent as kind `penance` (oldest first) or in a chat.
 - **DELAY and BYPASS** are typed as chat messages, not sent through this API. Status reports their counters. The one exception is the app shield's emergency button, below.
-- **`moves`** (since 2026-11-05) lists today's MOVE/LATER moves, oldest first: `{ slot, from, to, by, at }`. A moved requirement leaves `outstanding` until its new time and shows in `due_today` with `: moved to HH:MM` in its label. Each item moves at most twice a day; count an item's entries here to show how many are left. Moves are made with `POST /move` or typed in a chat.
+- **`moves`** (since 2026-11-05) lists today's MOVE/LATER moves, oldest first: `{ slot, from, to, by, at }`, photo requirements and gym plans (`slot` `gym/<plan id>`; a gym plan's moves by an agent count too). A moved requirement leaves `outstanding` until its new time and shows in `due_today` with `: moved to HH:MM` in its label. Each item moves at most `max_moves_per_day` times a day; count an item's entries here to show how many are left. Moves are made with `POST /move` or typed in a chat.
 
 ## POST /bypass
 
@@ -113,9 +114,9 @@ Cairn's Hygiene "Move" button: the chat's `MOVE`/`LATER` reply (README, MOVE / L
 ```
 
 - **`item`** is optional. Omitted, `null`, `""` or `"all"` moves every photo requirement that locks now. Otherwise one or more words: `teeth`, `morning`, `night`, `shower`, `weight`, `creatine`, `walk` (combine to narrow: `"morning teeth"`, `"night teeth"`), or `gym` for today's next gym plan. A named item that does not lock yet (this morning's photos before 05:00) can move too.
-- **`to`** is a 24-hour `HH:MM` (or `6:30pm`) on the phone's local day, or ISO 8601 with an offset. It must be later than now and than the item's current due time, and before midnight.
-- **Limits:** each item moves at most twice per local day. Penances and missed gym plans never move; a gym plan that has started moves only before its start-by time (start + grace) or while its Start at the gym is open.
-- **A move is a promise.** If the day ends with the moved photo still missing, the gate charges an open debt (`source: "move"`) on the next gated turn, which the model rules on like a BYPASS.
+- **`to`** is a clock-shaped time on the phone's local day (24-hour `HH:MM`, `6:30pm` or `6pm`), or ISO 8601 with an offset. It must be later than now and than the item's current due time (an open DELAY counts as that time; a gym plan's current start), and before midnight.
+- **Limits:** each item moves at most `max_moves_per_day` (2) times per local day. Penances and missed gym plans never move; a gym plan with an open Start at the gym never moves, and one that has started moves only before its start-by time (start + grace).
+- **A move is a promise.** If the day ends with the moved photo still missing, and no BYPASS of that item was charged that day, the gate charges an open debt (`source: "move"`) on the next status read or gated turn, which the model rules on like a BYPASS.
 - **Response 200:** `{ ok: true, message, moved: [{ slot, from, to, by, at }], plan?: <gym plan>, gate: <same shape as GET /status> }`. `message` is a line to show as it is. `by` is `cairn:<device name>`. A gym move returns `moved: []` and the moved `plan`.
 - **400** `{error}`: bad input, or the move was refused (another day, a time already past, a third move, nothing movable). The error says why; show it as it is. **401/403** for auth, **503** while the gate is disabled.
 

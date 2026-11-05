@@ -11,7 +11,7 @@ import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, parseMoveItems, type ProofKind } from "./hygiene";
-import { refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { chargeMoves, refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -118,6 +118,7 @@ function status() {
     bypass: { count: s.bypass.count, active_until: s.bypass.activeUntil },
     delay: s.delay,
     moves: s.moves,
+    max_moves_per_day: s.maxMovesPerDay,
     open_debts: s.openDebts,
     suspensions: s.suspensions,
     cancellations: s.cancellations,
@@ -141,6 +142,7 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     const zone = request.headers.get("x-device-time-zone");
     if (zone) await noteDeviceZone(zone);
     await refreshFaults();
+    await chargeMoves();
     return json(status());
   }
 

@@ -64,6 +64,7 @@ import {
   zoneAt,
   TIME_ZONE,
   MAX_MOVES_PER_DAY,
+  allMoves,
   chargeBrokenMoves,
   movableSlots,
   moveSlots,
@@ -648,12 +649,14 @@ async function checkImage(
   }
   const target = slotsFor(verdict.kind as ProofKind)[0];
   // An everyday outdoor or kitchen photo must not start a walk or count as creatine by accident:
-  // only one sent to unlock the gate, during DELAY, or through Cairn's proof flow counts.
+  // only one sent to unlock the gate, during DELAY, for a requirement Alex moved (MOVE/LATER),
+  // or through Cairn's proof flow counts.
   const meant =
     (verdict.kind !== "walk" && verdict.kind !== "creatine") ||
     record.locked ||
     source.thread === "cairn" ||
-    delayActive(state, now);
+    delayActive(state, now) ||
+    (!!target && (state.moves ?? []).some((m) => m.slot === target || (target.endsWith("/morning-walk-start") && m.slot === target.replace(/-start$/, ""))));
   if (!target) {
     state.images.push({ ...record, verdict: "unneeded" });
     return { line: null };
@@ -911,16 +914,23 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
     const todays = evaluateGym(state.gym, now)
       .filter((r) => localTime(Date.parse(r.plan.start)).day === today && r.status !== "cancelled")
       .sort((a, b) => Date.parse(a.plan.start) - Date.parse(b.plan.start));
-    const open = todays.find((r) => r.status === "upcoming" || r.status === "in-progress");
+    // The first plan a move can take: upcoming and not past its start-by time (one waiting for
+    // Uplifting's read after its deadline is a likely miss and never moves).
+    const open = todays.find((r) => r.status === "upcoming" && now < r.deadline);
     if (!open) {
-      const missed = todays.find((r) => r.status === "missed");
+      const missed = todays.find((r) => r.status === "missed" || (r.status === "upcoming" && now >= r.deadline));
+      const going = todays.find((r) => r.status === "in-progress");
       return {
         ok: false,
-        error: missed
-          ? `today's gym plan (${clockLabel(Date.parse(missed.plan.start))}) was already missed; a move never erases a miss. Log a session in Uplifting, or reply BYPASS`
-          : "there is no gym plan left today to move",
+        error: going
+          ? "today's gym session is under way (open Start); finish it in Uplifting"
+          : missed
+            ? `today's gym plan (${clockLabel(Date.parse(missed.plan.start))}) is past its start-by time; a move never erases a miss. Log a session in Uplifting, or reply BYPASS`
+            : "there is no gym plan left today to move",
       };
     }
+    if (time.at <= Date.parse(open.plan.start))
+      return { ok: false, error: `today's gym plan is already at ${clockLabel(Date.parse(open.plan.start))}; MOVE only pushes it later` };
     const r = reschedulePlan(state.gym!, open.plan.id, new Date(time.at).toISOString(), now, by);
     if (!r.ok) return { ok: false, error: r.error };
     return { ok: true, message: `🏋️ gym ${r.message}. No bypass, no debt.`, moved: [], plan: r.plan };
@@ -970,12 +980,29 @@ export async function moveRequest(cmd: MoveCommand, by: string): Promise<MoveOut
   return serialized(async () => {
     const state = structuredClone(loadState());
     const now = deps.now();
+    const charged = chargeBrokenMoves(state, now).length > 0;
     const outcome = applyMove(state, now, cmd, by);
-    if (!outcome.ok) return outcome;
+    if (!outcome.ok) {
+      if (charged) saveState(state);
+      return outcome;
+    }
     if (!outstanding(state, now).length) retire(state.bypass);
     saveState(state);
     release(state, now, "MOVE");
     return outcome;
+  });
+}
+
+/**
+ * Charges moves whose day ended unkept (chargeBrokenMoves) from a status read,
+ * so the phone shows the debt without waiting for a chat turn. Most reads
+ * change nothing and skip the lock.
+ */
+export async function chargeMoves(): Promise<void> {
+  if (!chargeBrokenMoves(structuredClone(loadState()), deps.now()).length) return;
+  await serialized(async () => {
+    const state = structuredClone(loadState());
+    if (chargeBrokenMoves(state, deps.now()).length) saveState(state);
   });
 }
 
@@ -1096,7 +1123,9 @@ async function decideHumanTurn(
     return { action: "respond", text };
   }
   const move = turn.images.length ? null : parseMoveText(turn.text);
-  if (move) {
+  // An unnamed LATER is a gate reply only while something locks (bypass or not), so a clear
+  // gate never swallows "later 5pm" meant for the chat. A named item (MOVE teeth 08:00) always is.
+  if (move && (move.items !== null || move.gym || outstanding(state, now).length > 0)) {
     const text = moveReply(state, now, move, `chat:${thread || "unknown"}`);
     saveState(state);
     release(state, now, "MOVE");
@@ -1425,13 +1454,15 @@ export function gateStatus() {
       expires_at: delayActive(state, now) ? state.delay.until : null,
       count: state.delay.count,
     },
-    // MOVE/LATER made today (local day), oldest first; each item moves at most MAX_MOVES_PER_DAY times a day.
-    moves: (state.moves ?? []).filter((m) => localTime(Date.parse(m.at)).day === localTime(now).day),
+    // MOVE/LATER made today (local day), photos and gym plans (slot gym/<id>), oldest first;
+    // each item moves at most MAX_MOVES_PER_DAY times a day.
+    moves: allMoves(state).filter((m) => localTime(Date.parse(m.at)).day === localTime(now).day),
+    maxMovesPerDay: MAX_MOVES_PER_DAY,
     suspensions: (state.suspensions ?? []).filter(s => !s.resolvedAt),
     cancellations: state.cancellations ?? {},
     openDebts: state.debts
       .filter((d) => d.status === "open" || d.status === "penance")
-      .map(({ id, at, skipped, status, penance }) => ({ id, at, skipped, status, penance })),
+      .map(({ id, at, skipped, status, penance, source }) => ({ id, at, skipped, status, penance, source: source ?? "bypass" })),
     lastProofs: state.images
       .filter((r) => r.verdict === "accepted")
       .slice(-5)

@@ -131,6 +131,8 @@ export type Debt = {
   /** "move": charged because a MOVE/LATER passed midnight unkept (`moveSlot`), not a BYPASS. */
   source?: "move";
   moveSlot?: string;
+  /** Move debts: when the gate charged it (after the midnight in `at`). */
+  chargedAt?: string;
   status: "open" | "justified" | "penance" | "paid";
   reason?: string;
   ruledAt?: string;
@@ -531,7 +533,7 @@ export function dueToday(state: GateState, now: number): Requirement[] {
     result.push({ slot: slot.walk(day), kind: "walk", label: "15-min outdoor walk (from 05:00)" });
   for (const name of new Set((state.moves ?? []).map((m) => m.slot))) {
     if (!movedAway(state, name, now) || state.filled[name] || !enforced(state, name, now)) continue;
-    const label = `${slotLabel(name, state)}: moved to ${clockLabel(movedTo(state, name)!)}`;
+    const label = `${slotLabel(name, state)}: moved to ${clockLabel(movedTo(state, name, now)!)}`;
     const existing = result.find((r) => r.slot === name);
     if (existing) existing.label = label;
     else result.push({ slot: name, kind: slotKind(name), label });
@@ -555,15 +557,23 @@ export const MAX_MOVES_PER_DAY = 2;
 
 export type SlotMove = { slot: string; from: string; to: string; by: string; at: string };
 
-/** When a moved slot locks from, or null if it was never moved. */
-export function movedTo(state: GateState, slotName: string): number | null {
-  const last = state.moves?.filter((m) => m.slot === slotName).at(-1);
+/** When a moved slot locks from, as of `asOf` (moves made later don't count yet), or null if not moved by then. */
+function movedTo(state: GateState, slotName: string, asOf: number): number | null {
+  const last = state.moves?.filter((m) => m.slot === slotName && Date.parse(m.at) <= asOf).at(-1);
   return last ? Date.parse(last.to) : null;
 }
 
 function movedAway(state: GateState, slotName: string, now: number): boolean {
-  const to = movedTo(state, slotName);
+  const to = movedTo(state, slotName, now);
   return to !== null && to > now;
+}
+
+/** When a slot locks as of `now`: its arm time, pushed by a move or by an open DELAY. */
+function effectiveDue(state: GateState, slotName: string, now: number): number {
+  let due = movedTo(state, slotName, now) ?? armMs(slotName);
+  const { day } = localTime(now);
+  if (delayActive(state, now) && morningSlots(state, day, now).includes(slotName)) due = Math.max(due, Date.parse(state.delay.until!));
+  return due;
 }
 
 function slotKind(name: string): ProofKind {
@@ -588,6 +598,16 @@ export function movableSlots(state: GateState, now: number): string[] {
 export function movesToday(state: GateState, slotName: string, now: number): SlotMove[] {
   const today = localTime(now).day;
   return (state.moves ?? []).filter((m) => m.slot === slotName && localTime(Date.parse(m.at)).day === today);
+}
+
+/** Every move, photo and gym, oldest first. Gym moves live on their plan's log; here they read as slot `gym/<plan id>`. */
+export function allMoves(state: GateState): SlotMove[] {
+  const gym = (state.gym?.plans ?? []).flatMap((p) =>
+    p.log
+      .filter((e) => e.action === "move" && e.from && e.to)
+      .map((e) => ({ slot: `gym/${p.id}`, from: e.from!, to: e.to!, by: e.by ?? "", at: e.at })),
+  );
+  return [...(state.moves ?? []), ...gym].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
 }
 
 export type MoveCommand = {
@@ -616,7 +636,8 @@ const ITEM_WORDS: Record<string, string[]> = {
 const ALL_WORDS = new Set(["all", "everything"]);
 const FILLER = new Set(["to", "at", "until", "till", "til"]);
 const OTHER_DAY = /^(tomorrow|tmrw|tmr|tomorow)$/i;
-const TIME = /^(\d{1,2})(?::(\d{2}))?(am|pm)?$|^(\d{2})(\d{2})$/i;
+// Clock-shaped only (18:30, 6:30pm, 6pm): a bare "move 2" is an ordinary reply to a numbered list.
+const TIME = /^(\d{1,2}):(\d{2})(am|pm)?$|^(\d{1,2})(am|pm)$/i;
 
 /** Item words ("morning teeth", "gym", "all") to a command's items; null when a word is unknown. */
 export function parseMoveItems(words: string[]): Pick<MoveCommand, "items" | "gym"> | null {
@@ -625,8 +646,9 @@ export function parseMoveItems(words: string[]): Pick<MoveCommand, "items" | "gy
   if (lower.length === 1 && lower[0] === "gym") return { items: [], gym: true };
   let items: string[] | null = null;
   for (const word of lower) {
+    // Own keys only: "constructor" or "__proto__" from chat text must not reach the prototype.
+    if (!Object.hasOwn(ITEM_WORDS, word)) return null;
     const named = ITEM_WORDS[word];
-    if (!named) return null;
     items = items ? items.filter((i) => named.includes(i)) : [...named];
   }
   return items && items.length ? { items, gym: false } : null;
@@ -659,8 +681,8 @@ export function resolveMoveTime(raw: string, now: number, otherDay = false): { a
   const m = TIME.exec(raw.trim());
   if (m) {
     let hour = Number(m[1] ?? m[4]);
-    const minute = Number(m[2] ?? m[5] ?? 0);
-    const half = m[3]?.toLowerCase();
+    const minute = Number(m[2] ?? 0);
+    const half = (m[3] ?? m[5])?.toLowerCase();
     if (half) {
       if (hour < 1 || hour > 12) return { error: `can't read the time ${raw}` };
       hour = (hour % 12) + (half === "pm" ? 12 : 0);
@@ -688,11 +710,11 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
   for (const name of names) {
     const what = slotLabel(name, state);
     const earlier = movesToday(state, name, now);
-    const current = movedTo(state, name) ?? armMs(name);
+    const current = effectiveDue(state, name, now);
     if (!movable.includes(name)) problems.push(`${what} can't move`);
     else if (earlier.length >= MAX_MOVES_PER_DAY)
       problems.push(
-        `${what} was already moved twice today (to ${earlier.map((e) => clockLabel(Date.parse(e.to))).join(", then ")}); send the photo, or reply BYPASS`,
+        `${what} was already moved ${MAX_MOVES_PER_DAY === 2 ? "twice" : `${MAX_MOVES_PER_DAY} times`} today (to ${earlier.map((e) => clockLabel(Date.parse(e.to))).join(", then ")}); send the photo, or reply BYPASS`,
       );
     else if (to <= current) problems.push(`${what} isn't due until ${clockLabel(current)}, so ${clockLabel(to)} moves nothing`);
   }
@@ -700,7 +722,7 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
   const at = new Date(now).toISOString();
   const moved = names.map((name) => ({
     slot: name,
-    from: new Date(movedTo(state, name) ?? armMs(name)).toISOString(),
+    from: new Date(effectiveDue(state, name, now)).toISOString(),
     to: new Date(to).toISOString(),
     by: by.slice(0, 120),
     at,
@@ -711,21 +733,24 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
 
 /**
  * Charges each move whose day ended with its photo missing as an open debt,
- * once, unless a BYPASS debt already covered that item after the moved time.
+ * once, unless a BYPASS debt for that item was already charged that day.
  * Returns the new debts (the caller saves the state).
  */
 export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
   const charged: Debt[] = [];
   for (const name of new Set((state.moves ?? []).map((m) => m.slot))) {
-    const to = movedTo(state, name)!;
+    const to = movedTo(state, name, now);
+    if (to === null) continue;
     const day = localTime(to).day;
+    const start = zonedTime(day, 0);
     const end = zonedTime(addDays(day, 1), 0);
     if (now < end || state.filled[name]) continue;
     if (itemStopped(state, itemKey(name), end) || !enforced(state, name, to)) continue;
     if (state.debts.some((d) => d.source === "move" && d.moveSlot === name)) continue;
     const item = itemKey(name);
+    // One skip, one charge: a BYPASS of this item that day (before or after the move) already counts.
     const bypassed = state.debts.some(
-      (d) => d.source !== "move" && Date.parse(d.at) >= to && Date.parse(d.at) < end && (d.items ?? []).includes(item),
+      (d) => d.source !== "move" && Date.parse(d.at) >= start && Date.parse(d.at) < end && (d.items ?? []).includes(item),
     );
     if (bypassed) continue;
     const prefix = `${day}-move-`;
@@ -736,6 +761,7 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
       items: [item],
       source: "move",
       moveSlot: name,
+      chargedAt: new Date(now).toISOString(),
       status: "open",
     };
     state.debts.push(debt);
@@ -872,11 +898,17 @@ export function gateEvents(state: GateState, since: number, until: number): Gate
       text: `BYPASS${skipped.length ? ` (skipped ${skipped.join(", ")})` : ""}`,
     });
   }
-  // Only the latest DELAY keeps a time; there is one per morning, so each is read before the next.
-  for (const m of state.moves ?? []) {
+  for (const m of allMoves(state)) {
     if (!within(Date.parse(m.at))) continue;
-    out.push({ key: `move:${m.slot}:${m.at}`, at: m.at, text: `MOVE ${slotLabel(m.slot, state)} to ${clockLabel(Date.parse(m.to))}` });
+    out.push({ key: `move:${m.slot}:${m.at}`, at: m.at, text: `MOVE ${slotLabel(m.slot, state)} from ${clockLabel(Date.parse(m.from))} to ${clockLabel(Date.parse(m.to))}` });
   }
+  for (const d of state.debts) {
+    // Timed by when it was charged (the next gated turn or status read), not the midnight it covers.
+    const charged = d.source === "move" ? (d.chargedAt ?? d.at) : null;
+    if (!charged || !within(Date.parse(charged))) continue;
+    out.push({ key: `move-debt:${d.id}`, at: charged, text: `MOVE not kept, charged as a skip: ${d.skipped.join(", ")}` });
+  }
+  // Only the latest DELAY keeps a time; there is one per morning, so each is read before the next.
   if (state.delay.until) {
     const ends = Date.parse(state.delay.until);
     const at = ends - DELAY_MS;
@@ -1282,7 +1314,7 @@ export function lockedText(requirements: Requirement[], results: string[] = [], 
   ].join("\n");
 }
 
-export const LATER_HINT = "Doing it later today? Reply LATER 18:30 (any time before midnight; not a bypass).";
+const LATER_HINT = "Doing it later today? Reply LATER and a time before midnight, e.g. LATER 21:00 (not a bypass).";
 
 export function imageMarker(record: ImageRecord, state?: GateState): string {
   const what =
