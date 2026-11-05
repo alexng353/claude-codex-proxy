@@ -133,6 +133,8 @@ export type Debt = {
   moveSlot?: string;
   /** Move debts: when the gate charged it (after the midnight in `at`). */
   chargedAt?: string;
+  /** Move debts: the moved time the skip ran from (to `at`, the midnight that ended it). */
+  moveTo?: string;
   status: "open" | "justified" | "penance" | "paid";
   reason?: string;
   ruledAt?: string;
@@ -733,7 +735,10 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
 
 /**
  * Charges each move whose day ended with its photo missing as an open debt,
- * once, unless a BYPASS debt for that item was already charged that day.
+ * once, unless a BYPASS of that item from the moved time on already charged
+ * the same skip. A BYPASS before the move is a different skip and doesn't
+ * count. A shield report that arrives after this charge supersedes it
+ * (supersedeMoveDebts).
  * Returns the new debts (the caller saves the state).
  */
 export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
@@ -742,15 +747,13 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
     const to = movedTo(state, name, now);
     if (to === null) continue;
     const day = localTime(to).day;
-    const start = zonedTime(day, 0);
     const end = zonedTime(addDays(day, 1), 0);
     if (now < end || state.filled[name]) continue;
     if (itemStopped(state, itemKey(name), end) || !enforced(state, name, to)) continue;
     if (state.debts.some((d) => d.source === "move" && d.moveSlot === name)) continue;
     const item = itemKey(name);
-    // One skip, one charge: a BYPASS of this item that day (before or after the move) already counts.
     const bypassed = state.debts.some(
-      (d) => d.source !== "move" && Date.parse(d.at) >= start && Date.parse(d.at) < end && (d.items ?? []).includes(item),
+      (d) => d.source !== "move" && Date.parse(d.at) >= to && Date.parse(d.at) < end && (d.items ?? []).includes(item),
     );
     if (bypassed) continue;
     const prefix = `${day}-move-`;
@@ -761,6 +764,7 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
       items: [item],
       source: "move",
       moveSlot: name,
+      moveTo: new Date(to).toISOString(),
       chargedAt: new Date(now).toISOString(),
       status: "open",
     };
@@ -768,6 +772,22 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
     charged.push(debt);
   }
   return charged;
+}
+
+/**
+ * A BYPASS charged late (a shield tap reported after midnight) for a skip a
+ * move debt already charged: one skip, one charge. Each open move debt whose
+ * window (moved time to midnight) holds `at` and whose item the bypass names
+ * is closed as justified, with the reason naming the debt that replaces it.
+ */
+export function supersedeMoveDebts(state: GateState, items: string[], at: number, byDebtId: string, now: number): void {
+  for (const d of state.debts) {
+    if (d.source !== "move" || d.status !== "open" || !d.moveTo || !d.items?.some((i) => items.includes(i))) continue;
+    if (at < Date.parse(d.moveTo) || at >= Date.parse(d.at)) continue;
+    d.status = "justified";
+    d.reason = `superseded by ${byDebtId}: the same skip, charged once`;
+    d.ruledAt = new Date(now).toISOString();
+  }
 }
 
 export function openPenance(state: GateState): Debt[] {

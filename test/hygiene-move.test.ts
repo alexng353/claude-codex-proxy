@@ -228,13 +228,48 @@ describe("MOVE / LATER on the hygiene gate", () => {
     expect(s.debts).toHaveLength(1);
   });
 
-  test("a skip already charged as a BYPASS that day is not charged again for the move", async () => {
-    clock = at(DAY, "12:00");
-    expect(await say("BYPASS maple river otter")).toContain("bypass #1");
+  test("a BYPASS of the moved lock itself is the one charge for that skip", async () => {
     await say("MOVE teeth 23:00");
+    clock = at(DAY, "23:30");
+    expect(await say("BYPASS maple river otter")).toContain("bypass #1");
     clock = at("2026-11-06", "04:00");
     await say("hi");
     expect((await state()).debts.map((d: any) => d.source ?? "bypass")).toEqual(["bypass"]);
+  });
+
+  test("a BYPASS before the move is a different skip: the broken move is still charged", async () => {
+    clock = at(DAY, "06:00");
+    expect(await say("BYPASS maple river otter")).toContain("bypass #1");
+    clock = at(DAY, "07:30");
+    expect(await say("MOVE teeth 23:00")).toContain("moved");
+    clock = at("2026-11-06", "04:00");
+    await say("hi");
+    expect((await state()).debts.map((d: any) => d.source ?? "bypass")).toEqual(["bypass", "move"]);
+  });
+
+  test("a shield tap in the moved window reported after the move debt supersedes it", async () => {
+    await say("MOVE teeth 23:00");
+    clock = at("2026-11-06", "00:05");
+    expect((await getStatus()).open_debts).toMatchObject([{ source: "move" }]);
+    const r = await api("/bypass", { minutes: 15, source: "cairn-shield", at: iso(at(DAY, "23:30")) });
+    expect(r.body.debt_id).not.toBeNull();
+    const s = await state();
+    expect(s.debts.filter((d: any) => d.status === "open").map((d: any) => d.source ?? "bypass")).toEqual(["bypass"]);
+    expect(s.debts.find((d: any) => d.source === "move")).toMatchObject({ status: "justified", reason: expect.stringContaining("superseded by") });
+  });
+
+  test("a bypassed gate never swallows an unnamed LATER", async () => {
+    expect(await say("BYPASS maple river otter")).toContain("bypass #1");
+    expect(await say("later 5pm")).toBeNull();
+    expect((await state()).moves ?? []).toEqual([]);
+  });
+
+  test("the kill switch stops a status read charging a broken move", async () => {
+    await say("LATER 23:00");
+    await writeFile(process.env.HYGIENE_GATE_DISABLED_FILE!, "");
+    clock = at("2026-11-06", "04:00");
+    await getStatus();
+    expect((await state()).debts).toEqual([]);
   });
 
   test("a shield tap before a move is still charged", async () => {
@@ -313,6 +348,25 @@ describe("MOVE gym", () => {
     const r = editPlan(gym, { action: "move", id, start: iso(at(DAY, "21:30")) }, at(DAY, "18:15"));
     expect(r).toMatchObject({ ok: false });
     expect((r as { error: string }).error).toContain("open Start");
+  });
+
+  test("a plan for just after midnight with an open Start before midnight can't move either", () => {
+    const gym = emptyGym();
+    const add = editPlan(gym, { action: "add", start: iso(at("2026-11-06", "00:30")) }, at(DAY, "12:00"));
+    if (!add.ok) throw new Error(add.error);
+    const g = DEFAULT_GYM_SETTINGS.gym;
+    mergeFeed(gym, { checkins: [{ client_workout_id: "w1", kind: "start", at: iso(at(DAY, "23:40")), latitude: g.lat, longitude: g.lon, accuracy_m: 10 }], workouts: [] }, at(DAY, "23:41"));
+    expect(evaluateGym(gym, at(DAY, "23:45"))[0].status).toBe("in-progress");
+    expect(editPlan(gym, { action: "move", id: add.plan.id, start: iso(at("2026-11-06", "20:00")) }, at(DAY, "23:45"))).toMatchObject({ ok: false });
+  });
+
+  test("today's plan inside a travel pause can move out of it", () => {
+    const gym = plannedGym();
+    const id = gym.plans[0].id;
+    expect(addPause(gym, { from: iso(at(DAY, "17:00")), to: iso(at(DAY, "19:00")), reason: "flight" }, at(DAY, "12:00"))).toMatchObject({ ok: true });
+    expect(evaluateGym(gym, at(DAY, "12:00"))[0].status).toBe("paused");
+    expect(editPlan(gym, { action: "move", id, start: iso(at(DAY, "20:00")) }, at(DAY, "12:00"))).toMatchObject({ ok: true });
+    expect(evaluateGym(gym, at(DAY, "12:00"))[0].status).toBe("upcoming");
   });
 
   test("MOVE gym in a chat moves today's plan without a bypass", async () => {

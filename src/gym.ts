@@ -639,6 +639,10 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
   const started = startedBefore(plan, now);
   const by = edit.by ? { by: edit.by } : {};
   if (edit.action === "move") {
+    // A plan with an open Start at the gym never moves, on any path (one for just after
+    // midnight can be under way before midnight): the workout would stop counting for it.
+    if (evaluateGym(gym, now).find((r) => r.plan.id === plan.id)?.status === "in-progress")
+      return { ok: false, error: `plan ${plan.id} has an open Start at the gym; finish the session in Uplifting (a move would stop it counting)` };
     // Today's plan, and any plan under way, moves only the bounded way: same day, before its
     // start-by time, MAX_MOVES_PER_DAY times a day. Plans for later days move freely.
     if (started || localTime(ms(plan.start)).day === localTime(now).day) return reschedulePlan(gym, edit.id, edit.start, now, edit.by, edit.note);
@@ -693,7 +697,8 @@ export function reschedulePlan(gym: GymState, id: string, startIso: string, now:
   const result = evaluateGym(gym, now).find((r) => r.plan.id === id)!;
   if (result.status === "in-progress")
     return { ok: false, error: `plan ${id} has an open Start at the gym; finish the session in Uplifting (a move would stop it counting)` };
-  if (result.status !== "upcoming")
+  // A plan inside a travel pause may move out of it (the pause check below still applies).
+  if (result.status !== "upcoming" && result.status !== "paused")
     return { ok: false, error: `plan ${id} is ${result.status}; there is nothing to move` };
   if (startedBefore(plan, now) && now >= result.deadline)
     return {

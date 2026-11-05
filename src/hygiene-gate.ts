@@ -71,6 +71,7 @@ import {
   movesToday,
   parseMoveText,
   resolveMoveTime,
+  supersedeMoveDebts,
   type MoveCommand,
   type SlotMove,
   type Debt,
@@ -855,6 +856,7 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
       const items = [...new Set([...tapRequirements.map(r => r.slot), ...reportRequirements.map(r => r.slot), ...clearedSlots].map(itemKey))];
       const skipped = atTap.length ? atTap : atReport.length ? atReport : ["a lock cleared after the tap"];
       state.debts.push({ id: debtId, at: new Date(anchor).toISOString(), skipped, ...(items.length ? {items} : {}), itemsComplete: false, status: "open" });
+      supersedeMoveDebts(state, items, anchor, debtId, now);
       if (until > now) {
         applied = true;
         state.bypass.count += 1;
@@ -999,6 +1001,8 @@ export async function moveRequest(cmd: MoveCommand, by: string): Promise<MoveOut
  * change nothing and skip the lock.
  */
 export async function chargeMoves(): Promise<void> {
+  // The kill switch stops the gate charging anything, like every other gate action.
+  if (gateDisabled()) return;
   if (!chargeBrokenMoves(structuredClone(loadState()), deps.now()).length) return;
   await serialized(async () => {
     const state = structuredClone(loadState());
@@ -1123,9 +1127,9 @@ async function decideHumanTurn(
     return { action: "respond", text };
   }
   const move = turn.images.length ? null : parseMoveText(turn.text);
-  // An unnamed LATER is a gate reply only while something locks (bypass or not), so a clear
+  // An unnamed LATER is a gate reply only while the gate shows a lock, so a clear or bypassed
   // gate never swallows "later 5pm" meant for the chat. A named item (MOVE teeth 08:00) always is.
-  if (move && (move.items !== null || move.gym || outstanding(state, now).length > 0)) {
+  if (move && (move.items !== null || move.gym || locked)) {
     const text = moveReply(state, now, move, `chat:${thread || "unknown"}`);
     saveState(state);
     release(state, now, "MOVE");
