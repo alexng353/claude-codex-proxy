@@ -4,7 +4,7 @@ import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { refuseLocal } from "./pins";
-import { PREDICTION_DEADLINE, PredictionService } from "./predictions";
+import { PREDICTION_DEADLINE, PredictionService, screenPrediction } from "./predictions";
 import {
   preparePrediction,
   guardPredictionReply,
@@ -58,6 +58,8 @@ export type PredictionAttempt = {
   source: PredictionSource;
   /** Why the fork did not answer, when Haiku did instead. */
   fallback?: string;
+  /** A suggestion was made but screened out as a bare acknowledgement. */
+  screened?: boolean;
   forkMs?: number;
   fork?: ForkOutcome["usage"];
   forkAccount?: string;
@@ -84,6 +86,7 @@ export async function guardedModelPrediction(
   onTiming?: (timing: PredictionTiming) => void,
   dependencies: PredictionDependencies = productionDependencies,
   onModel?: (metrics: PredictionModelMetrics) => void,
+  onScreened?: () => void,
 ): Promise<string | null> {
   const started = Date.now();
   const prepared = await dependencies.prepare(
@@ -114,7 +117,10 @@ export async function guardedModelPrediction(
     outputGuardMs: Date.now() - guardStart,
     totalMs: Date.now() - started,
   });
-  return safe ? reply : null;
+  if (!safe) return null;
+  const shown = screenPrediction(reply);
+  if (shown === null) onScreened?.();
+  return shown;
 }
 let service: PredictionService | undefined;
 function localService(): PredictionService {
@@ -187,7 +193,11 @@ export function createPredictionService(
           if (outcome.kind === "suggested") {
             if (await dependencies.guardReply(outcome.text, signal)) {
               attempt.source = "fork";
-              return outcome.text;
+              // An ack is the fork echoing its own closing ask: show nothing rather
+              // than spend a Haiku call that has the same pull.
+              const shown = screenPrediction(outcome.text);
+              if (shown === null) attempt.screened = true;
+              return shown;
             }
             attempt.fallback = "unsafe text";
           }
@@ -202,6 +212,9 @@ export function createPredictionService(
         dependencies,
         (metrics) => {
           attempt.haiku = metrics.tokens;
+        },
+        () => {
+          attempt.screened = true;
         },
       );
     },
@@ -257,6 +270,7 @@ export async function handlePredictionRoute(
                 // service refused the request (a duplicate, busy, or invalid).
                 model: attempt ? attempt.source : "skipped",
                 ...(attempt?.fallback ? { fallback: attempt.fallback } : {}),
+                ...(attempt?.screened ? { screened: "ack" } : {}),
                 ...(attempt?.forkMs !== undefined ? { forkMs: attempt.forkMs } : {}),
                 ...(attempt?.fork ? { forkUsage: attempt.fork } : {}),
                 ...(attempt?.forkAccount ? { forkAccount: attempt.forkAccount } : {}),

@@ -1,9 +1,31 @@
 import { expect, test } from "bun:test";
 import {
   PredictionService,
+  contextMessages,
+  isBareAck,
   parsePrediction,
   predictionPrompt,
 } from "../src/predictions";
+
+test("a bare ack is only acknowledgement words, so a real message that starts with one survives", () => {
+  expect(isBareAck("ok sounds good gn")).toBe(true);
+  expect(isBareAck("thanks bubble, going to bed")).toBe(true);
+  expect(isBareAck("ok so why is gym paused today")).toBe(false);
+  expect(isBareAck("shower and teeth have been sent")).toBe(false);
+});
+
+test("Haiku sees Alex's own recent messages apart from the answer it would otherwise echo", () => {
+  const context =
+    "Alex: the x for goal tab is not pinned to the right\n\n" +
+    "Assistant: Logged it for the pane batch.\n\nShower, then bed. Bed by midnight.";
+  const messages = contextMessages(context);
+  expect(messages.map((m) => m.speaker)).toEqual(["Alex", "Assistant"]);
+  expect(messages[1]!.text).toContain("\n\nShower");
+  const prompt = JSON.parse(predictionPrompt(context, []));
+  expect(prompt.alex_recent).toEqual(["the x for goal tab is not pinned to the right"]);
+  expect(prompt.last_answer).toStartWith("Logged it");
+  expect(prompt.conversation).toBeUndefined();
+});
 
 test("one short attempt per completed turn and secrets refused before model", async () => {
   const calls: string[] = [];
@@ -33,7 +55,7 @@ test("one short attempt per completed turn and secrets refused before model", as
 });
 
 test("model JSON fences are parsed, but commentary is never shown as a prediction", () => {
-  expect(parsePrediction('```json\n{"prediction":"show me"}\n```')).toBe(
+  expect(parsePrediction('```json\n{"prediction":"show me","confidence":0.8}\n```')).toBe(
     "show me",
   );
   expect(parsePrediction('{"prediction":null}')).toBeNull();
@@ -47,7 +69,7 @@ test("slow retrieval reserves concurrency and retrieval errors fail closed", asy
   });
   let lookups = 0;
   const service = new PredictionService(
-    async () => "ok",
+    async () => "show me the diff",
     (text) => text,
     async () => {
       lookups++;
@@ -75,9 +97,9 @@ test("slow retrieval reserves concurrency and retrieval errors fail closed", asy
   });
   expect(lookups).toBe(2);
   release();
-  expect(await Promise.all([a, b, c])).toEqual(["ok", "ok", null]);
+  expect(await Promise.all([a, b, c])).toEqual(["show me the diff", "show me the diff", null]);
   const broken = new PredictionService(
-    async () => "ok",
+    async () => "show me the diff",
     (text) => text,
     async () => {
       throw new Error("offline");
@@ -108,7 +130,7 @@ test("runtime corpus and benchmark examples share a bounded prompt", () => {
   expect(prompt).toBe(predictionPrompt(context, evaluation));
   expect(prompt.length).toBeLessThan(12_000);
   expect(prompt).not.toContain("private-id");
-  expect(JSON.parse(prompt).conversation).toEndWith(
+  expect(JSON.parse(prompt).last_answer).toEndWith(
     "latest assistant response",
   );
 });
