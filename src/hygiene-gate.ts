@@ -325,7 +325,8 @@ function noticeEvent(record: ImageRecord, line: string | null, state: GateState,
   if (
     record.verdict === "duplicate" &&
     record.source.thread === "outage" &&
-    state.images.some((r) => r !== record && r.sha256 === record.sha256 && r.verdict === "accepted")
+    // The same proofs checkImage's copy check counts.
+    state.images.some((r) => r !== record && r.sha256 === record.sha256 && (r.verdict === "accepted" || r.verdict === "unneeded") && !r.gymOnly)
   )
     return null;
   const what = record.kind && record.kind !== "none" ? record.kind : (only?.kind ?? "photo");

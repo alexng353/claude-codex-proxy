@@ -324,22 +324,28 @@ async function flushOnce(statePath: string, send: WakeSender, now: number): Prom
   const isDue = (w: Wake) => !w.sentAt && !w.failedAt && (!!w.text || !!w.notice) && (w.nextAttemptAt ?? 0) <= now;
   const due = read(path).wakes.filter(isDue).map((w) => w.id);
   for (const id of due) {
-    // Read again just before sending (an earlier send may have taken seconds), and seal a
-    // notice under the lock, so an event that arrives late opens a new notice instead of
-    // changing this one's text after it went out.
-    let wake: { id: string; thread: string; machine?: string; text: string } | undefined;
-    try {
-      wake = update(path, (store) => {
-        const entry = store.wakes.find((w) => w.id === id);
-        if (!entry || !isDue(entry)) return undefined;
-        if (entry.notice) entry.notice.text ??= noticeText(entry.notice).slice(0, MAX_TEXT);
-        const text = entry.notice ? entry.notice.text : entry.text;
-        return text ? { id: entry.id, thread: entry.thread, ...(entry.machine ? { machine: entry.machine } : {}), text } : undefined;
-      });
-    } catch (error) {
-      console.error("hygiene-gate: could not read a wake to send; retrying later:", (error as Error).message);
-      continue;
+    // Read again just before sending: an earlier send may have taken seconds.
+    let entry = read(path).wakes.find((w) => w.id === id);
+    if (!entry || !isDue(entry)) continue;
+    if (entry.notice && entry.notice.text === undefined) {
+      // Seal a notice under the lock, so an event that arrives late opens a new notice
+      // instead of changing this one's text after it went out. Only a notice pays for this
+      // write: an unlock wake goes out even when the store can't be written.
+      try {
+        entry = update(path, (store) => {
+          const fresh = store.wakes.find((w) => w.id === id);
+          if (!fresh || !isDue(fresh) || !fresh.notice) return undefined;
+          fresh.notice.text ??= noticeText(fresh.notice).slice(0, MAX_TEXT);
+          return structuredClone(fresh);
+        });
+      } catch (error) {
+        console.error("hygiene-gate: could not seal a photo notice; retrying later:", (error as Error).message);
+        continue;
+      }
+      if (!entry) continue;
     }
+    const text = entry.notice ? entry.notice.text : entry.text;
+    const wake = text ? { id: entry.id, thread: entry.thread, ...(entry.machine ? { machine: entry.machine } : {}), text } : undefined;
     if (!wake) continue;
     const sending = wake;
     let result: WakeResult;

@@ -1991,21 +1991,25 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     await flushWakes();
     expect(notices).toHaveLength(1);
     // The attempt sealed that line: a later photo opens its own, and the retry sends the same bytes.
+    // The clock goes back inside the first window, so only the seal keeps the photo out of it.
+    clock -= minutes(1);
     exif["old-shower"] = clock - minutes(40);
-    clock += 1_000;
     const old = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("old-shower") }, { kind: "shower", slot: () => true });
     expect(old.verdict).toBe("stale");
-    clock += 31_000;
+    clock += minutes(1) + 31_000;
     await flushWakes();
     expect(notices).toHaveLength(2);
     expect(notices[1].id).toBe(notices[0].id);
     expect(notices[1].text).toBe(notices[0].text);
     expect(notices[1].text).toBe("credited: morning teeth 06:00; nothing outstanding");
-    clock += minutes(2);
+    clock += minutes(1);
     await flushWakes();
     expect(notices).toHaveLength(3);
     expect(notices[2].id).not.toBe(notices[0].id);
     expect(notices[2].text).toBe("rejected: shower (photo too old); nothing outstanding");
+    clock += minutes(60);
+    await flushWakes();
+    expect(notices).toHaveLength(3);
   });
 
   test("a notice store that can't be written never blocks the credit, and the notice follows once it can", async () => {
@@ -2061,25 +2065,30 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
   });
 
   test("a Cairn credit and an outage replay each notify; a replay of a credited photo is not a reject", async () => {
-    verdicts.push(teeth);
-    const cairn = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("cairn-teeth") }, { kind: "teeth", slot: (s) => s.endsWith("/morning-teeth") });
+    const shower = { kind: "shower", confidence: 0.95, reason: "in the shower" } as Verdict;
+    const replay = (name: string) =>
+      handleRequest(new Request("http://localhost/hygiene/recheck", { method: "POST", body: JSON.stringify({ url: photo(name), at: clock }) }));
+    // Morning teeth stays due until the end, so the gate is locked and every photo counts as a try.
+    verdicts.push(shower);
+    const cairn = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("cairn-shower") }, { kind: "shower", slot: () => true });
     expect(cairn.result).toBe("pass");
     clock += minutes(2);
     await flushWakes();
-    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; nothing outstanding"]);
-    // The same photo replayed from a follower's outage queue: an exact copy, already told as credited.
-    clock = at(DAY, "21:30");
-    const replay = (name: string) =>
-      handleRequest(new Request("http://localhost/hygiene/recheck", { method: "POST", body: JSON.stringify({ url: photo(name), at: clock }) }));
-    expect((await replay("cairn-teeth")).ok).toBe(true);
+    expect(notices.map((n) => n.text)).toEqual(["credited: shower 06:00; still due: morning teeth photo"]);
+    // The same photo replayed from a follower's outage queue (it lost the reply): a copy, told as credited.
+    clock += minutes(1);
+    expect((await replay("cairn-shower")).ok).toBe(true);
+    const state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    expect(state.images.at(-1)).toMatchObject({ verdict: "duplicate", locked: true, source: { thread: "outage" } });
     // A new photo from the outage queue is a real credit.
-    verdicts.push({ kind: "shower", confidence: 0.95, reason: "in the shower" } as Verdict);
-    expect((await replay("outage-shower")).ok).toBe(true);
+    verdicts.push(teeth);
+    expect((await replay("outage-teeth")).ok).toBe(true);
     clock += minutes(2);
     await flushWakes();
-    expect(notices).toHaveLength(2);
-    expect(notices[1].text).toStartWith("credited: shower 21:30; ");
-    expect(notices[1].text).not.toContain("rejected");
+    expect(notices.map((n) => n.text)).toEqual([
+      "credited: shower 06:00; still due: morning teeth photo",
+      "credited: morning teeth 06:03; nothing outstanding",
+    ]);
   });
 
   test("the batch takes every photo until the flush seals it; a later one opens a new line", async () => {
