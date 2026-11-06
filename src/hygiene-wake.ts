@@ -79,7 +79,8 @@ export type Wake = {
 };
 
 export type NoticeEvent = { kind: "credited" | "rejected"; text: string };
-type Notice = { closesAt: number; credited: string[]; rejected: string[]; tail: string };
+/** `sealed`: the flush took its text; nothing may join it, so every retry sends the same bytes. */
+type Notice = { closesAt: number; credited: string[]; rejected: string[]; tail: string; sealed?: boolean };
 
 type Store = { held: HeldMessage[]; wakes: Wake[] };
 
@@ -258,11 +259,6 @@ export const noticeThread = (): string | null => {
 };
 /** Photos within this long of the first one go out as one line. */
 export const NOTICE_WINDOW_MS = 2 * 60_000;
-/**
- * An event joins an open notice only until this long before it closes: the
- * flush reads the text after the close, so no event can land after that read.
- */
-const NOTICE_MARGIN_MS = 5_000;
 
 export function noticeText(notice: Pick<Notice, "credited" | "rejected" | "tail">): string {
   // Newest first, as Alex reads it ("credited: night teeth 23:16, shower 23:12").
@@ -287,7 +283,7 @@ export function addNotice(statePath: string, events: NoticeEvent[], tail: string
   update(storePath(statePath), (store) => {
     store.wakes = store.wakes.filter((w) => !(w.sentAt || w.failedAt) || now - Date.parse(w.at) <= RECEIPT_KEEP_MS);
     let wake = store.wakes.find(
-      (w) => w.notice && w.thread === thread && !w.sentAt && !w.failedAt && !w.attempts && now < w.notice.closesAt - NOTICE_MARGIN_MS,
+      (w) => w.notice && !w.notice.sealed && w.thread === thread && !w.sentAt && !w.failedAt && !w.attempts && now < w.notice.closesAt,
     );
     if (!wake) {
       const closesAt = now + NOTICE_WINDOW_MS;
@@ -321,9 +317,22 @@ async function flushOnce(statePath: string, send: WakeSender, now: number): Prom
   const isDue = (w: Wake) => !w.sentAt && !w.failedAt && !!w.text && (w.nextAttemptAt ?? 0) <= now;
   const due = read(path).wakes.filter(isDue).map((w) => w.id);
   for (const id of due) {
-    // Read again just before sending: an earlier send in this loop may have taken seconds.
-    const wake = read(path).wakes.find((w) => w.id === id);
-    if (!wake || !isDue(wake)) continue;
+    // Read again just before sending (an earlier send may have taken seconds), and seal a
+    // notice under the lock, so an event that arrives late opens a new notice instead of
+    // changing this one's text after it went out.
+    let wake: Wake | undefined;
+    try {
+      wake = update(path, (store) => {
+        const entry = store.wakes.find((w) => w.id === id);
+        if (!entry || !isDue(entry)) return undefined;
+        if (entry.notice) entry.notice.sealed = true;
+        return { ...entry };
+      });
+    } catch (error) {
+      console.error("hygiene-gate: could not read a wake to send; retrying later:", (error as Error).message);
+      continue;
+    }
+    if (!wake) continue;
     let result: WakeResult;
     try {
       result = await send({ id: wake.id, thread: wake.thread, ...(wake.machine ? { machine: wake.machine } : {}), text: wake.text! });

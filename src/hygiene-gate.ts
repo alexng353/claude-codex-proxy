@@ -176,6 +176,7 @@ let deps: GateDeps = { ...defaults };
 /** For tests: swap the clock, classifier or hashers. */
 export function setGateDeps(overrides: Partial<GateDeps>): void {
   deps = { ...defaults, ...overrides };
+  unqueued = [];
 }
 
 // ---- Files ----
@@ -272,20 +273,37 @@ function saveState(state: GateState): void {
  * that throws before saving leaves nothing behind.
  */
 const pendingNotices = new WeakMap<GateState, NoticeEvent[]>();
+/**
+ * Saved verdicts whose notice could not be queued (the store's lock was busy
+ * or the disk failed); tried again before the next notice or flush. Lost on a
+ * restart: a credit is never held back for its notice.
+ */
+let unqueued: Array<{ events: NoticeEvent[]; tail: string }> = [];
+const UNQUEUED_MAX = 50;
+
+function queueNotices(now: number): void {
+  while (unqueued.length) {
+    const { events, tail } = unqueued[0];
+    addNotice(statePath(), events, tail, now);
+    unqueued.shift();
+  }
+}
 
 function sendNotices(state: GateState): void {
   const events = pendingNotices.get(state);
   if (!events?.length) return;
   pendingNotices.delete(state);
+  const now = deps.now();
+  const due = outstanding(state, now);
+  const open = bypassActive(state, now) ? ` (bypass open until ${clockLabel(Date.parse(state.bypass.until!))})` : "";
+  const tail = due.length ? `still due: ${due.map((r) => r.label).join(", ")}${open}` : "nothing outstanding";
+  unqueued.push({ events, tail });
+  if (unqueued.length > UNQUEUED_MAX) unqueued = unqueued.slice(-UNQUEUED_MAX);
   try {
-    const now = deps.now();
-    const due = outstanding(state, now);
-    const open = bypassActive(state, now) ? ` (bypass open until ${clockLabel(Date.parse(state.bypass.until!))})` : "";
-    const tail = due.length ? `still due: ${due.map((r) => r.label).join(", ")}${open}` : "nothing outstanding";
-    addNotice(statePath(), events, tail, now);
+    queueNotices(now);
   } catch (error) {
     // The credit is already saved; a lost notice must never fail the gate.
-    console.error("hygiene-gate: could not queue a photo notice:", (error as Error).message);
+    console.error("hygiene-gate: could not queue a photo notice; retrying on the next flush:", (error as Error).message);
   }
 }
 
@@ -477,6 +495,11 @@ const armed = (state: GateState, now: number) => outstanding(state, now).length 
 /** Sends queued wakes now; the server's timer retries any that fail. */
 export async function flushWakes(): Promise<void> {
   if (!remoteGate()) await refreshFaults();
+  try {
+    queueNotices(deps.now());
+  } catch (error) {
+    console.error("hygiene-gate: could not queue a photo notice; retrying on the next flush:", (error as Error).message);
+  }
   await flushWakeQueue(statePath(), deps.wake, deps.now);
 }
 
@@ -1591,6 +1614,9 @@ export async function creditPenancePhoto(
     state.filled[slot] = atNow;
     debt.penance.paidAt = atNow;
     debt.status = "paid";
+    // A photo first told to Bubble as rejected must be told as credited too.
+    const credited = noticeEvent(record, null, state);
+    if (credited) pendingNotices.set(state, [...(pendingNotices.get(state) ?? []), { ...credited, text: `${credited.text}, credited by ${by.slice(0, 40)}` }]);
     saveState(state);
     console.error(`hygiene-gate: penance ${debt.id} credited from photo ${sha.slice(0, 12)} by ${by}: ${reason.slice(0, 120)}`);
     release(state, now, "photo accepted");

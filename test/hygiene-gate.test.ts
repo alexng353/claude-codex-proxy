@@ -486,6 +486,12 @@ describe("BYPASS, debt and penance", () => {
     // Paid now, not at the photo's time.
     expect(state.debts[0]).toMatchObject({ status: "paid", penance: { paidAt: new Date(clock).toISOString() } });
     expect((await credit("a", reason)).status).toBe(409);
+    // Bubble hears of the credit once, with who credited it.
+    clock += 2 * 60_000;
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    expect(notices[0].text).toStartWith("credited: penance (");
+    expect(notices[0].text).toContain(" 07:29, credited by test; still due: morning teeth photo");
   });
 
   test("a photo credited by 2583b55 (marked manual) is moved to credited on load, so it is withheld again", async () => {
@@ -1984,14 +1990,25 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     clock += minutes(2);
     await flushWakes();
     expect(notices).toHaveLength(1);
+    // The attempt sealed that line: a later photo opens its own, and the retry sends the same bytes.
+    exif["old-shower"] = clock - minutes(40);
+    clock += 1_000;
+    const old = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("old-shower") }, { kind: "shower", slot: () => true });
+    expect(old.verdict).toBe("stale");
     clock += 31_000;
     await flushWakes();
     expect(notices).toHaveLength(2);
     expect(notices[1].id).toBe(notices[0].id);
     expect(notices[1].text).toBe(notices[0].text);
+    expect(notices[1].text).toBe("credited: morning teeth 06:00; nothing outstanding");
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(3);
+    expect(notices[2].id).not.toBe(notices[0].id);
+    expect(notices[2].text).toBe("rejected: shower (photo too old); nothing outstanding");
   });
 
-  test("a notice store that can't be written never blocks the credit", async () => {
+  test("a notice store that can't be written never blocks the credit, and the notice follows once it can", async () => {
     await mkdir(heldStore(), { recursive: true });
     const logged = spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -2004,6 +2021,12 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     } finally {
       logged.mockRestore();
     }
+    await rm(heldStore(), { recursive: true });
+    await flushWakes();
+    expect(notices).toHaveLength(0);
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; nothing outstanding"]);
   });
 
   test("photos nobody asked about post nothing", async () => {
