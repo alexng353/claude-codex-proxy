@@ -54,13 +54,20 @@ export function predictionPrompt(context: string, examples: unknown[]): string {
     return [{ assistant: assistant.slice(-300), alex: alex.slice(0, 200) }];
   });
   const messages = contextMessages(context);
+  // A turn ends on an answer, so anything parsed after the last "Assistant: " is a quoted
+  // "Alex: " paragraph inside that answer (the text format cannot tell them apart): it
+  // belongs to the answer, and never to his own words.
+  let end = messages.length;
+  while (end > 0 && messages[end - 1]!.speaker !== "Assistant") end--;
+  const answer = end
+    ? [messages[end - 1]!.text, ...messages.slice(end).map((m) => `${m.speaker}: ${m.text}`)].join("\n\n")
+    : context;
   // His own words carry the style; the answer is context, its closing ask least of all.
-  const alex = messages.filter((m) => m.speaker === "Alex").slice(-6).map((m) => clip(m.text, 300));
-  const last = messages.at(-1);
-  // The text format cannot be split for certain: a quoted "Alex: " paragraph inside an
-  // answer looks like his message. When the split does not end on an answer, send the
-  // whole context's clipped text rather than no answer at all.
-  const answer = last?.speaker === "Assistant" ? last.text : context;
+  const alex = messages
+    .slice(0, end ? end - 1 : 0)
+    .filter((m) => m.speaker === "Alex")
+    .slice(-6)
+    .map((m) => clip(m.text, 300));
   return JSON.stringify({
     alex_recent: alex,
     last_answer: clip(answer, 1200, 300),
@@ -75,7 +82,7 @@ const ACK_PHRASES = (
   "sounds good|sounds great|makes sense|got it|will do|go ahead|go for it|do it|send it|ship it|works for me|that works|" +
   "thank you|good night|goodnight|night night|all good|all right|for now|heading to bed|going to bed|off to bed|" +
   "ok|okay|okk|okie|oki|k|kk|alright|aight|sure|yes|yep|yeah|yeh|ye|yea|ya|yup|mhm|np|cool|nice|great|perfect|awesome|" +
-  "sweet|bet|noted|fine|lgtm|sg|sgtm|thanks|thx|ty|tysm|appreciate it|appreciated|fair|agreed|gn|night|nite|bye|cya|ttyl|" +
+  "sweet|bet|noted|fine|lgtm|sg|sgtm|thanks|thx|ty|tysm|i appreciate it|appreciate it|appreciated|fair|agreed|gn|night|nite|bye|cya|ttyl|" +
   "lol|haha"
 )
   .split("|")
@@ -86,7 +93,8 @@ const ACK_FILLER = new Set("so and then now im ah oh bubble buddy bro man very m
 
 /** Only acknowledgement phrases (and filler between them), at least one phrase, and
  * no question: "do i go to bed now?" asks something, "ok sounds good gn" does not.
- * Text with no letters or digits at all ("👍") is an acknowledgement too. */
+ * A guess with no letters or digits at all ("👍", "...") is screened too: a symbols-only
+ * suggestion is not worth showing, whatever it means. */
 export function isBareAck(text: string): boolean {
   if (text.includes("?")) return false;
   let rest = ` ${text

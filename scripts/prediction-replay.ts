@@ -483,17 +483,29 @@ async function runHaikuRaw(c: Case, corpus: PredictionCorpus | undefined): Promi
   );
   child.stdin.write(predictionPrompt(c.context, examples));
   child.stdin.end();
-  const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
-  const out = await new Response(child.stdout).text();
-  await child.exited;
-  clearTimeout(timer);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, 20_000);
+  let out: string;
+  try {
+    out = await new Response(child.stdout).text();
+    await child.exited;
+  } finally {
+    clearTimeout(timer);
+  }
+  // A timeout or unreadable output is not the model declining: say which it was.
+  if (timedOut) return { id: c.id, predictor: "haiku-raw", shown: null, kind: "timeout", ms: Math.round(performance.now() - started) };
   let parsed = null as ReturnType<typeof parsePredictionReply>;
   let usage: Record<string, number> | undefined;
   try {
     const event = JSON.parse(out);
     parsed = parsePredictionReply(String(event.result ?? ""));
     usage = { inputTokens: event.usage?.input_tokens ?? 0, cacheReadTokens: event.usage?.cache_read_input_tokens ?? 0, cacheWriteTokens: event.usage?.cache_creation_input_tokens ?? 0, outputTokens: event.usage?.output_tokens ?? 0 };
-  } catch {}
+  } catch {
+    return { id: c.id, predictor: "haiku-raw", shown: null, kind: "parse", ms: Math.round(performance.now() - started) };
+  }
   const raw = parsed?.prediction ?? null;
   return { id: c.id, predictor: "haiku-raw", shown: raw, raw, confidence: parsed?.confidence, ms: Math.round(performance.now() - started), tokens: usage };
 }

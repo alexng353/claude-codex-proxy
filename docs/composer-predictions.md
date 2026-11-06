@@ -33,9 +33,10 @@ Haiku's guess was under the threshold. Alex sent a bare ack 1 time in 90
 replayed turn ends, and in under 1% of his 1,409 messages over two weeks.
 
 The context is plain text, so a quoted `Alex: ` paragraph inside an answer can
-split wrongly; when the split does not end on an answer, `last_answer` is the
-clipped whole context instead. Structured messages from Today would remove the
-guess.
+split wrongly. A turn ends on an answer, so everything after the last
+`Assistant: ` belongs to `last_answer` and never to `alex_recent`; with no
+answer at all, `last_answer` is the clipped whole context. Structured messages
+from Today would remove the guess.
 
 `scripts/prediction-replay.ts` replays real turn ends from Today's log against
 what Alex sent next (exact and near match, bare-ack and ack-led share, shown
