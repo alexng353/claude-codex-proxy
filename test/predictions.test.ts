@@ -9,7 +9,7 @@ import {
 
 test("a bare ack is only acknowledgement words, so a real message that starts with one survives", () => {
   for (const ack of ["ok sounds good gn", "thanks bubble, going to bed", "makes sense", "yes do it", "Sounds good, thanks!", "ok",
-    "👍", "mhm", "ye", "okie", "ah ok", "oh nice", "fine"])
+    "👍", "mhm", "ye", "okie", "ah ok", "oh nice", "fine", "...", "thanks i appreciate it", "thank you so much"])
     expect(isBareAck(ack)).toBe(true);
   for (const real of ["ok so why is gym paused today", "shower and teeth have been sent", "will you do that?", "do i go to bed now?",
     "will you do that", "ok and the pane thing", "you sure?", "and then?", "send me that", "?", "do it later", "i do it",
@@ -31,8 +31,15 @@ test("Haiku sees Alex's own recent messages apart from the answer it would other
 });
 
 test("a quoted 'Alex: ' paragraph in an answer never leaves Haiku without the answer", () => {
-  const context = "Alex: fix\n\nAssistant: summary of what you said:\n\nAlex: quoted line from user";
-  expect(JSON.parse(predictionPrompt(context, [])).last_answer).toBe(context);
+  const older = Array.from({ length: 6 }, (_, i) => `Alex: old message ${i} ${"o".repeat(300)}`).join("\n\n");
+  const context = `${older}\n\nAssistant: ANSWER_START summary of what you said:\n\nAlex: quoted line from user`;
+  const prompt = JSON.parse(predictionPrompt(context, []));
+  expect(prompt.last_answer).toStartWith("ANSWER_START");
+  expect(prompt.last_answer).toEndWith("Alex: quoted line from user");
+  expect(prompt.alex_recent).not.toContain("quoted line from user");
+  expect(prompt.alex_recent).toHaveLength(6);
+  // No answer at all: the whole context, clipped.
+  expect(JSON.parse(predictionPrompt("just text", [])).last_answer).toBe("just text");
 });
 
 test("the prompt keeps his last six messages, clipped, and a clipped answer", () => {
