@@ -16,6 +16,7 @@
  *   bun scripts/prediction-replay.ts extract            # cases.jsonl
  *   bun scripts/prediction-replay.ts run haiku LABEL    # LABEL-haiku.jsonl
  *   bun scripts/prediction-replay.ts run fork LABEL     # LABEL-fork.jsonl
+ *   bun scripts/prediction-replay.ts run haiku-raw LABEL  # guess + stated confidence, unscreened (tuning)
  *   bun scripts/prediction-replay.ts score LABEL...     # table, text-free
  * Env: REPLAY_THREADS (comma list, default Bubble + the chats Alex wrote most in),
  * REPLAY_DAYS (5), REPLAY_MAX (per thread, 80), REPLAY_FORK_MAX (fork cases, 40),
@@ -34,7 +35,7 @@ import { FORK_PREDICTION_PROMPT, parseForkResult, type ForkOutcome } from "../sr
 import { guardedModelPrediction } from "../src/prediction-route";
 import { closePredictionModel, prewarmPredictionModel } from "../src/prediction-model";
 import { closePredictionPreparation, guardPredictionReply } from "../src/prediction-preparation";
-import * as predictions from "../src/predictions";
+import { parsePredictionReply, predictionPrompt, PREDICTION_SYSTEM, safePredictionExamples, screenPrediction } from "../src/predictions";
 
 const dir = process.env.REPLAY_DIR ?? join(homedir(), ".cache/prediction-bias");
 mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -77,6 +78,8 @@ export type Result = {
   /** The model's raw text, before any screening. */
   raw?: string | null;
   kind?: string;
+  /** haiku-raw only: the model's stated confidence. */
+  confidence?: number;
   ms: number;
   tokens?: Record<string, number>;
 };
@@ -133,11 +136,16 @@ const ACK_WORDS = new Set(
   ("ok okay k kk okk sounds sound good great cool nice thanks thank you thx ty tysm gn goodnight night nite " +
     "yes yep yeah yea ya yup sure perfect got it will do alright aight bet lgtm done np noted fine sg sgtm awesome " +
     "sweet makes sense go ahead true fair agreed mhm lol haha for now then all right that works me heading to bed " +
-    "sleep going off im ill i").split(" "),
+    "sleep going off im ill i bubble").split(" "),
 );
 export function scorerBareAck(text: string): boolean {
   const t = tokens(text);
   return t.length > 0 && t.length <= 8 && t.every((w) => ACK_WORDS.has(w));
+}
+const LEAD_WORDS = new Set("ok okay k kk alright sure yes yep yeah yea sounds thanks thank thx ty cool nice perfect great got gn".split(" "));
+/** Opens with an acknowledgement ("ok so…", "thanks, …"), the echo's milder form. */
+export function ackLed(text: string): boolean {
+  return LEAD_WORDS.has(tokens(text)[0] ?? "");
 }
 /** The answer ends on something to agree to: a question, an offer, or a bedtime/sign-off. */
 export function closingAsk(answer: string): boolean {
@@ -296,11 +304,10 @@ function extract(): void {
 
 // ---- predictors ----
 
-/** What the checkout's route shows for a fork outcome (no Haiku fallback here). */
+/** What the checkout's route shows for a fork outcome (no Haiku fallback here).
+ * The BEFORE run (commit 6e2d776, main's code) showed outcome.text unscreened. */
 function forkShown(outcome: ForkOutcome, safe: boolean): string | null {
-  const screen = (predictions as Record<string, unknown>).screenPrediction as ((text: string) => string | null) | undefined;
-  if (outcome.kind !== "suggested" || !safe) return null;
-  return screen ? screen(outcome.text) : outcome.text;
+  return outcome.kind === "suggested" && safe ? screenPrediction(outcome.text) : null;
 }
 
 let rollouts: Map<string, string> | undefined;
@@ -425,6 +432,36 @@ async function runFork(c: Case): Promise<Result> {
 }
 
 const scrubber = createScrubber();
+
+/** One Haiku call with the checkout's prompt, keeping the stated confidence. */
+async function runHaikuRaw(c: Case, corpus: PredictionCorpus | undefined): Promise<Result> {
+  const scrub = (t: string) => scrubber.scrub(t);
+  const started = performance.now();
+  if (scrub(c.context) !== c.context) return { id: c.id, predictor: "haiku-raw", shown: null, kind: "scrubbed", ms: 0 };
+  const examples = safePredictionExamples(corpus ? corpus.examples(c.context, 0, c.completedAt) : [], scrub);
+  const env = { ...process.env } as Record<string, string>;
+  for (const key of STRIPPED_ENV) delete env[key];
+  const account = listAccounts().find((a) => a.isDefault)!;
+  const child = Bun.spawn(
+    [process.env.CLAUDE_BIN ?? "claude", "-p", "--no-session-persistence", "--output-format", "json", "--model", "haiku", "--effort", "low",
+      "--safe-mode", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--tools", "", "--max-turns", "1",
+      "--system-prompt", PREDICTION_SYSTEM],
+    { stdin: "pipe", stdout: "pipe", stderr: "ignore", cwd: homedir(), env: { ...env, ...accountEnv(account), CLAUDE_CODE_EFFORT_LEVEL: "low" } },
+  );
+  child.stdin.write(predictionPrompt(c.context, examples));
+  child.stdin.end();
+  const out = await new Response(child.stdout).text();
+  await child.exited;
+  let parsed = null as ReturnType<typeof parsePredictionReply>;
+  let usage: Record<string, number> | undefined;
+  try {
+    const event = JSON.parse(out);
+    parsed = parsePredictionReply(String(event.result ?? ""));
+    usage = { inputTokens: event.usage?.input_tokens ?? 0, cacheReadTokens: event.usage?.cache_read_input_tokens ?? 0, cacheWriteTokens: event.usage?.cache_creation_input_tokens ?? 0, outputTokens: event.usage?.output_tokens ?? 0 };
+  } catch {}
+  const raw = parsed?.prediction ?? null;
+  return { id: c.id, predictor: "haiku-raw", shown: raw, raw, confidence: parsed?.confidence, ms: Math.round(performance.now() - started), tokens: usage };
+}
 async function runHaiku(c: Case, corpus: PredictionCorpus | undefined): Promise<Result> {
   // Production retrieves examples itself; here only rows older than the turn, so
   // Alex's actual reply can never be an example for its own case.
@@ -456,6 +493,13 @@ async function run(predictor: string, label: string): Promise<void> {
       const r = await runFork(c);
       results.push(r);
       console.error(`fork ${index + 1}/${cases.length} ${r.kind} ${r.ms} ms read ${r.tokens?.cacheReadTokens} write ${r.tokens?.cacheWriteTokens}`);
+    }
+  } else if (predictor === "haiku-raw") {
+    const index = join(homedir(), ".local/state/today/composer-predictions.sqlite");
+    const corpus = existsSync(index) ? new PredictionCorpus(new Database(index, { readonly: true }), (t) => scrubber.scrub(t), false) : undefined;
+    for (const [i, c] of cases.entries()) {
+      results.push(await runHaikuRaw(c, corpus));
+      if (i % 10 === 0) console.error(`haiku-raw ${i + 1}/${cases.length}`);
     }
   } else {
     prewarmPredictionModel();
@@ -490,6 +534,7 @@ export function summarize(cases: Case[], results: Result[]) {
     onTopic: count((r, c) => onTopic(r.shown!, c.reference)),
     acks: count((r) => scorerBareAck(r.shown!)),
     ackShare: pct(count((r) => scorerBareAck(r.shown!)), shown.length),
+    ackLedShare: pct(count((r) => ackLed(r.shown!)), shown.length),
     nearOfAll: pct(count((r, c) => nearMatch(r.shown!, c.reference)), rows.length),
     nearOfShown: pct(count((r, c) => nearMatch(r.shown!, c.reference)), shown.length),
     onTopicOfShown: pct(count((r, c) => onTopic(r.shown!, c.reference)), shown.length),
@@ -507,6 +552,7 @@ function score(labels: string[]): void {
   const base = (list: Case[]) => ({
     n: list.length,
     acks: list.filter((c) => scorerBareAck(c.reference)).length,
+    ackLed: list.filter((c) => ackLed(c.reference)).length,
     asks: list.filter((c) => closingAsk(c.lastAnswer)).length,
     acksAfterAsks: list.filter((c) => closingAsk(c.lastAnswer) && scorerBareAck(c.reference)).length,
   });
@@ -514,16 +560,16 @@ function score(labels: string[]): void {
     const own = cases.filter((c) => split === "all" || c.split === split);
     const b = base(own);
     console.log(
-      `\n## ${split}: ${b.n} cases; Alex's own next messages that are bare acks: ${b.acks} (${((100 * b.acks) / (b.n || 1)).toFixed(1)}%); ` +
+      `\n## ${split}: ${b.n} cases; Alex's own next messages that are bare acks: ${b.acks} (${((100 * b.acks) / (b.n || 1)).toFixed(1)}%), ack-led: ${b.ackLed}; ` +
         `turns ending on a closing ask: ${b.asks}, after which Alex sent a bare ack: ${b.acksAfterAsks}`,
     );
-    console.log("| run | n | shown | exact | near | near/all | near/shown | on-topic/shown | bare acks shown | ack share of shown | p50 ms | p90 ms | in tok | out tok |");
-    console.log("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    console.log("| run | n | shown | exact | near | near/all | near/shown | on-topic/shown | bare acks shown | ack share of shown | ack-led of shown | p50 ms | p90 ms | in tok | out tok |");
+    console.log("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for (const label of labels) {
       if (!existsSync(join(dir, label))) continue;
       const s = summarize(own, readLines<Result>(label));
       console.log(
-        `| ${label.replace(/\.jsonl$/, "")} | ${s.n} | ${s.shown} | ${s.exact} | ${s.near} | ${s.nearOfAll} | ${s.nearOfShown} | ${s.onTopicOfShown} | ${s.acks} | ${s.ackShare} | ${s.p50ms} | ${s.p90ms} | ${s.meanInTokens} | ${s.meanOutTokens} |`,
+        `| ${label.replace(/\.jsonl$/, "")} | ${s.n} | ${s.shown} | ${s.exact} | ${s.near} | ${s.nearOfAll} | ${s.nearOfShown} | ${s.onTopicOfShown} | ${s.acks} | ${s.ackShare} | ${s.ackLedShare} | ${s.p50ms} | ${s.p90ms} | ${s.meanInTokens} | ${s.meanOutTokens} |`,
       );
     }
   }
@@ -534,6 +580,19 @@ if (import.meta.main) {
   if (command === "extract") extract();
   else if (command === "run") await run(rest[0]!, rest[1]!);
   else if (command === "score") score(rest);
+  else if (command === "sweep") sweep(rest[0]!);
   else console.error("usage: extract | run haiku|fork LABEL | score FILE...");
   process.exit(0);
+}
+
+/** A haiku-raw run under each confidence cutoff, screened as production screens. */
+function sweep(file: string): void {
+  const results = readLines<Result>(file);
+  const cases = readLines<Case>("cases.jsonl").filter((c) => results.some((r) => r.id === c.id));
+  console.log("| min confidence | shown | near | near/shown | on-topic/shown | acks shown | ack-led of shown |");
+  console.log("|---|---|---|---|---|---|---|");
+  for (const min of [0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]) {
+    const s = summarize(cases, results.map((r) => ({ ...r, shown: (r.confidence ?? 0) >= min ? screenPrediction(r.raw ?? null) : null })));
+    console.log(`| ${min} | ${s.shown} | ${s.near} | ${s.nearOfShown} | ${s.onTopicOfShown} | ${s.acks} | ${s.ackLedShare} |`);
+  }
 }

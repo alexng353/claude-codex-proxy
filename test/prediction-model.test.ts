@@ -10,7 +10,7 @@ const responder = `
 console.log(JSON.stringify({type:"system", subtype:"init"}));
 for await (const chunk of Bun.stdin.stream()) {
  const input = JSON.parse(new TextDecoder().decode(chunk));
- console.log(JSON.stringify({type:"result", result:JSON.stringify({prediction:input.message.content}), duration_api_ms:7}));
+ console.log(JSON.stringify({type:"result", result:JSON.stringify({prediction:input.message.content, confidence:0.9}), duration_api_ms:7}));
 }
 `;
 describe("one-shot prediction workers", () => {

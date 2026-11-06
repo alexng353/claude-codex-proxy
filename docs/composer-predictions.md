@@ -11,11 +11,31 @@ There is no retry. At most two requests run concurrently, including
 retrieval. Generation uses the existing subscription account environment with
 billing/API-key variables removed, Haiku, low effort, no tools, no session
 persistence. One absolute deadline covers preparation, retrieval, generation, and output checking: the earlier of the caller deadline and 12 seconds after receipt. Output must be a short single-line string
-inside a JSON prediction response; null or invalid output produces no suggestion.
+inside a JSON prediction response with a stated `confidence` of at least 0.3
+(`MIN_PREDICTION_CONFIDENCE`); null, invalid, unsure or confidence-less output
+produces no suggestion.
 With the fork switch on (below), Haiku is the fallback instead of the only model.
 
-The shared prompt builder keeps the last 3,000 context characters and at most
-two example pairs (500 assistant characters and 200 reply characters each).
+The prompts model Alex, not the assistant. The shared prompt builder splits
+Today's context into messages and sends Alex's own last six messages
+(`alex_recent`, 300 characters each) apart from the assistant's last answer
+(`last_answer`, its first 1,200 and last 300 characters), plus at most two
+example pairs (300 assistant characters and 200 reply characters each). The
+system prompt and the fork prompt say that Alex rarely just agrees, and that the
+answer's closing question, offer or instruction is not the thing to reply to.
+
+Every path then screens the text (`screenPrediction`): a bare acknowledgement,
+approval or sign-off ("ok sounds good gn", "yes do it", "thanks bubble") is
+never shown. A fork that offers one counts as declined, with no Haiku call, and
+the usage line says `screened: "ack"`. Alex sent such a message 1 time in 90
+replayed turn ends, and in under 1% of his 1,409 messages over two weeks.
+
+`scripts/prediction-replay.ts` replays real turn ends from Today's log against
+what Alex sent next (exact and near match, bare-ack and ack-led share, shown
+rate) for the Haiku path and a cold replay of the fork prompt, on a dev slice and
+the newest 30% held out. Its raw text stays in 0600 files under
+`~/.cache/prediction-bias`.
+
 Corpus examples are independently opt-in (`corpusEnabled: true`); the default is no examples. The shared runtime/evaluation boundary checks raw context and each raw example field before JSON escaping or truncation, and checks
 the prediction before return. The local usage log contains time, model, duration,
 and whether a suggestion was produced; it contains no message text.

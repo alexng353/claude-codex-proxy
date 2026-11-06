@@ -24,8 +24,8 @@ import { stateDir, threadParkSession } from "./sessions";
 
 export const FORK_PREDICTION_PROMPT = `<composer_prediction>
 This message is from Today, not from Alex, and Alex never sees it. Your answer is thrown away unless it is shown to him as a suggestion in his message box.
-Predict the next message Alex is most likely to send in this chat, in reply to your last answer. Write it as he would: his words and tone, usually short, casual and lowercase. One line, at most 80 words.
-Put only that message in text and leave tool_calls empty. Do not answer it, continue the work, or call tools. If no useful next message is predictable, set text to "".
+Predict the next message Alex will actually type in this chat. Model Alex, not the reply you would like: go by his own recent messages here (their length, wording, casing and typos, and what he brings up). After an answer he usually reports a new problem, asks a new question, corrects you, pushes back or changes topic; he rarely just agrees, thanks you or says goodnight. Your closing question, offer or instruction is not the thing to answer: never predict agreement, an acknowledgement or a sign-off.
+Write it as he would, one line, at most 80 words. Put only that message in text and leave tool_calls empty. Do not answer it, continue the work, or call tools. If you would not bet that he sends roughly this message, set text to "".
 </composer_prediction>`;
 
 /** Which model predicts: the fork, or Haiku as before. Haiku unless switched on. */
