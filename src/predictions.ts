@@ -66,25 +66,38 @@ export function predictionPrompt(context: string, examples: unknown[]): string {
   });
 }
 
-/** Words a bare acknowledgement, approval or sign-off is made of. Alex almost never
- * sends one; a prediction made only of them echoes the assistant instead. */
-const ACK_WORDS = new Set(
-  (
-    "ok okay okk k kk alright aight sure yes yep yeah yea ya yup np cool nice great perfect awesome sweet bet noted " +
-    "lgtm sg sgtm thanks thank thx ty tysm appreciate appreciated got it will do sounds sound good works fair true agreed " +
-    "gn goodnight good night nite bye later cya ttyl going heading to bed off sleep lol haha go ahead send ship do " +
-    "that this you u me i im ill for now then all right so and bubble buddy bro man"
-  ).split(" "),
-);
+/** Acknowledgement, approval and sign-off phrases, longest first. Alex almost never
+ * sends one on its own; a prediction made only of them echoes the assistant. */
+const ACK_PHRASES = (
+  "sounds good|sounds great|makes sense|got it|will do|go ahead|go for it|do it|send it|ship it|works for me|that works|" +
+  "thank you|good night|goodnight|night night|all good|all right|for now|heading to bed|going to bed|off to bed|to bed|" +
+  "ok|okay|okk|k|kk|alright|aight|sure|yes|yep|yeah|yea|ya|yup|np|cool|nice|great|perfect|awesome|sweet|bet|noted|" +
+  "lgtm|sg|sgtm|thanks|thx|ty|tysm|appreciate it|appreciated|fair|true|agreed|done|gn|night|nite|bye|later|cya|ttyl|" +
+  "sleep|bed|lol|haha"
+)
+  .split("|")
+  .sort((a, b) => b.length - a.length);
+/** Words that may sit between those phrases without making a message: "ok thanks bubble". */
+const ACK_FILLER = new Set("so and then now i im ill me you u bubble buddy bro man very much a lot".split(" "));
 
+/** Only acknowledgement phrases (and filler between them), at least one phrase, and
+ * no question: "do i go to bed now?" asks something, "ok sounds good gn" does not. */
 export function isBareAck(text: string): boolean {
-  const words = text
+  if (text.includes("?")) return false;
+  let rest = ` ${text
     .toLowerCase()
     .replace(/['’]/g, "")
     .replace(/[^\p{L}\p{N}\s]+/gu, " ")
-    .split(/\s+/)
-    .filter(Boolean);
-  return words.length <= 8 && words.every((word) => ACK_WORDS.has(word));
+    .replace(/\s+/g, " ")
+    .trim()} `;
+  if (rest.trim().split(" ").length > 8) return false;
+  let phrases = 0;
+  for (const phrase of ACK_PHRASES)
+    while (rest.includes(` ${phrase} `)) {
+      rest = rest.replace(` ${phrase} `, " ");
+      phrases++;
+    }
+  return phrases > 0 && rest.trim().split(" ").every((word) => !word || ACK_FILLER.has(word));
 }
 
 /** The last screen before a prediction is shown, on every path: nothing beats an ack. */
