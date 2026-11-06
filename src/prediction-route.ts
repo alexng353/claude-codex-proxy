@@ -58,8 +58,8 @@ export type PredictionAttempt = {
   source: PredictionSource;
   /** Why the fork did not answer, when Haiku did instead. */
   fallback?: string;
-  /** A suggestion was made but screened out as a bare acknowledgement. */
-  screened?: boolean;
+  /** A guess was made but not shown: a bare acknowledgement, or Haiku was unsure. */
+  screened?: "ack" | "confidence";
   forkMs?: number;
   fork?: ForkOutcome["usage"];
   forkAccount?: string;
@@ -196,7 +196,7 @@ export function createPredictionService(
               // An ack is the fork echoing its own closing ask: show nothing rather
               // than spend a Haiku call that has the same pull.
               const shown = screenPrediction(outcome.text);
-              if (shown === null) attempt.screened = true;
+              if (shown === null) attempt.screened = "ack";
               return shown;
             }
             attempt.fallback = "unsafe text";
@@ -212,9 +212,10 @@ export function createPredictionService(
         dependencies,
         (metrics) => {
           attempt.haiku = metrics.tokens;
+          if (metrics.lowConfidence) attempt.screened = "confidence";
         },
         () => {
-          attempt.screened = true;
+          attempt.screened = "ack";
         },
       );
     },
@@ -270,7 +271,7 @@ export async function handlePredictionRoute(
                 // service refused the request (a duplicate, busy, or invalid).
                 model: attempt ? attempt.source : "skipped",
                 ...(attempt?.fallback ? { fallback: attempt.fallback } : {}),
-                ...(attempt?.screened ? { screened: "ack" } : {}),
+                ...(attempt?.screened ? { screened: attempt.screened } : {}),
                 ...(attempt?.forkMs !== undefined ? { forkMs: attempt.forkMs } : {}),
                 ...(attempt?.fork ? { forkUsage: attempt.fork } : {}),
                 ...(attempt?.forkAccount ? { forkAccount: attempt.forkAccount } : {}),

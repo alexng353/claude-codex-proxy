@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { accountEnv, isUnavailable, listAccounts } from "./accounts";
 import { STRIPPED_ENV } from "./claude-env";
-import { parsePrediction, PREDICTION_SYSTEM } from "./predictions";
+import { MIN_PREDICTION_CONFIDENCE, parsePredictionReply, PREDICTION_SYSTEM } from "./predictions";
 
 type Child = Bun.Subprocess<"pipe", "pipe", "ignore">;
 /** Tokens of one Haiku call, as Claude Code's result reports them. */
@@ -19,10 +19,19 @@ export type PredictionModelMetrics = {
   apiMs?: number;
   totalMs: number;
   tokens?: PredictionTokens;
+  /** The model made a guess but stated less than MIN_PREDICTION_CONFIDENCE: nothing shown. */
+  lowConfidence?: boolean;
 };
-type Result = { text: string; apiMs?: number; tokens?: PredictionTokens };
+type Result = { text: string; apiMs?: number; tokens?: PredictionTokens; lowConfidence?: boolean };
 
 const tokenCount = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+/** The text to show from Haiku's JSON, and whether a guess was held back as unsure. */
+function shownGuess(result: string): { text: string; lowConfidence?: boolean } {
+  const parsed = parsePredictionReply(result);
+  if (!parsed) return { text: "" };
+  if (parsed.confidence >= MIN_PREDICTION_CONFIDENCE) return { text: parsed.prediction };
+  return parsed.prediction.trim() ? { text: "", lowConfidence: true } : { text: "" };
+}
 export function predictionTokens(usage: unknown): PredictionTokens | undefined {
   if (!usage || typeof usage !== "object") return undefined;
   const raw = usage as Record<string, unknown>;
@@ -105,7 +114,7 @@ export class PredictionModelPool {
       if (event.is_error || typeof event.result !== "string")
         throw new Error("prediction model failed");
       return {
-        text: parsePrediction(event.result) ?? "",
+        ...shownGuess(event.result),
         apiMs:
           typeof event.duration_api_ms === "number"
             ? event.duration_api_ms
@@ -188,6 +197,7 @@ export class PredictionModelPool {
         apiMs: result.apiMs,
         totalMs: ended - started,
         tokens: result.tokens,
+        ...(result.lowConfidence ? { lowConfidence: true } : {}),
       });
       return result.text;
     } finally {

@@ -57,3 +57,29 @@ for await (const chunk of Bun.stdin.stream()) {
   expect(await pool.generate("prompt")).toBe("");
   await pool.close();
 });
+
+test("a screened suggestion is logged as screened, by why, never by text", async () => {
+  const { createPredictionService, takeAttemptForTest } = await import("../src/prediction-route");
+  const make = (source: "fork" | "haiku", generate: () => string, metrics?: Record<string, unknown>) =>
+    createPredictionService({
+      prepare: async () => ({ prompt: "haiku prompt", retrievalMs: 0, guardMs: 0 }),
+      generate: async (_p: string, _s: AbortSignal, onModel?: (m: unknown) => void) => {
+        onModel?.({ warm: true, spawnMs: 0, modelMs: 0, totalMs: 0, ...metrics });
+        return generate();
+      },
+      guardReply: async () => true,
+      refresh: () => {},
+      source: () => source,
+      fork: async () => ({ kind: "suggested", text: "ok sounds good gn" }),
+    } as never);
+  const attempt = async (engine: ReturnType<typeof make>, id: string) => {
+    await engine.predict({ ...input(id), attemptId: id });
+    return takeAttemptForTest(id);
+  };
+  expect(await attempt(make("fork", () => "unused"), "screened-fork")).toMatchObject({ source: "fork", screened: "ack" });
+  expect(await attempt(make("haiku", () => "gn bubble"), "screened-haiku")).toMatchObject({ source: "haiku", screened: "ack" });
+  expect(await attempt(make("haiku", () => "", { lowConfidence: true }), "unsure-haiku")).toMatchObject({ source: "haiku", screened: "confidence" });
+  const shown = await attempt(make("haiku", () => "also the goal tab x"), "shown-haiku");
+  expect(shown?.screened).toBeUndefined();
+  expect(JSON.stringify(await attempt(make("fork", () => "unused"), "no-text"))).not.toContain("sounds good");
+});

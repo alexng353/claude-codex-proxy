@@ -24,7 +24,7 @@
  * REPLAY_ACCOUNT (fork account), REPLAY_IDS (file of case ids for fork).
  */
 import { Database } from "bun:sqlite";
-import { closeSync, constants, existsSync, fchmodSync, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { accountEnv, listAccounts } from "../src/accounts";
@@ -39,6 +39,12 @@ import { parsePredictionReply, predictionPrompt, PREDICTION_SYSTEM, safePredicti
 
 const dir = process.env.REPLAY_DIR ?? join(homedir(), ".cache/prediction-bias");
 mkdirSync(dir, { recursive: true, mode: 0o700 });
+{
+  // Raw chat text lives here: refuse a symlinked or foreign directory, and close it to others.
+  const info = lstatSync(dir);
+  if (!info.isDirectory() || info.uid !== process.getuid!()) throw new Error(`${dir} must be a directory you own, not a symlink`);
+  chmodSync(dir, 0o700);
+}
 const todayDb = process.env.TODAY_DB_PATH ?? join(homedir(), ".local/state/today/daemon.sqlite");
 const proxyState = join(homedir(), ".local/state/claude-codex-proxy");
 
@@ -248,7 +254,12 @@ function extract(): void {
   }
   const cases: Case[] = [];
   for (const thread of threads) {
-    const title = (db.query("SELECT title FROM threads WHERE thread_id = ?").get(thread) as { title: string }).title;
+    const row = db.query("SELECT title FROM threads WHERE thread_id = ?").get(thread) as { title: string } | null;
+    if (!row) {
+      console.error(`skip: no thread ${thread}`);
+      continue;
+    }
+    const title = row.title;
     const replies = db
       .query(
         `SELECT seq, at_ms, body FROM events WHERE thread_id = ? AND at_ms >= ? AND actor = 'me'
@@ -309,10 +320,11 @@ function extract(): void {
     own.slice(Math.floor(own.length * 0.7)).forEach((c) => (c.split = "held"));
   }
   privateWrite("cases.jsonl", cases);
+  // Ids only: a title is often made from message text.
   const byThread = new Map<string, number>();
-  for (const c of cases) byThread.set(c.title, (byThread.get(c.title) ?? 0) + 1);
+  for (const c of cases) byThread.set(c.thread, (byThread.get(c.thread) ?? 0) + 1);
   console.log(`cases: ${cases.length}`);
-  for (const [title, n] of byThread) console.log(`  ${n}\t${title}`);
+  for (const [thread, n] of byThread) console.log(`  ${n}\t${thread}`);
 }
 
 // ---- predictors ----
@@ -452,7 +464,9 @@ async function runFork(c: Case): Promise<Result> {
 
 const scrubber = createScrubber();
 
-/** One Haiku call with the checkout's prompt, keeping the stated confidence. */
+/** One Haiku call with the checkout's prompt, keeping the stated confidence. A tuning
+ * tool: it skips the route's isolated preparation worker, so final numbers come from
+ * the `haiku` predictor, which runs the production path. */
 async function runHaikuRaw(c: Case, corpus: PredictionCorpus | undefined): Promise<Result> {
   const scrub = (t: string) => scrubber.scrub(t);
   const started = performance.now();
@@ -469,8 +483,10 @@ async function runHaikuRaw(c: Case, corpus: PredictionCorpus | undefined): Promi
   );
   child.stdin.write(predictionPrompt(c.context, examples));
   child.stdin.end();
+  const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
   const out = await new Response(child.stdout).text();
   await child.exited;
+  clearTimeout(timer);
   let parsed = null as ReturnType<typeof parsePredictionReply>;
   let usage: Record<string, number> | undefined;
   try {

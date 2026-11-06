@@ -8,9 +8,12 @@ import {
 } from "../src/predictions";
 
 test("a bare ack is only acknowledgement words, so a real message that starts with one survives", () => {
-  for (const ack of ["ok sounds good gn", "thanks bubble, going to bed", "makes sense", "yes do it", "Sounds good, thanks!", "ok"])
+  for (const ack of ["ok sounds good gn", "thanks bubble, going to bed", "makes sense", "yes do it", "Sounds good, thanks!", "ok",
+    "👍", "mhm", "ye", "okie", "ah ok", "oh nice", "fine"])
     expect(isBareAck(ack)).toBe(true);
-  for (const real of ["ok so why is gym paused today", "shower and teeth have been sent", "will you do that?", "do i go to bed now?", "will you do that", "ok and the pane thing"])
+  for (const real of ["ok so why is gym paused today", "shower and teeth have been sent", "will you do that?", "do i go to bed now?",
+    "will you do that", "ok and the pane thing", "you sure?", "and then?", "send me that", "?", "do it later", "i do it",
+    "ill do it", "you do it then", "done", "im done", "true", "sleep", "i sleep now"])
     expect(isBareAck(real)).toBe(false);
 });
 
@@ -25,6 +28,27 @@ test("Haiku sees Alex's own recent messages apart from the answer it would other
   expect(prompt.alex_recent).toEqual(["the x for goal tab is not pinned to the right"]);
   expect(prompt.last_answer).toStartWith("Logged it");
   expect(prompt.conversation).toBeUndefined();
+});
+
+test("a quoted 'Alex: ' paragraph in an answer never leaves Haiku without the answer", () => {
+  const context = "Alex: fix\n\nAssistant: summary of what you said:\n\nAlex: quoted line from user";
+  expect(JSON.parse(predictionPrompt(context, [])).last_answer).toBe(context);
+});
+
+test("the prompt keeps his last six messages, clipped, and a clipped answer", () => {
+  const alex = Array.from({ length: 8 }, (_, i) => `Alex: message ${i} ${"x".repeat(1000)}`);
+  const context = [...alex, `Assistant: ${"y".repeat(5000)}`].join("\n\n");
+  const prompt = JSON.parse(predictionPrompt(context, []));
+  expect(prompt.alex_recent).toHaveLength(6);
+  expect(prompt.alex_recent[0]).toStartWith("message 2 ");
+  for (const text of prompt.alex_recent) expect(text.length).toBe(303);
+  expect(prompt.last_answer.length).toBe(1503);
+});
+
+test("a confidence that is not a number is no confidence", () => {
+  expect(parsePrediction('{"prediction":"why is gym paused","confidence":"0.9"}')).toBeNull();
+  expect(parsePrediction('{"prediction":"why is gym paused","confidence":0.3}')).toBe("why is gym paused");
+  expect(parsePrediction('{"prediction":"why is gym paused","confidence":0.29}')).toBeNull();
 });
 
 test("one short attempt per completed turn and secrets refused before model", async () => {

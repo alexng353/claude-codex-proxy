@@ -34,6 +34,7 @@ import { accountEnv, listAccounts, type Account } from "../src/accounts";
 import { STRIPPED_ENV } from "../src/claude-env";
 import { FORK_PREDICTION_PROMPT, forkArgs, parseForkResult, type ForkOutcome } from "../src/prediction-fork";
 import { guardedModelPrediction } from "../src/prediction-route";
+import { screenPrediction } from "../src/predictions";
 import { closePredictionModel, prewarmPredictionModel } from "../src/prediction-model";
 import { closePredictionPreparation, guardPredictionReply } from "../src/prediction-preparation";
 
@@ -352,7 +353,8 @@ async function runFork(point: Point, effort = effortOverride) {
     kind: outcome.kind,
     reason: outcome.kind === "failed" ? outcome.reason : undefined,
     usage: outcome.usage,
-    text: safe ? text : null,
+    // Screened like the route, so fork and Haiku are compared on what Alex would see.
+    text: safe ? screenPrediction(text) : null,
     rawRejected: text && !safe ? true : undefined,
     initMs,
     totalMs,
@@ -575,7 +577,7 @@ async function coldQuality() {
     await child.exited;
     await prepared.cleanup();
     const outcome = result ? parseForkResult(result) : ({ kind: "failed", reason: "no result" } as ForkOutcome);
-    const text = outcome.kind === "suggested" && (await guardPredictionReply(outcome.text)) ? outcome.text : null;
+    const text = outcome.kind === "suggested" && (await guardPredictionReply(outcome.text)) ? screenPrediction(outcome.text) : null;
     const haikuContext = recentContext(reply.thread_id, completion.seq);
     const haikuStarted = performance.now();
     let haiku: string | null = null;

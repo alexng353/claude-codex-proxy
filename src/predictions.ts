@@ -57,7 +57,10 @@ export function predictionPrompt(context: string, examples: unknown[]): string {
   // His own words carry the style; the answer is context, its closing ask least of all.
   const alex = messages.filter((m) => m.speaker === "Alex").slice(-6).map((m) => clip(m.text, 300));
   const last = messages.at(-1);
-  const answer = last?.speaker === "Assistant" ? last.text : messages.length ? "" : context;
+  // The text format cannot be split for certain: a quoted "Alex: " paragraph inside an
+  // answer looks like his message. When the split does not end on an answer, send the
+  // whole context's clipped text rather than no answer at all.
+  const answer = last?.speaker === "Assistant" ? last.text : context;
   return JSON.stringify({
     alex_recent: alex,
     last_answer: clip(answer, 1200, 300),
@@ -70,18 +73,20 @@ export function predictionPrompt(context: string, examples: unknown[]): string {
  * sends one on its own; a prediction made only of them echoes the assistant. */
 const ACK_PHRASES = (
   "sounds good|sounds great|makes sense|got it|will do|go ahead|go for it|do it|send it|ship it|works for me|that works|" +
-  "thank you|good night|goodnight|night night|all good|all right|for now|heading to bed|going to bed|off to bed|to bed|" +
-  "ok|okay|okk|k|kk|alright|aight|sure|yes|yep|yeah|yea|ya|yup|np|cool|nice|great|perfect|awesome|sweet|bet|noted|" +
-  "lgtm|sg|sgtm|thanks|thx|ty|tysm|appreciate it|appreciated|fair|true|agreed|done|gn|night|nite|bye|later|cya|ttyl|" +
-  "sleep|bed|lol|haha"
+  "thank you|good night|goodnight|night night|all good|all right|for now|heading to bed|going to bed|off to bed|" +
+  "ok|okay|okk|okie|oki|k|kk|alright|aight|sure|yes|yep|yeah|yeh|ye|yea|ya|yup|mhm|np|cool|nice|great|perfect|awesome|" +
+  "sweet|bet|noted|fine|lgtm|sg|sgtm|thanks|thx|ty|tysm|appreciate it|appreciated|fair|agreed|gn|night|nite|bye|cya|ttyl|" +
+  "lol|haha"
 )
   .split("|")
   .sort((a, b) => b.length - a.length);
-/** Words that may sit between those phrases without making a message: "ok thanks bubble". */
-const ACK_FILLER = new Set("so and then now i im ill me you u bubble buddy bro man very much a lot".split(" "));
+/** Words that may sit between those phrases without making a message: "ok thanks bubble".
+ * No pronouns: "i do it" and "you do it then" say who does the work, so they are messages. */
+const ACK_FILLER = new Set("so and then now im ah oh bubble buddy bro man very much a lot".split(" "));
 
 /** Only acknowledgement phrases (and filler between them), at least one phrase, and
- * no question: "do i go to bed now?" asks something, "ok sounds good gn" does not. */
+ * no question: "do i go to bed now?" asks something, "ok sounds good gn" does not.
+ * Text with no letters or digits at all ("👍") is an acknowledgement too. */
 export function isBareAck(text: string): boolean {
   if (text.includes("?")) return false;
   let rest = ` ${text
@@ -90,6 +95,7 @@ export function isBareAck(text: string): boolean {
     .replace(/[^\p{L}\p{N}\s]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim()} `;
+  if (!rest.trim()) return text.trim().length > 0;
   if (rest.trim().split(" ").length > 8) return false;
   let phrases = 0;
   for (const phrase of ACK_PHRASES)
