@@ -55,6 +55,19 @@ function privateWrite(name: string, lines: unknown[]): void {
 }
 const readLines = <T>(name: string): T[] =>
   readFileSync(join(dir, name), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as T);
+/** Output labels are plain names: raw text must never land outside `dir`. */
+function label(name: string): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`label must be letters, digits, _ or -: ${JSON.stringify(name)}`);
+  return name;
+}
+
+/** main's fork prompt (723d5b7), for REPLAY_BASELINE=main reruns of the BEFORE numbers. */
+const MAIN_FORK_PROMPT = `<composer_prediction>
+This message is from Today, not from Alex, and Alex never sees it. Your answer is thrown away unless it is shown to him as a suggestion in his message box.
+Predict the next message Alex is most likely to send in this chat, in reply to your last answer. Write it as he would: his words and tone, usually short, casual and lowercase. One line, at most 80 words.
+Put only that message in text and leave tool_calls empty. Do not answer it, continue the work, or call tools. If no useful next message is predictable, set text to "".
+</composer_prediction>`;
+const baseline = process.env.REPLAY_BASELINE === "main";
 
 export type Case = {
   id: string;
@@ -305,9 +318,10 @@ function extract(): void {
 // ---- predictors ----
 
 /** What the checkout's route shows for a fork outcome (no Haiku fallback here).
- * The BEFORE run (commit 6e2d776, main's code) showed outcome.text unscreened. */
+ * main showed outcome.text unscreened (REPLAY_BASELINE=main reproduces that). */
 function forkShown(outcome: ForkOutcome, safe: boolean): string | null {
-  return outcome.kind === "suggested" && safe ? screenPrediction(outcome.text) : null;
+  if (outcome.kind !== "suggested" || !safe) return null;
+  return baseline ? outcome.text : screenPrediction(outcome.text);
 }
 
 let rollouts: Map<string, string> | undefined;
@@ -354,6 +368,11 @@ async function runFork(c: Case): Promise<Result> {
     else if (entry.type === "compacted") items.length = 0;
     else if (entry.type === "response_item") items.push(entry.payload);
   }
+  // The turn ends at its final answer: anything after it (Alex's next message can land
+  // within the margin above) is the reference itself and must not be in the history.
+  let end = items.length;
+  while (end > 0 && !(items[end - 1]!.type === "message" && items[end - 1]!.role === "assistant")) end--;
+  items.length = end;
   if (!model?.startsWith("claude-") || items.length < 2) return fail(`skip:${items.length < 2 ? "short" : `model ${model}`}`);
   const budget = Number(process.env.REPLAY_FORK_BUDGET ?? 50_000);
   const request = { model, instructions, input: items, tools: [], reasoning: { effort: "medium" } } as never;
@@ -391,7 +410,7 @@ async function runFork(c: Case): Promise<Result> {
     cwd: join(dir, "scratch-cwd"),
     env: { ...env, ...accountEnv(account) },
   });
-  const content = [...prepared.content, { type: "text", text: FORK_PREDICTION_PROMPT }];
+  const content = [...prepared.content, { type: "text", text: baseline ? MAIN_FORK_PROMPT : FORK_PREDICTION_PROMPT }];
   child.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n");
   child.stdin.flush();
   const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
@@ -578,7 +597,7 @@ function score(labels: string[]): void {
 if (import.meta.main) {
   const [command, ...rest] = process.argv.slice(2);
   if (command === "extract") extract();
-  else if (command === "run") await run(rest[0]!, rest[1]!);
+  else if (command === "run") await run(rest[0]!, label(rest[1]!));
   else if (command === "score") score(rest);
   else if (command === "sweep") sweep(rest[0]!);
   else console.error("usage: extract | run haiku|fork LABEL | score FILE...");

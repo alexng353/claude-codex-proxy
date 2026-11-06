@@ -8,10 +8,10 @@ import {
 } from "../src/predictions";
 
 test("a bare ack is only acknowledgement words, so a real message that starts with one survives", () => {
-  expect(isBareAck("ok sounds good gn")).toBe(true);
-  expect(isBareAck("thanks bubble, going to bed")).toBe(true);
-  expect(isBareAck("ok so why is gym paused today")).toBe(false);
-  expect(isBareAck("shower and teeth have been sent")).toBe(false);
+  for (const ack of ["ok sounds good gn", "thanks bubble, going to bed", "makes sense", "yes do it", "Sounds good, thanks!", "ok"])
+    expect(isBareAck(ack)).toBe(true);
+  for (const real of ["ok so why is gym paused today", "shower and teeth have been sent", "will you do that?", "do i go to bed now?", "will you do that", "ok and the pane thing"])
+    expect(isBareAck(real)).toBe(false);
 });
 
 test("Haiku sees Alex's own recent messages apart from the answer it would otherwise echo", () => {
