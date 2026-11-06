@@ -38,6 +38,7 @@ import {
   candidateSlots,
   classifyTurn,
   clockLabel,
+  attemptedProof,
   delayActive,
   delayNoteText,
   dueToday,
@@ -116,6 +117,7 @@ import {
 import { refreshIfDeciding, startGymSync, syncGym, upliftingToken, type GymSyncHost } from "./gym-sync";
 import { parseStart } from "./gym-client";
 import {
+  addNotice,
   enqueueWake,
   flushWakes as flushWakeQueue,
   heldNoteText,
@@ -125,6 +127,7 @@ import {
   todayWake,
   wakesIdle,
   whileChecking,
+  type NoticeEvent,
   type WakeSender,
 } from "./hygiene-wake";
 import { relaySender, startPhoneWake, wakeFilePath, type PhoneWakeSender } from "./phone-wake";
@@ -260,6 +263,59 @@ function saveState(state: GateState): void {
   renameSync(temporary, path);
   cache = { path, mtimeMs: statSync(path).mtimeMs, state };
   setZoneHistory(state.zones);
+  sendNotices(state);
+}
+
+/**
+ * Photo verdicts waiting for their state to be saved. Keyed by the state
+ * object, so Bubble hears of a credit only once it is on disk, and a decision
+ * that throws before saving leaves nothing behind.
+ */
+const pendingNotices = new WeakMap<GateState, NoticeEvent[]>();
+
+function sendNotices(state: GateState): void {
+  const events = pendingNotices.get(state);
+  if (!events?.length) return;
+  pendingNotices.delete(state);
+  try {
+    const now = deps.now();
+    const due = outstanding(state, now);
+    const open = bypassActive(state, now) ? ` (bypass open until ${clockLabel(Date.parse(state.bypass.until!))})` : "";
+    const tail = due.length ? `still due: ${due.map((r) => r.label).join(", ")}${open}` : "nothing outstanding";
+    addNotice(statePath(), events, tail, now);
+  } catch (error) {
+    // The credit is already saved; a lost notice must never fail the gate.
+    console.error("hygiene-gate: could not queue a photo notice:", (error as Error).message);
+  }
+}
+
+/** Bubble's one-line view of a photo the gate just recorded; null for photos nobody asked about. */
+function noticeEvent(record: ImageRecord, line: string | null, state: GateState, only?: ProofTarget): NoticeEvent | null {
+  const time = clockLabel(Date.parse(record.at));
+  if (record.verdict === "accepted") {
+    const slot = record.slot;
+    let what = slot ? slotLabel(slot, state) : (record.kind ?? "photo");
+    // "night teeth 23:16", not "night teeth (Nov 5) 23:16"; a late credit for yesterday keeps its day.
+    if (slot && slot.split("/")[0] === localTime(Date.parse(record.at)).day) what = what.replace(/ \([^)]*\)$/, "");
+    return { kind: "credited", text: `${what}${record.reading ? ` (${record.reading})` : ""} ${time}` };
+  }
+  // Unneeded, gym-only, an everyday photo sent while BYPASS was open, or one never meant as
+  // proof (a screenshot checked because something is due later): nobody needs to hear of it.
+  if (record.gymOnly || record.verdict === "unneeded" || !line || !attemptedProof(record)) return null;
+  const what = record.kind && record.kind !== "none" ? record.kind : (only?.kind ?? "photo");
+  const why =
+    record.verdict === "duplicate"
+      ? (record.reason ?? "copy of an earlier photo")
+      : record.verdict === "stale"
+        ? "photo too old"
+        : line.includes("too soon")
+          ? "too soon to finish the walk"
+          : line.includes("isn't due")
+            ? "not due right now"
+            : line.includes("not clear enough")
+              ? "not clear enough"
+              : (record.reason || "no proof visible");
+  return { kind: "rejected", text: `${what} (${why.slice(0, 100)})` };
 }
 
 /** Refresh `seenAt` for an unchanged zone at most this often (it costs a state write). */
@@ -472,6 +528,11 @@ async function checkImageRecorded(
   const gym = only ? null : await gymPhoto(state, url, now);
   const before = state.images.length;
   const outcome = await whileChecking(statePath(), () => checkImage(state, url, source, now, only));
+  // Only a record this call added is news; a retried message returns its first verdict silently.
+  const added = state.images.length > before ? state.images.at(-1) : undefined;
+  // "No hygiene proof visible" on a gym photo is not shown in the chat either.
+  const event = added && !(gym && added.verdict === "rejected" && added.kind === "none") ? noticeEvent(added, outcome.line, state, only) : null;
+  if (event) pendingNotices.set(state, [...(pendingNotices.get(state) ?? []), event]);
   const result = outcome.record || state.images.length === before ? outcome : { ...outcome, record: state.images.at(-1) };
   if (!gym) return result;
   let record = result.record;

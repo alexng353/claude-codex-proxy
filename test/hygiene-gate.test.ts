@@ -29,6 +29,9 @@ let classifierDown = false;
 let classifyBlock: Promise<void> | null = null;
 let wakes: Array<{ id: string; thread: string; machine?: string; text: string }> = [];
 let wakeResults: Array<"sent" | "retry" | "failed"> = [];
+/** Photo notices to Bubble go through the same sender; kept apart so wake tests count wakes only. */
+let notices: Array<{ id: string; thread: string; machine?: string; text: string }> = [];
+let noticeResults: Array<"sent" | "retry" | "failed"> = [];
 let exif: Record<string, number | null> = {};
 let hashes: Record<string, string> = {};
 const saved: Record<string, string | undefined> = {};
@@ -80,6 +83,8 @@ beforeEach(async () => {
   issued = 0;
   wakes = [];
   wakeResults = [];
+  notices = [];
+  noticeResults = [];
   exif = {};
   hashes = {};
   setGateDeps({
@@ -87,6 +92,10 @@ beforeEach(async () => {
     bypassWords,
     baseUrl: "http://127.0.0.1:3456",
     wake: async (wake) => {
+      if (wake.id.startsWith("hygiene-notice-")) {
+        notices.push(wake);
+        return noticeResults.shift() ?? "sent";
+      }
       wakes.push(wake);
       return wakeResults.shift() ?? "sent";
     },
@@ -1911,5 +1920,104 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
     expect(text(await decide(request([env, user("DELAY")])))).toStartWith("⏰ delay");
     clock = at(DAY, "09:46");
     expect(text(await decide(request([env, user("back")])))).toContain("BYPASS cedar comet tulip.");
+  });
+});
+
+describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
+  const BUBBLE = "0b7c3073-04a4-404f-87d1-50e7f6359ba1";
+  const teeth = { kind: "teeth", confidence: 0.95, reason: "brushing" } as Verdict;
+  const minutes = (n: number) => n * 60_000;
+  const heldStore = () => join(dirname(process.env.HYGIENE_GATE_STATE!), "hygiene-held.json");
+
+  test("a credit posts one line to Bubble after the batch window, once", async () => {
+    verdicts.push(teeth);
+    expect((await decide(request([env, user({ photo: "teeth-1" })]))).action).toBe("forward");
+    await flushWakes();
+    expect(notices).toHaveLength(0);
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    expect(notices[0].thread).toBe(BUBBLE);
+    expect(notices[0].id).toMatch(/^hygiene-notice-\d+-[0-9a-f]{12}$/);
+    expect(notices[0].text).toBe("credited: morning teeth 06:00; nothing outstanding");
+    // Sent is recorded on disk, so a later flush (or a restarted proxy reading the store) sends nothing.
+    clock += minutes(60);
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    expect(wakes).toHaveLength(0);
+  });
+
+  test("two photos within two minutes go out as one line", async () => {
+    expect(text(await decide(request([env, user({ photo: "cat" })])))).toContain("gate armed");
+    clock += minutes(1);
+    verdicts.push(teeth);
+    const turn = request([env, user({ photo: "cat" }), assistant("locked"), user({ photo: "teeth-1" })]);
+    expect((await decide(turn)).action).toBe("forward");
+    clock += 30_000;
+    await flushWakes();
+    expect(notices).toHaveLength(0);
+    clock += 30_000;
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    expect(notices[0].text).toBe("credited: morning teeth 06:01; rejected: photo (no person); nothing outstanding");
+  });
+
+  test("a reject posts its reason and what is still due", async () => {
+    exif["old-teeth"] = clock - minutes(45);
+    expect(text(await decide(request([env, user({ photo: "old-teeth" })])))).toContain("45 minutes old");
+    clock += minutes(1);
+    const again = request([env, user({ photo: "old-teeth" }), assistant("locked"), user({ photo: "cat" })]);
+    expect(text(await decide(again))).toContain("gate armed");
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    expect(notices[0].text).toBe(
+      "rejected: photo (no person), photo (photo too old); still due: morning teeth photo",
+    );
+  });
+
+  test("a failed send never blocks the credit, and is retried under the same id", async () => {
+    noticeResults = ["retry"];
+    verdicts.push(teeth);
+    expect((await decide(request([env, user({ photo: "teeth-1" })]))).action).toBe("forward");
+    expect(gateStatus()).toMatchObject({ state: "clear", armed: false });
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    clock += 31_000;
+    await flushWakes();
+    expect(notices).toHaveLength(2);
+    expect(notices[1].id).toBe(notices[0].id);
+    expect(notices[1].text).toBe(notices[0].text);
+  });
+
+  test("a notice store that can't be written never blocks the credit", async () => {
+    await mkdir(heldStore(), { recursive: true });
+    const logged = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      verdicts.push(teeth);
+      expect((await decide(request([env, user({ photo: "teeth-1" })]))).action).toBe("forward");
+      expect(gateStatus()).toMatchObject({ state: "clear", armed: false });
+      const state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+      expect(state.images.map((r: { verdict: string }) => r.verdict)).toEqual(["accepted"]);
+      expect(logged.mock.calls.some((c) => String(c[0]).includes("could not queue a photo notice"))).toBe(true);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
+  test("photos nobody asked about post nothing", async () => {
+    verdicts.push(teeth);
+    expect((await decide(request([env, user({ photo: "teeth-1" })]))).action).toBe("forward");
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(1);
+    // The gate is clear: a screenshot is checked (night teeth is due later) but was never a proof try.
+    clock = at(DAY, "12:00");
+    const later = request([env, user({ photo: "teeth-1" }), assistant("ok"), user({ photo: "screenshot" })]);
+    expect((await decide(later)).action).toBe("forward");
+    clock += minutes(5);
+    await flushWakes();
+    expect(notices).toHaveLength(1);
   });
 });

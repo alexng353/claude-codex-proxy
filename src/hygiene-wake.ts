@@ -29,7 +29,7 @@ import { scrubText } from "./scrub.mjs";
 export const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** A Today machine name (forge, arch): also the ssh host that reaches it. */
 export const MACHINE_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/i;
-const WAKE_ID = /^hygiene-unlock-\d+-[0-9a-f]{12}$/;
+const WAKE_ID = /^hygiene-(?:unlock|notice)-\d+-[0-9a-f]{12}$/;
 
 /** This proxy's Today machine name. */
 export const localMachine = () => process.env.HYGIENE_GATE_MACHINE?.trim() || hostname();
@@ -74,7 +74,12 @@ export type Wake = {
   failedAt?: string;
   attempts?: number;
   nextAttemptAt?: number;
+  /** A photo notice still collecting events (see addNotice); dropped once sent. */
+  notice?: Notice;
 };
+
+export type NoticeEvent = { kind: "credited" | "rejected"; text: string };
+type Notice = { closesAt: number; credited: string[]; rejected: string[]; tail: string };
 
 type Store = { held: HeldMessage[]; wakes: Wake[] };
 
@@ -243,6 +248,62 @@ export function enqueueWake(statePath: string, wake: Wake): void {
   });
 }
 
+// ---- Photo notices (Alex, 2026-11-05: "we really need to automatically have the gate send you that") ----
+
+/** Bubble, the chat that keeps Alex's day; HYGIENE_GATE_NOTIFY_THREAD=off turns notices off. */
+const BUBBLE = "0b7c3073-04a4-404f-87d1-50e7f6359ba1";
+export const noticeThread = (): string | null => {
+  const thread = (process.env.HYGIENE_GATE_NOTIFY_THREAD ?? BUBBLE).trim();
+  return THREAD_ID.test(thread) ? thread : null;
+};
+/** Photos within this long of the first one go out as one line. */
+export const NOTICE_WINDOW_MS = 2 * 60_000;
+/**
+ * An event joins an open notice only until this long before it closes: the
+ * flush reads the text after the close, so no event can land after that read.
+ */
+const NOTICE_MARGIN_MS = 5_000;
+
+export function noticeText(notice: Pick<Notice, "credited" | "rejected" | "tail">): string {
+  // Newest first, as Alex reads it ("credited: night teeth 23:16, shower 23:12").
+  const parts = [
+    ...(notice.credited.length ? [`credited: ${[...notice.credited].reverse().join(", ")}`] : []),
+    ...(notice.rejected.length ? [`rejected: ${[...notice.rejected].reverse().join(", ")}`] : []),
+    notice.tail,
+  ];
+  return parts.filter(Boolean).join("; ");
+}
+
+/**
+ * Adds credits or rejects to the open notice for Bubble, or opens one that
+ * goes out NOTICE_WINDOW_MS later. The notice is a wake in this store, so it
+ * is sent once under a client message id and retried like an unlock wake;
+ * a restart finds it on disk. `tail` is the gate after this photo
+ * ("nothing outstanding"); the newest one wins.
+ */
+export function addNotice(statePath: string, events: NoticeEvent[], tail: string, now: number): void {
+  const thread = noticeThread();
+  if (!thread || !events.length) return;
+  update(storePath(statePath), (store) => {
+    store.wakes = store.wakes.filter((w) => !(w.sentAt || w.failedAt) || now - Date.parse(w.at) <= RECEIPT_KEEP_MS);
+    let wake = store.wakes.find(
+      (w) => w.notice && w.thread === thread && !w.sentAt && !w.failedAt && !w.attempts && now < w.notice.closesAt - NOTICE_MARGIN_MS,
+    );
+    if (!wake) {
+      const closesAt = now + NOTICE_WINDOW_MS;
+      const id = `hygiene-notice-${now}-${createHash("sha256").update(`${thread}/${now}`).digest("hex").slice(0, 12)}`;
+      wake = store.wakes.find((w) => w.id === id);
+      if (wake) return;
+      wake = { id, thread, at: new Date(now).toISOString(), nextAttemptAt: closesAt, notice: { closesAt, credited: [], rejected: [], tail } };
+      store.wakes.push(wake);
+    }
+    const notice = wake.notice!;
+    for (const event of events) notice[event.kind].push(event.text.slice(0, 160));
+    notice.tail = tail;
+    wake.text = noticeText(notice).slice(0, MAX_TEXT);
+  });
+}
+
 let chain: Promise<void> = Promise.resolve();
 
 /** Resolves once the sends already started have finished (for draining). */
@@ -257,8 +318,12 @@ export function flushWakes(statePath: string, send: WakeSender, now: () => numbe
 
 async function flushOnce(statePath: string, send: WakeSender, now: number): Promise<void> {
   const path = storePath(statePath);
-  const due = read(path).wakes.filter((w) => !w.sentAt && !w.failedAt && w.text && (w.nextAttemptAt ?? 0) <= now);
-  for (const wake of due) {
+  const isDue = (w: Wake) => !w.sentAt && !w.failedAt && !!w.text && (w.nextAttemptAt ?? 0) <= now;
+  const due = read(path).wakes.filter(isDue).map((w) => w.id);
+  for (const id of due) {
+    // Read again just before sending: an earlier send in this loop may have taken seconds.
+    const wake = read(path).wakes.find((w) => w.id === id);
+    if (!wake || !isDue(wake)) continue;
     let result: WakeResult;
     try {
       result = await send({ id: wake.id, thread: wake.thread, ...(wake.machine ? { machine: wake.machine } : {}), text: wake.text! });
@@ -275,9 +340,11 @@ async function flushOnce(statePath: string, send: WakeSender, now: number): Prom
         if (result === "sent") {
           entry.sentAt = at;
           delete entry.text;
+          delete entry.notice;
         } else if (result === "failed") {
           entry.failedAt = at;
           delete entry.text;
+          delete entry.notice;
           console.error(`hygiene-gate: gave up waking chat ${entry.thread.slice(0, 8)} (${entry.id})`);
         } else {
           entry.attempts = Math.min((entry.attempts ?? 0) + 1, 7);
