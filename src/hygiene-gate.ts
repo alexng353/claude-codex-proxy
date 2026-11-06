@@ -320,6 +320,14 @@ function noticeEvent(record: ImageRecord, line: string | null, state: GateState,
   // Unneeded, gym-only, an everyday photo sent while BYPASS was open, or one never meant as
   // proof (a screenshot checked because something is due later): nobody needs to hear of it.
   if (record.gymOnly || record.verdict === "unneeded" || !line || !attemptedProof(record)) return null;
+  // An outage replay of a photo the gate already credited (the follower lost the reply) is the
+  // same photo, not a second try: Bubble was told "credited" and must not hear "rejected".
+  if (
+    record.verdict === "duplicate" &&
+    record.source.thread === "outage" &&
+    state.images.some((r) => r !== record && r.sha256 === record.sha256 && r.verdict === "accepted")
+  )
+    return null;
   const what = record.kind && record.kind !== "none" ? record.kind : (only?.kind ?? "photo");
   const why =
     record.verdict === "duplicate"

@@ -2043,4 +2043,82 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     await flushWakes();
     expect(notices).toHaveLength(1);
   });
+
+  test("an identical resend, in a chat or from Cairn, is told once", async () => {
+    verdicts.push(teeth);
+    const turn = request([env, user({ photo: "teeth-1" })]);
+    expect((await decide(turn)).action).toBe("forward");
+    expect((await decide(turn)).action).toBe("forward");
+    exif["old-shower"] = clock - minutes(40);
+    const shower = () => submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("old-shower") }, { kind: "shower", slot: () => true });
+    expect((await shower()).verdict).toBe("stale");
+    expect((await shower()).verdict).toBe("stale");
+    clock += minutes(2);
+    await flushWakes();
+    clock += minutes(5);
+    await flushWakes();
+    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; rejected: shower (photo too old); nothing outstanding"]);
+  });
+
+  test("a Cairn credit and an outage replay each notify; a replay of a credited photo is not a reject", async () => {
+    verdicts.push(teeth);
+    const cairn = await submitProof({ mediaType: "image/jpeg", bytes: Buffer.from("cairn-teeth") }, { kind: "teeth", slot: (s) => s.endsWith("/morning-teeth") });
+    expect(cairn.result).toBe("pass");
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; nothing outstanding"]);
+    // The same photo replayed from a follower's outage queue: an exact copy, already told as credited.
+    clock = at(DAY, "21:30");
+    const replay = (name: string) =>
+      handleRequest(new Request("http://localhost/hygiene/recheck", { method: "POST", body: JSON.stringify({ url: photo(name), at: clock }) }));
+    expect((await replay("cairn-teeth")).ok).toBe(true);
+    // A new photo from the outage queue is a real credit.
+    verdicts.push({ kind: "shower", confidence: 0.95, reason: "in the shower" } as Verdict);
+    expect((await replay("outage-shower")).ok).toBe(true);
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(2);
+    expect(notices[1].text).toStartWith("credited: shower 21:30; ");
+    expect(notices[1].text).not.toContain("rejected");
+  });
+
+  test("the batch takes every photo until the flush seals it; a later one opens a new line", async () => {
+    const stale = (name: string) => {
+      exif[name] = clock - minutes(40);
+      return submitProof({ mediaType: "image/jpeg", bytes: Buffer.from(name) }, { kind: "shower", slot: () => true });
+    };
+    await stale("s1");
+    clock += minutes(2) - 1_000;
+    await stale("s2");
+    clock += 1_000;
+    await flushWakes();
+    expect(notices.map((n) => n.text)).toEqual(["rejected: shower (photo too old), shower (photo too old); still due: morning teeth photo"]);
+    clock += 1_000;
+    await stale("s3");
+    clock += minutes(2);
+    await flushWakes();
+    expect(notices).toHaveLength(2);
+    expect(notices[1].id).not.toBe(notices[0].id);
+    expect(notices[1].text).toBe("rejected: shower (photo too old); still due: morning teeth photo");
+  });
+
+  test("a proxy from before notices never sees one as a wake to send (deploy handoff)", async () => {
+    // The old flush sends every unsent wake with `text`; a notice id is refused there and marked failed.
+    const oldFlushWouldTake = () =>
+      (JSON.parse(readFileSync(heldStore(), "utf8")).wakes as Array<{ id: string; text?: string; sentAt?: string; failedAt?: string }>)
+        .filter((w) => !w.sentAt && !w.failedAt && w.text && w.id.startsWith("hygiene-notice-"));
+    noticeResults = ["retry"];
+    verdicts.push(teeth);
+    expect((await decide(request([env, user({ photo: "teeth-1" })]))).action).toBe("forward");
+    expect(oldFlushWouldTake()).toEqual([]);
+    clock += minutes(2);
+    await flushWakes();
+    // Sealed and waiting for its retry: still invisible to the old copy.
+    expect(notices).toHaveLength(1);
+    expect(oldFlushWouldTake()).toEqual([]);
+    clock += 31_000;
+    await flushWakes();
+    expect(notices).toHaveLength(2);
+    expect(notices[1].text).toBe(notices[0].text);
+  });
 });

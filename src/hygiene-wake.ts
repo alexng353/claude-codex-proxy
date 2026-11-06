@@ -74,13 +74,20 @@ export type Wake = {
   failedAt?: string;
   attempts?: number;
   nextAttemptAt?: number;
-  /** A photo notice still collecting events (see addNotice); dropped once sent. */
+  /**
+   * A photo notice (see addNotice); dropped once sent. Its text lives here, never in
+   * `text`: a proxy from before notices treats any due wake with `text` as an unlock
+   * wake, refuses the notice id and marks it failed (comb, Nov 5: deploy handoff).
+   */
   notice?: Notice;
 };
 
 export type NoticeEvent = { kind: "credited" | "rejected"; text: string };
-/** `sealed`: the flush took its text; nothing may join it, so every retry sends the same bytes. */
-type Notice = { closesAt: number; credited: string[]; rejected: string[]; tail: string; sealed?: boolean };
+/**
+ * `text` is set once, under the store's lock, when the flush first takes the notice: from
+ * then on nothing may join it, so every retry sends the same bytes under the same id.
+ */
+type Notice = { closesAt: number; credited: string[]; rejected: string[]; tail: string; text?: string };
 
 type Store = { held: HeldMessage[]; wakes: Wake[] };
 
@@ -283,20 +290,20 @@ export function addNotice(statePath: string, events: NoticeEvent[], tail: string
   update(storePath(statePath), (store) => {
     store.wakes = store.wakes.filter((w) => !(w.sentAt || w.failedAt) || now - Date.parse(w.at) <= RECEIPT_KEEP_MS);
     let wake = store.wakes.find(
-      (w) => w.notice && !w.notice.sealed && w.thread === thread && !w.sentAt && !w.failedAt && !w.attempts && now < w.notice.closesAt,
+      (w) => w.notice && w.notice.text === undefined && w.thread === thread && !w.sentAt && !w.failedAt && now < w.notice.closesAt,
     );
     if (!wake) {
       const closesAt = now + NOTICE_WINDOW_MS;
-      const id = `hygiene-notice-${now}-${createHash("sha256").update(`${thread}/${now}`).digest("hex").slice(0, 12)}`;
-      wake = store.wakes.find((w) => w.id === id);
-      if (wake) return;
+      const idFor = (n: number) => `hygiene-notice-${now}-${createHash("sha256").update(`${thread}/${now}/${n}`).digest("hex").slice(0, 12)}`;
+      let n = 0;
+      while (store.wakes.some((w) => w.id === idFor(n))) n++;
+      const id = idFor(n);
       wake = { id, thread, at: new Date(now).toISOString(), nextAttemptAt: closesAt, notice: { closesAt, credited: [], rejected: [], tail } };
       store.wakes.push(wake);
     }
     const notice = wake.notice!;
     for (const event of events) notice[event.kind].push(event.text.slice(0, 160));
     notice.tail = tail;
-    wake.text = noticeText(notice).slice(0, MAX_TEXT);
   });
 }
 
@@ -314,35 +321,37 @@ export function flushWakes(statePath: string, send: WakeSender, now: () => numbe
 
 async function flushOnce(statePath: string, send: WakeSender, now: number): Promise<void> {
   const path = storePath(statePath);
-  const isDue = (w: Wake) => !w.sentAt && !w.failedAt && !!w.text && (w.nextAttemptAt ?? 0) <= now;
+  const isDue = (w: Wake) => !w.sentAt && !w.failedAt && (!!w.text || !!w.notice) && (w.nextAttemptAt ?? 0) <= now;
   const due = read(path).wakes.filter(isDue).map((w) => w.id);
   for (const id of due) {
     // Read again just before sending (an earlier send may have taken seconds), and seal a
     // notice under the lock, so an event that arrives late opens a new notice instead of
     // changing this one's text after it went out.
-    let wake: Wake | undefined;
+    let wake: { id: string; thread: string; machine?: string; text: string } | undefined;
     try {
       wake = update(path, (store) => {
         const entry = store.wakes.find((w) => w.id === id);
         if (!entry || !isDue(entry)) return undefined;
-        if (entry.notice) entry.notice.sealed = true;
-        return { ...entry };
+        if (entry.notice) entry.notice.text ??= noticeText(entry.notice).slice(0, MAX_TEXT);
+        const text = entry.notice ? entry.notice.text : entry.text;
+        return text ? { id: entry.id, thread: entry.thread, ...(entry.machine ? { machine: entry.machine } : {}), text } : undefined;
       });
     } catch (error) {
       console.error("hygiene-gate: could not read a wake to send; retrying later:", (error as Error).message);
       continue;
     }
     if (!wake) continue;
+    const sending = wake;
     let result: WakeResult;
     try {
-      result = await send({ id: wake.id, thread: wake.thread, ...(wake.machine ? { machine: wake.machine } : {}), text: wake.text! });
+      result = await send(sending);
     } catch (error) {
       console.error("hygiene-gate: wake send threw:", (error as Error).message);
       result = "retry";
     }
     try {
       update(path, (store) => {
-        const entry = store.wakes.find((w) => w.id === wake.id);
+        const entry = store.wakes.find((w) => w.id === sending.id);
         if (!entry || entry.sentAt || entry.failedAt) return;
         const at = new Date(now).toISOString();
         if (result === "retry" && now - Date.parse(entry.at) > WAKE_GIVE_UP_MS) result = "failed";
