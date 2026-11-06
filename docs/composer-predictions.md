@@ -25,10 +25,17 @@ system prompt and the fork prompt say that Alex rarely just agrees, and that the
 answer's closing question, offer or instruction is not the thing to reply to.
 
 Every path then screens the text (`screenPrediction`): a bare acknowledgement,
-approval or sign-off ("ok sounds good gn", "yes do it", "thanks bubble") is
-never shown. A fork that offers one counts as declined, with no Haiku call, and
-the usage line says `screened: "ack"`. Alex sent such a message 1 time in 90
+approval or sign-off ("ok sounds good gn", "yes do it", "thanks bubble", "👍") is
+never shown; a question, or anything saying who does what ("i do it", "do it
+later"), is not one. A fork that offers one counts as declined, with no Haiku
+call. The usage line says `screened: "ack"`, or `screened: "confidence"` when
+Haiku's guess was under the threshold. Alex sent a bare ack 1 time in 90
 replayed turn ends, and in under 1% of his 1,409 messages over two weeks.
+
+The context is plain text, so a quoted `Alex: ` paragraph inside an answer can
+split wrongly; when the split does not end on an answer, `last_answer` is the
+clipped whole context instead. Structured messages from Today would remove the
+guess.
 
 `scripts/prediction-replay.ts` replays real turn ends from Today's log against
 what Alex sent next (exact and near match, bare-ack and ack-led share, shown
