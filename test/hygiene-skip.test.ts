@@ -118,7 +118,7 @@ test("a gate_fault ruling on another item excuses no gym plan by default", async
   expect(due()).toContain(`gym/${DAY}-1`);
 });
 
-test("a ruling never skips a gym plan that wasn't locking at the bypass (a stale shield tap)", async () => {
+test("a ruling on an Emergency-tap debt skips nothing: its items are inferred (a stale tap)", async () => {
   const state = read();
   state.debts[0].at = iso(at(8 * 60)); // before the 09:30 start-by: the plan wasn't missed yet
   state.debts[0].itemsComplete = false;
@@ -131,16 +131,36 @@ test("a ruling never skips a gym plan that wasn't locking at the bypass (a stale
   expect(due()).toContain(`gym/${DAY}-1`);
 });
 
+test("a BYPASS debt's captured gym item is skipped even if the gate's view of that moment changed since", async () => {
+  // A Start received later, dated before the bypass, would make a replay call the plan in progress.
+  const state = read();
+  state.gym!.checkins.push({ clientId: "late", kind: "start", at: iso(at(9 * 60 + 15)), distanceM: 10, accuracyM: 5, receivedAt: iso(at(14 * 60 + 40)) });
+  writeFileSync(path(), JSON.stringify(state));
+  resetGateCache();
+  const r = await call(`debt/${DAY}-30/resolve`, { verdict: "justified", reason: "sick" });
+  expect(r.body.debt.skippedItems).toEqual([`gym/${DAY}-1`]);
+});
+
 test("a move debt's ruling skips its own slot, never the next day's", async () => {
   const state = read();
-  delete state.filled["2026-11-09/night-teeth"];
-  state.debts.push({ id: `${DAY}-m1`, at: iso(at(0)), skipped: ["night teeth photo"], items: ["night-teeth"], status: "open", source: "move", moveSlot: "2026-11-09/night-teeth" } as any);
+  // A morning photo moved to the evening and charged at midnight: no morning slot locks at
+  // 00:00, so only the debt's own moveSlot can name it.
+  delete state.filled[`${DAY}/morning-teeth`];
+  state.debts.push({ id: `${DAY}-m1`, at: iso(at(0)), skipped: ["morning teeth photo"], items: ["morning-teeth"], status: "open", source: "move", moveSlot: "2026-11-09/morning-teeth" } as any);
   writeFileSync(path(), JSON.stringify(state));
   advance(at(10 * 60));
   const r = await call(`debt/${DAY}-m1/resolve`, { verdict: "justified", reason: "sick", skip: true });
   expect(r.status).toBe(200);
-  expect(r.body.debt.skippedItems).toEqual(["2026-11-09/night-teeth"]);
-  expect(read().skips!.map((s) => `${s.day}/${s.item}`)).toEqual(["2026-11-09/night-teeth"]);
+  expect(r.body.debt.skippedItems).toEqual(["2026-11-09/morning-teeth"]);
+  expect(read().skips!.map((s) => `${s.day}/${s.item}`)).toEqual(["2026-11-09/morning-teeth"]);
+  expect(due()).toContain(`${DAY}/morning-teeth`);
+});
+
+test("a ruling on a plan an agent already skipped records it as skipped", async () => {
+  expect((await call("skip", { target: `gym/${DAY}-1`, by: "Bubble", reason: "sick" })).status).toBe(200);
+  const r = await call(`debt/${DAY}-30/resolve`, { verdict: "justified", reason: "sick" });
+  expect(r.body.debt.skippedItems).toEqual([`gym/${DAY}-1`]);
+  expect(r.body.notSkipped).toBeUndefined();
 });
 
 test("a skip after an Emergency tap still charges the tap", async () => {

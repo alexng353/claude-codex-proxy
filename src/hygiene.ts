@@ -541,10 +541,27 @@ export function skipChoice(debt: Debt, skip: unknown, faultItem?: string): strin
 }
 
 /**
- * Applies a justified ruling's skips to what the bypass really covered: a move debt's own
- * slot (moveSlot), else the requirements locking at the bypass. A shield debt's items also
- * name requirements that only locked when the tap was reported (itemsComplete false), and
- * a ruling on a stale tap must not excuse those. Returns what it skipped and what it left.
+ * The slot a ruled debt's item stood for, from what the debt captured, never by replaying
+ * the gate at debt.at (today's Uplifting read and late check-ins would rewrite that past).
+ * A BYPASS captures the requirements locking at that moment, so its gym items are exact,
+ * and its photos are yesterday's overdue shower or night teeth, or that morning's photos
+ * (tonight's never lock before midnight). A move debt names its slot. A shield debt's items
+ * also hold what locked only when the tap was reported (itemsComplete false), so a ruling
+ * skips none of them; an agent who judges one excused uses POST /hygiene/skip.
+ */
+function ruledSlot(debt: Debt, item: string): string | undefined {
+  if (debt.source === "move") return debt.moveSlot && itemKey(debt.moveSlot) === item ? debt.moveSlot : undefined;
+  if (debt.itemsComplete === false || !debt.items?.includes(item)) return undefined;
+  if (item.startsWith("gym/")) return item;
+  const at = Date.parse(debt.at);
+  if (!Number.isFinite(at) || !RECURRING_ITEMS.some((key) => key === item)) return undefined;
+  const day = localTime(at).day;
+  return item === "shower" || item === "night-teeth" ? `${addDays(day, -1)}/${item}` : `${day}/${item}`;
+}
+
+/**
+ * Applies a justified ruling's skips to the slots its debt covered (ruledSlot). Returns
+ * what it skipped and what it left (not covered, already done, or a shield debt).
  */
 export function skipRuledItems(
   state: GateState,
@@ -557,17 +574,8 @@ export function skipRuledItems(
   const skipped: string[] = [];
   const notSkipped: string[] = [];
   if (!items.length) return { skipped, notSkipped };
-  const at = Date.parse(debt.at);
-  // A gym read error now says nothing about the read at the bypass (like atTapView).
-  const view = state.gym?.syncError ? { ...state, gym: { ...state.gym, syncError: undefined } } : state;
-  const covered = debt.source === "move" || !Number.isFinite(at) ? [] : outstanding(view, at);
   for (const item of items) {
-    const target =
-      debt.source === "move"
-        ? debt.moveSlot && itemKey(debt.moveSlot) === item
-          ? debt.moveSlot
-          : undefined
-        : covered.find((r) => itemKey(r.slot) === item)?.slot;
+    const target = ruledSlot(debt, item);
     if (!target) {
       notSkipped.push(item);
       continue;

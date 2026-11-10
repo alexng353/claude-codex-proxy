@@ -228,8 +228,9 @@ judgement, never from a keyword Alex types to the gate.
 - A justified ruling (`/hygiene/debt/:id/resolve` or `/revise`) skips the gym plans the
   bypass covered (a `gate_fault` ruling: only its faulty item). Photos stay due unless
   the ruling adds `"skip":true` (every covered item) or a list of item keys; `"skip":false`
-  skips nothing. Only requirements locking at the bypass (a move debt: its `moveSlot`)
-  are skipped. The debt records `skippedItems`; the response lists `notSkipped` items.
+  skips nothing. Only what the BYPASS captured as locking is skipped (a move debt: its
+  `moveSlot`); an Emergency-tap debt, whose items are inferred, skips nothing by ruling
+  (use `/hygiene/skip`). The debt records `skippedItems`; the response lists `notSkipped`.
 - `POST /hygiene/skip` `{target, by, reason}` skips ahead of time or after the fact.
   `target` is `gym/<plan id>` or `YYYY-MM-DD/<item>` (the keys above, from yesterday
   to 31 days ahead). `POST /hygiene/unskip` `{target, by}` undoes it. Penances never
