@@ -899,6 +899,8 @@ function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
   if (state.delay.until && Date.parse(state.delay.until) - DELAY_MS > anchor) return false;
   // A MOVE after the tap may have cleared a lock that held at the tap.
   if (state.moves?.some((m) => after(m.at))) return false;
+  // So may a skip: today's view no longer shows what it excused.
+  if (state.skips?.some((s) => after(s.at)) || state.gym?.plans.some((p) => after(p.skipped?.at))) return false;
   return true;
 }
 
@@ -1674,8 +1676,6 @@ export async function resolveDebt(
     if (debt.status !== "open") return { status: 409, body: { error: `debt already ${debt.status}` } };
     if (body.reasonClass !== undefined && body.reasonClass !== "gate_fault" && body.reasonClass !== "other")
       return { status: 422, body: { error: "reasonClass must be gate_fault or other" } };
-    const skipItems = body.verdict === "justified" ? skipChoice(debt, body.skip) : [];
-    if (!Array.isArray(skipItems)) return { status: 422, body: skipItems };
     let fixRef: FixRef | undefined;
     let item: string | undefined;
     if (body.verdict === "justified" && body.reasonClass === "gate_fault") {
@@ -1735,6 +1735,10 @@ export async function resolveDebt(
       )
         return { status: 422, body: { error: "gate_fault requires item: a stable key from this debt's items" } };
     }
+    // A gate_fault ruling is about its faulty item; by default it excuses no other gym plan.
+    const skipItems = body.verdict === "justified" ? skipChoice(debt, body.skip, body.reasonClass === "gate_fault" ? item : undefined) : [];
+    if (!Array.isArray(skipItems)) return { status: 422, body: skipItems };
+    let notSkipped: string[] = [];
     const reason = typeof body.reason === "string" ? body.reason.slice(0, 300) : undefined;
     const now = new Date(deps.now()).toISOString();
     if (body.verdict === "justified") {
@@ -1747,8 +1751,9 @@ export async function resolveDebt(
       });
       // A justified skip settles what it skipped, so the gate doesn't re-arm on it when the
       // bypass window ends.
-      const skipped = skipRuledItems(state, debt, skipItems, `ruling on ${id}`, reason ?? "", deps.now());
-      if (skipped.length) debt.skippedItems = skipped;
+      const settled = skipRuledItems(state, debt, skipItems, `ruling on ${id}`, reason ?? "", deps.now());
+      if (settled.skipped.length) debt.skippedItems = settled.skipped;
+      notSkipped = settled.notSkipped;
     } else if (body.verdict === "unjustified") {
       const penance = typeof body.penance === "string" ? body.penance.trim() : "";
       if (!penance || penance.length > 200)
@@ -1781,7 +1786,8 @@ export async function resolveDebt(
     release(state, deps.now(), "gate fault ruling");
     queueFaults(state);
     kickWakes();
-    return { status: 200, body: { ok: true, debt } };
+    // notSkipped: items the ruling asked to skip that the bypass didn't cover (or were done).
+    return { status: 200, body: { ok: true, debt, ...(notSkipped.length ? { notSkipped } : {}) } };
   });
 }
 
@@ -1871,12 +1877,12 @@ export async function reviseDebt(
     debt.reason = reason;
     debt.ruledAt = revisedAt;
     delete debt.penance;
-    const skipped = skipRuledItems(state, debt, skipItems, `revision of ${id}`, reason, now);
-    if (skipped.length) debt.skippedItems = [...new Set([...(debt.skippedItems ?? []), ...skipped])];
+    const settled = skipRuledItems(state, debt, skipItems, `revision of ${id}`, reason, now);
+    if (settled.skipped.length) debt.skippedItems = [...new Set([...(debt.skippedItems ?? []), ...settled.skipped])];
     saveState(state);
     console.error(`hygiene-gate: debt ${id} revised to justified: ${reason.slice(0, 120)}`);
     release(state, now, "ruling revised");
-    return { status: 200, body: { ok: true, debt } };
+    return { status: 200, body: { ok: true, debt, ...(settled.notSkipped.length ? { notSkipped: settled.notSkipped } : {}) } };
   });
 }
 

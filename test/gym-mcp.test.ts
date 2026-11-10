@@ -91,7 +91,18 @@ describe("MCP server", () => {
     ]);
   });
 
+  test("skip through the proxy, logged as the caller with its reason", async () => {
+    const added = await call("gym_plan_add", { start: "2026-11-05 18:00" });
+    const id = /\(plan ([\w-]+)\)$/.exec(added.result.content[0].text)![1];
+    const skipped = await call("gym_plan_skip", { id, reason: "Alex is sick" });
+    expect(skipped.result).toEqual({ content: [{ type: "text", text: `skipped Thu, Nov 5 18:00 (Alex is sick) (plan ${id})` }], isError: false });
+    const report = await (await fetch(`${process.env.GYM_PROXY_URL}/hygiene/gym`)).json();
+    expect(report.plans.find((p: any) => p.id === id)).toMatchObject({ status: "skipped", skipped: { by: "bubble", reason: "Alex is sick" } });
+  });
+
   test("bad input comes back as a tool error, not a crash", async () => {
+    expect((await call("gym_plan_skip", { id: "nope", reason: "sick" })).result).toMatchObject({ isError: true, content: [{ text: "no plan nope" }] });
+    expect((await call("gym_plan_skip", { id: "nope" })).result).toMatchObject({ isError: true, content: [{ text: "a skip needs a reason" }] });
     expect((await call("gym_plan_add", { start: "tonight" })).result.isError).toBe(true);
     expect((await call("gym_plan_add", { start: "2026-11-01 18:00" })).result).toMatchObject({
       isError: true,

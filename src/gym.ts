@@ -767,7 +767,11 @@ export function skipPlan(
   return { ok: true, plan, message: `skipped ${when(plan.start)} (${reason})` };
 }
 
-/** Undoes a skip (a mistaken skip, or rollback). The plan is judged normally again. */
+/**
+ * Undoes a skip (a mistaken skip, or rollback). The plan is judged normally again: it may
+ * claim a session another plan was using, and a ruling's debt keeps its skippedItems as the
+ * record of what the ruling did.
+ */
 export function unskipPlan(gym: GymState, id: string, by: string, now: number): PlanEditResult {
   const plan = gym.plans.find((p) => p.id === id);
   if (!plan) return { ok: false, error: `no plan ${id}` };

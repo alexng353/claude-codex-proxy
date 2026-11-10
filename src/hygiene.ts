@@ -519,15 +519,20 @@ export function skipsView(state: GateState, now: number) {
 }
 
 /**
- * Which of a ruled debt's items a justified ruling skips. Default: its gym plans only. A
- * missed gym plan can't be done later, so a justified skip of it must not re-arm when the
- * bypass window ends (Nov 10: bypass #30 justified, #31 forced on the same plan). Photos
- * stay due by default (Nov 10 00:23: "brushing right after eating, teeth photo still due");
- * the ruling skips them with skip:true (all items) or a list of item keys.
+ * Which of a ruled debt's items a justified ruling skips. Default: its gym plans (a
+ * gate_fault ruling: only its faulty item, when that is a gym plan). A missed gym plan
+ * can't be done later, so a justified skip of it must not re-arm when the bypass window
+ * ends (Nov 10: bypass #30 justified, #31 forced on the same plan). Photos stay due by
+ * default (Nov 10 00:23: "brushing right after eating, teeth photo still due"); the
+ * ruling skips them with skip:true (all items) or a list of item keys. skipRuledItems then
+ * keeps only what the bypass really covered.
  */
-export function skipChoice(debt: Debt, skip: unknown): string[] | { error: string } {
+export function skipChoice(debt: Debt, skip: unknown, faultItem?: string): string[] | { error: string } {
   const items = debt.items ?? [];
-  if (skip === undefined || skip === null) return items.filter((i) => i.startsWith("gym/"));
+  if (skip === undefined || skip === null)
+    return faultItem !== undefined
+      ? items.filter((i) => i === faultItem && i.startsWith("gym/"))
+      : items.filter((i) => i.startsWith("gym/"));
   if (skip === false) return [];
   if (skip === true) return items.filter((i) => !i.startsWith("penance/"));
   if (Array.isArray(skip) && skip.every((i) => typeof i === "string" && items.includes(i) && !i.startsWith("penance/")))
@@ -536,22 +541,45 @@ export function skipChoice(debt: Debt, skip: unknown): string[] | { error: strin
 }
 
 /**
- * Applies a justified ruling's skips: each gym item skips its plan; each photo item skips
- * the slot the bypass was covering (found as it stood at the bypass; a slot done since
- * needs nothing). Returns what it skipped.
+ * Applies a justified ruling's skips to what the bypass really covered: a move debt's own
+ * slot (moveSlot), else the requirements locking at the bypass. A shield debt's items also
+ * name requirements that only locked when the tap was reported (itemsComplete false), and
+ * a ruling on a stale tap must not excuse those. Returns what it skipped and what it left.
  */
-export function skipRuledItems(state: GateState, debt: Debt, items: string[], by: string, reason: string, now: number): string[] {
-  const done: string[] = [];
+export function skipRuledItems(
+  state: GateState,
+  debt: Debt,
+  items: string[],
+  by: string,
+  reason: string,
+  now: number,
+): { skipped: string[]; notSkipped: string[] } {
+  const skipped: string[] = [];
+  const notSkipped: string[] = [];
+  if (!items.length) return { skipped, notSkipped };
   const at = Date.parse(debt.at);
-  const covered = Number.isFinite(at) ? outstanding(state, at) : [];
+  // A gym read error now says nothing about the read at the bypass (like atTapView).
+  const view = state.gym?.syncError ? { ...state, gym: { ...state.gym, syncError: undefined } } : state;
+  const covered = debt.source === "move" || !Number.isFinite(at) ? [] : outstanding(view, at);
   for (const item of items) {
-    const target = item.startsWith("gym/") ? item : covered.find((r) => itemKey(r.slot) === item)?.slot;
-    if (!target) continue;
+    const target =
+      debt.source === "move"
+        ? debt.moveSlot && itemKey(debt.moveSlot) === item
+          ? debt.moveSlot
+          : undefined
+        : covered.find((r) => itemKey(r.slot) === item)?.slot;
+    if (!target) {
+      notSkipped.push(item);
+      continue;
+    }
     const r = skipItem(state, target, { by, reason: reason || `justified ruling on ${debt.id}`, debtId: debt.id }, now);
-    if (r.ok) done.push(r.target);
-    else console.error(`hygiene-gate: ruling ${debt.id} could not skip ${target}: ${r.error}`);
+    if (r.ok) skipped.push(r.target);
+    else {
+      notSkipped.push(item);
+      console.error(`hygiene-gate: ruling ${debt.id} could not skip ${target}: ${r.error}`);
+    }
   }
-  return done;
+  return { skipped, notSkipped };
 }
 
 function enforced(state: GateState, slotName: string, now: number): boolean {
@@ -1497,7 +1525,7 @@ export function noteText(debt: Debt, baseUrl: string): string {
     `- unjustified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"unjustified","reason":"<one line>","penance":"<a short, safe, doable photo task, e.g. photo of you on a walk outside>"}'`,
     `Use reasonClass:"gate_fault" for a broken gate, or "other" otherwise. A justified gate_fault requires item (one of the bypassed item keys: ${(debt.items ?? []).join(", ") || "legacy debt: identify the faulty item"}) and fixRef: {"kind":"q","id":"<existing open queue item>"} or {"kind":"chat","id":"<chat UUID with an open task-ledger record>","eta":"<future ISO time with offset>","task":<ledger record number if the chat has multiple open tasks>}. Create or identify the repair first; do not merely repeat a gate-fault justification. A second fault for the same item within 24 h suspends it until the repair closes.`,
     "An unjustified ruling locks the gate until Alex sends the penance photo.",
-    `A justified ruling skips the bypassed gym plans, so they never lock again; bypassed photos stay due later today. Add "skip":true to excuse every bypassed item for the day, a list of item keys to excuse some, or "skip":false to keep even the gym plan due.`,
+    `A justified ruling also excuses the gym plans the bypass covered: they never lock again, so judge the session too. Excuse it for a sound reason not to train (sick, injured, an emergency); if the bypass was needed but the session should still be made up, add "skip":false. Bypassed photos stay due later today unless you add "skip":true (every bypassed item) or a list of item keys. A gate_fault ruling excuses only its faulty item by default.`,
     `</${NOTE_TAG}>`,
   ].join("\n");
 }

@@ -219,6 +219,27 @@ returns 422. Cancellation removes existing and future lock text and proof slots;
 old bypass debts remain available for explicit resolution. There is no resume
 endpoint in this change. Gym's deliberate late-cancel rule is unchanged.
 
+### Skips (Nov 10)
+
+A skip excuses one requirement: a gym plan (status `skipped`, never a miss, never
+locks, before or after its start) or one day's photo. Skips come from an agent's
+judgement, never from a keyword Alex types to the gate.
+
+- A justified ruling (`/hygiene/debt/:id/resolve` or `/revise`) skips the gym plans the
+  bypass covered (a `gate_fault` ruling: only its faulty item). Photos stay due unless
+  the ruling adds `"skip":true` (every covered item) or a list of item keys; `"skip":false`
+  skips nothing. Only requirements locking at the bypass (a move debt: its `moveSlot`)
+  are skipped. The debt records `skippedItems`; the response lists `notSkipped` items.
+- `POST /hygiene/skip` `{target, by, reason}` skips ahead of time or after the fact.
+  `target` is `gym/<plan id>` or `YYYY-MM-DD/<item>` (the keys above, from yesterday
+  to 31 days ahead). `POST /hygiene/unskip` `{target, by}` undoes it. Penances never
+  skip. Also `POST /hygiene/gym/plans/:id/skip|unskip`, MCP `gym_plan_skip`, and
+  `scripts/gym.ts skip ID --reason TEXT`.
+- `/hygiene/status` and `/hygiene/api/v1/status` include `skips`: entries from
+  yesterday on with `target`, `day`, `item` (`gym/<id>` for plans), `at`, `by`,
+  `reason` and optional `debtId`. Gym plans in `/hygiene/gym` show `skipped`.
+- A skip after an Emergency tap counts as a change since the tap, so the tap is charged.
+
 The authority reads `~/.local/state/today-ops/queue.sqlite` and
 `~/.local/state/today/daemon.sqlite` in read-only mode. Operators may override
 these locations with `HYGIENE_QUEUE_DB` and `HYGIENE_TASK_DB`.
