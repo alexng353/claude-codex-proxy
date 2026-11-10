@@ -71,7 +71,7 @@ describe("MCP server", () => {
     expect(init.result.serverInfo.name).toBe("gym");
     expect(await handle({ jsonrpc: "2.0", method: "notifications/initialized" })).toBeNull();
     const list = (await handle({ jsonrpc: "2.0", id: 2, method: "tools/list" })) as any;
-    expect(list.result.tools.map((t: any) => t.name)).toEqual(["gym_status", "gym_plan_add", "gym_plan_move", "gym_plan_cancel"]);
+    expect(list.result.tools.map((t: any) => t.name)).toEqual(["gym_status", "gym_plan_add", "gym_plan_move", "gym_plan_cancel", "gym_plan_skip"]);
   });
 
   test("add, move, status and cancel through the proxy, logged as the caller", async () => {

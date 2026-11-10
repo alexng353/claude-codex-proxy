@@ -7,6 +7,8 @@
  *   bun scripts/gym.ts add "2026-11-04 18:00" [--grace 30] [--note TEXT] [--by NAME]
  *   bun scripts/gym.ts move ID "2026-11-04 19:00" [--note TEXT] [--by NAME]
  *   bun scripts/gym.ts cancel ID [--note TEXT] [--by NAME]
+ *   bun scripts/gym.ts skip ID --reason TEXT [--by NAME]   (excused: never a miss, even after its start)
+ *   bun scripts/gym.ts unskip ID [--by NAME]
  *   bun scripts/gym.ts grace MINUTES        (default grace for new plans)
  *   bun scripts/gym.ts sync                 (read Uplifting now)
  *   bun scripts/gym.ts credit --start T --end T --reason TEXT --by NAME [--workout ID] [--sets N]
@@ -67,6 +69,13 @@ async function main() {
     case "cancel":
       if (!positional[0]) fail("cancel needs a plan id");
       return show(await gymCall(`/plans/${encodeURIComponent(positional[0])}/cancel`, { by, note }));
+    case "skip":
+      if (!positional[0]) fail("skip needs a plan id");
+      if (!named.reason) fail("skip needs --reason");
+      return show(await gymCall(`/plans/${encodeURIComponent(positional[0])}/skip`, { by, reason: named.reason }));
+    case "unskip":
+      if (!positional[0]) fail("unskip needs a plan id");
+      return show(await gymCall(`/plans/${encodeURIComponent(positional[0])}/unskip`, { by }));
     case "grace": {
       if (!/^\d+$/.test(positional[0] ?? "")) fail("grace needs a whole number of minutes");
       const r = await gymCall("/settings", { grace_min: Number(positional[0]) });

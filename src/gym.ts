@@ -13,7 +13,7 @@ import { MAX_MOVES_PER_DAY, clockLabel, inTransit, localTime, zoneNote } from ".
 
 export type GymPlanEvent = {
   at: string;
-  action: "add" | "move" | "cancel";
+  action: "add" | "move" | "cancel" | "skip" | "unskip";
   /** Start before a move. */
   from?: string;
   /** Start after an add or move. */
@@ -41,7 +41,16 @@ export type GymPlan = {
   log: GymPlanEvent[];
   /** Frozen outcome of a long-settled plan, so pruning its session can't reopen it. */
   settled?: { status: "kept" | "made-up"; sessionId: string; at: string };
+  /**
+   * Excused by a ruling (Alex, 2026-11-10: "can you update the gate to allow skips"):
+   * never a miss, never locks. Set by a justified ruling on a bypass that skipped it, or
+   * ahead of time by an agent relaying Alex (Bubble), never by a keyword Alex types to the
+   * gate. Unlike a cancel, a skip may come after the start, because someone judged it.
+   */
+  skipped?: GymSkip;
 };
+
+export type GymSkip = { at: string; by: string; reason: string; debtId?: string };
 
 /** A finished Uplifting workout as the gate first saw it; later edits never change it. */
 export type GymSession = {
@@ -194,7 +203,9 @@ export type PlanStatus =
   | "made-up"
   | "cancelled"
   /** Starts inside a travel pause: never a miss. */
-  | "paused";
+  | "paused"
+  /** Excused by a ruling or an agent's skip (plan.skipped): never a miss. */
+  | "skipped";
 
 export type PlanResult = {
   plan: GymPlan;
@@ -408,6 +419,10 @@ export function evaluateGym(gym: GymState | undefined, now: number): PlanResult[
     if (plan.settled) {
       used.add(plan.settled.sessionId);
       results.push({ plan, status: plan.settled.status, deadline, sessionId: plan.settled.sessionId });
+      continue;
+    }
+    if (plan.skipped) {
+      results.push({ plan, status: "skipped", deadline });
       continue;
     }
     if (plan.status === "cancelled" && !cancelledLate(plan)) {
@@ -636,6 +651,8 @@ export function editPlan(gym: GymState, edit: PlanEdit, now: number): PlanEditRe
   const plan = gym.plans.find((p) => p.id === edit.id);
   if (!plan) return { ok: false, error: `no plan ${edit.id}` };
   if (plan.status === "cancelled") return { ok: false, error: `plan ${edit.id} is already cancelled` };
+  if (plan.skipped && edit.action === "move")
+    return { ok: false, error: `plan ${edit.id} is skipped (${plan.skipped.reason}); unskip it first, or add a new plan` };
   const started = startedBefore(plan, now);
   const by = edit.by ? { by: edit.by } : {};
   if (edit.action === "move") {
@@ -719,6 +736,45 @@ export function reschedulePlan(gym: GymState, id: string, startIso: string, now:
   plan.log.push({ at: nowIso, action: "move", from: plan.start, to: iso, ...(by ? { by } : {}), ...(text ? { note: text } : {}) });
   plan.start = iso;
   return { ok: true, plan, message: `moved to ${when(plan.start)}, start by ${clockLabel(start + plan.graceMin * MIN)}` };
+}
+
+// ---- Skips ----
+
+/**
+ * Skips a plan: it is never a miss and never locks, whether or not it has started. Callers
+ * are a justified ruling (resolveDebt/reviseDebt, `debtId` set) or an agent relaying Alex
+ * (POST /hygiene/skip, gym_plan_skip): who and why are required and kept on the plan.
+ * Idempotent: skipping a skipped plan keeps the first record.
+ */
+export function skipPlan(
+  gym: GymState,
+  id: string,
+  input: { by: string; reason: string; debtId?: string },
+  now: number,
+): PlanEditResult {
+  const plan = gym.plans.find((p) => p.id === id);
+  if (!plan) return { ok: false, error: `no plan ${id}` };
+  if (plan.skipped) return { ok: true, plan, message: `plan ${id} was already skipped (${plan.skipped.reason})` };
+  const by = input.by.trim().slice(0, 120);
+  const reason = input.reason.trim().slice(0, 300);
+  if (!by || !reason) return { ok: false, error: "a skip needs by and reason" };
+  const status = evaluateGym(gym, now).find((r) => r.plan.id === id)?.status;
+  if (status === "kept" || status === "made-up") return { ok: false, error: `plan ${id} is ${status}; there is nothing to skip` };
+  if (status === "cancelled") return { ok: false, error: `plan ${id} is already cancelled` };
+  const at = new Date(now).toISOString();
+  plan.skipped = { at, by, reason, ...(input.debtId ? { debtId: input.debtId } : {}) };
+  plan.log.push({ at, action: "skip", by, note: reason.slice(0, 200) });
+  return { ok: true, plan, message: `skipped ${when(plan.start)} (${reason})` };
+}
+
+/** Undoes a skip (a mistaken skip, or rollback). The plan is judged normally again. */
+export function unskipPlan(gym: GymState, id: string, by: string, now: number): PlanEditResult {
+  const plan = gym.plans.find((p) => p.id === id);
+  if (!plan) return { ok: false, error: `no plan ${id}` };
+  if (!plan.skipped) return { ok: false, error: `plan ${id} isn't skipped` };
+  delete plan.skipped;
+  plan.log.push({ at: new Date(now).toISOString(), action: "unskip", by: by.slice(0, 120) });
+  return { ok: true, plan, message: `unskipped ${when(plan.start)}; it counts again` };
 }
 
 // ---- Travel pauses ----

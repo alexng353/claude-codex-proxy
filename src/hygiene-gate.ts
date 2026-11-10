@@ -25,6 +25,11 @@ import {
 import {
   itemKey,
   RECURRING_ITEMS,
+  skipChoice,
+  skipItem,
+  skipRuledItems,
+  skipsView,
+  unskipItem,
   BYPASS_MS,
   DELAY_END_MINUTE,
   DELAY_MS,
@@ -109,6 +114,8 @@ import {
   endPause,
   gymSettings,
   reschedulePlan,
+  skipPlan,
+  unskipPlan,
   when as vancouverLabel,
   type GymPlan,
   type GymState,
@@ -1384,7 +1391,8 @@ export function gymReport() {
       deadline: new Date(r.deadline).toISOString(),
       deadlineLabel: vancouverLabel(new Date(r.deadline).toISOString()),
       status: r.status,
-      ...(r.reason ? { reason: r.reason } : {}),
+      ...(r.reason ? { reason: r.reason } : r.plan.skipped ? { reason: `skipped by ${r.plan.skipped.by}: ${r.plan.skipped.reason}` } : {}),
+      ...(r.plan.skipped ? { skipped: r.plan.skipped } : {}),
       ...(r.sessionId ? { sessionId: r.sessionId } : {}),
       ...(r.plan.note ? { note: r.plan.note } : {}),
       log: r.plan.log,
@@ -1438,6 +1446,18 @@ async function gymRoute(request: Request, url: URL): Promise<Response | null> {
       const start = parseStart(raw);
       return start ? { action: "add", start, graceMin: grace, note, by } : null;
     });
+  }
+  const skipping = /^\/plans\/([A-Za-z0-9-]+)\/(skip|unskip)$/.exec(path);
+  if (skipping) {
+    // Same as POST /hygiene/skip with target gym/<id>; the reason is required (body.reason or note).
+    const reason = text(body.reason, 300) ?? note;
+    if (!by) return Response.json({ ok: false, error: "by is required" }, { status: 400 });
+    if (skipping[2] === "skip" && !reason) return Response.json({ ok: false, error: "a skip needs a reason" }, { status: 400 });
+    const result = await mutateGym((gym, now) => {
+      const r = skipping[2] === "skip" ? skipPlan(gym, skipping[1], { by, reason: reason! }, now) : unskipPlan(gym, skipping[1], by, now);
+      return { changed: r.ok, result: r };
+    }, skipping[2] === "skip" ? "gym plan skipped" : "gym plan unskipped");
+    return Response.json(result, { status: result.ok ? 200 : 400 });
   }
   const edit = /^\/plans\/([A-Za-z0-9-]+)\/(move|cancel)$/.exec(path);
   if (edit) {
@@ -1557,6 +1577,8 @@ export function gateStatus() {
     maxMovesPerDay: MAX_MOVES_PER_DAY,
     suspensions: (state.suspensions ?? []).filter(s => !s.resolvedAt),
     cancellations: state.cancellations ?? {},
+    // Requirements excused from yesterday on: gym plans and photo days, with who, why and any debt.
+    skips: skipsView(state, now),
     openDebts: state.debts
       .filter((d) => d.status === "open" || d.status === "penance")
       .map(({ id, at, skipped, status, penance, source }) => ({ id, at, skipped, status, penance, source: source ?? "bypass" })),
@@ -1642,6 +1664,7 @@ export async function resolveDebt(
     reasonClass?: unknown;
     fixRef?: unknown;
     item?: unknown;
+    skip?: unknown;
   },
 ): Promise<{ status: number; body: unknown }> {
   return serialized(async () => {
@@ -1651,6 +1674,8 @@ export async function resolveDebt(
     if (debt.status !== "open") return { status: 409, body: { error: `debt already ${debt.status}` } };
     if (body.reasonClass !== undefined && body.reasonClass !== "gate_fault" && body.reasonClass !== "other")
       return { status: 422, body: { error: "reasonClass must be gate_fault or other" } };
+    const skipItems = body.verdict === "justified" ? skipChoice(debt, body.skip) : [];
+    if (!Array.isArray(skipItems)) return { status: 422, body: skipItems };
     let fixRef: FixRef | undefined;
     let item: string | undefined;
     if (body.verdict === "justified" && body.reasonClass === "gate_fault") {
@@ -1720,6 +1745,10 @@ export async function resolveDebt(
         reasonClass: body.reasonClass,
         ...(fixRef ? { fixRef, item } : {}),
       });
+      // A justified skip settles what it skipped, so the gate doesn't re-arm on it when the
+      // bypass window ends.
+      const skipped = skipRuledItems(state, debt, skipItems, `ruling on ${id}`, reason ?? "", deps.now());
+      if (skipped.length) debt.skippedItems = skipped;
     } else if (body.verdict === "unjustified") {
       const penance = typeof body.penance === "string" ? body.penance.trim() : "";
       if (!penance || penance.length > 200)
@@ -1809,7 +1838,7 @@ export const REVISE_WINDOW_MS = 12 * 3_600_000;
  */
 export async function reviseDebt(
   id: string,
-  body: { verdict?: unknown; reason?: unknown },
+  body: { verdict?: unknown; reason?: unknown; skip?: unknown },
 ): Promise<{ status: number; body: unknown }> {
   return serialized(async () => {
     const state = structuredClone(loadState());
@@ -1821,6 +1850,8 @@ export async function reviseDebt(
     if (!reason || reason.length > 300) return { status: 400, body: { error: "a revision needs a reason (1-300 chars)" } };
     if (debt.status !== "penance") return { status: 409, body: { error: `only a penance can be revised; debt is ${debt.status}` } };
     if (debt.penance?.paidAt) return { status: 409, body: { error: "the penance is already paid" } };
+    const skipItems = skipChoice(debt, body.skip);
+    if (!Array.isArray(skipItems)) return { status: 422, body: skipItems };
     const now = deps.now();
     const ruled = Date.parse(debt.ruledAt ?? "");
     if (!Number.isFinite(ruled) || now - ruled > REVISE_WINDOW_MS)
@@ -1840,6 +1871,8 @@ export async function reviseDebt(
     debt.reason = reason;
     debt.ruledAt = revisedAt;
     delete debt.penance;
+    const skipped = skipRuledItems(state, debt, skipItems, `revision of ${id}`, reason, now);
+    if (skipped.length) debt.skippedItems = [...new Set([...(debt.skippedItems ?? []), ...skipped])];
     saveState(state);
     console.error(`hygiene-gate: debt ${id} revised to justified: ${reason.slice(0, 120)}`);
     release(state, now, "ruling revised");
@@ -1937,6 +1970,34 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
       return Response.json({ error: "body must be a JSON object" }, { status: 400 });
     const result = await reviseDebt(revision[1], body);
     return Response.json(result.body, { status: result.status });
+  }
+  // Skip a requirement ahead of time or after the fact: {target: "gym/<plan id>" or
+  // "YYYY-MM-DD/<item>", by, reason}. For an agent relaying Alex (Bubble: "Alex is sick,
+  // skip gym today"), never a keyword Alex types to the gate. Local route like /debt.
+  if ((url.pathname === "/hygiene/skip" || url.pathname === "/hygiene/unskip") && request.method === "POST") {
+    let body: Record<string, unknown> | null;
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return Response.json({ error: "body must be JSON" }, { status: 400 });
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return Response.json({ error: "body must be a JSON object" }, { status: 400 });
+    const target = text(body.target, 120);
+    const by = text(body.by, 120);
+    if (!target || !by) return Response.json({ error: "target and by are required" }, { status: 422 });
+    const undo = url.pathname === "/hygiene/unskip";
+    const reason = text(body.reason, 300);
+    if (!undo && !reason) return Response.json({ error: "reason is required" }, { status: 422 });
+    return serialized(async () => {
+      const state = structuredClone(loadState());
+      const now = deps.now();
+      const r = undo ? unskipItem(state, target, by, now) : skipItem(state, target, { by, reason: reason! }, now);
+      if (!r.ok) return Response.json(r, { status: 400 });
+      saveState(state);
+      console.error(`hygiene-gate: ${undo ? "unskip" : "skip"} ${r.target} by ${by}: ${(reason ?? "").slice(0, 120)}`);
+      release(state, now, undo ? "item unskipped" : "item skipped");
+      return Response.json({ ...r, skips: skipsView(state, now), gate: gateStatus() });
+    });
   }
   return null;
 }

@@ -31,7 +31,7 @@
 import type { FixRef, FixStatus } from "./hygiene-fix";
 import { createHash } from "node:crypto";
 import type { BypassPhraseState } from "./bypass-phrase";
-import { gymDueToday, gymOutstanding, type GymState } from "./gym";
+import { gymDueToday, gymOutstanding, skipPlan, unskipPlan, type GymState } from "./gym";
 import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from "./types";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -136,6 +136,8 @@ export type Debt = {
   /** Move debts: the moved time the skip ran from (to `at`, the midnight that ended it). */
   moveTo?: string;
   status: "open" | "justified" | "penance" | "paid";
+  /** What a justified ruling skipped (gym/<plan> or <day>/<item>), so it can't re-arm. */
+  skippedItems?: string[];
   reason?: string;
   ruledAt?: string;
   penance?: { description: string; setAt: string; paidAt?: string };
@@ -166,6 +168,11 @@ export type GateState = {
   /** First morning outdoor walk to enforce; absent means off. */
   walkStartsAt?: string;
   cancellations?: Record<string, { at: string; reason: string }>;
+  /**
+   * Photo requirements excused for one day (gym plans keep theirs on the plan, GymPlan.skipped).
+   * Added by a justified ruling or an agent relaying Alex; never by a keyword to the gate.
+   */
+  skips?: SlotSkip[];
   suspensions?: Array<{ item: string; at: string; debtId: string; fixRef: FixRef; resolvedAt?: string; notificationQueuedAt?: string; repairStatus?: FixStatus; receiptNoticeQueuedAt?: string }>;
   images: ImageRecord[];
   /** Requirement slot -> ISO time it was filled. */
@@ -429,8 +436,126 @@ function armedDuringSuspension(state: GateState, name: string): boolean {
     (!s.resolvedAt || arm < Date.parse(s.resolvedAt)));
 }
 
+// ---- Skips: one day's requirement excused by a ruling or an agent relaying Alex ----
+
+/** One photo requirement excused for one local day (both walk slots for morning-walk). */
+export type SlotSkip = { day: string; item: string; at: string; by: string; reason: string; debtId?: string };
+
+/** A skip target: `gym/<planId>`, or `<YYYY-MM-DD>/<recurring item>` for a photo. */
+export type SkipTarget = string;
+
+export type SkipResult = { ok: true; target: SkipTarget; message: string } | { ok: false; error: string };
+
+const SKIP_DAY = /^(\d{4}-\d{2}-\d{2})\/([a-z-]+)$/;
+/** How far ahead a photo day may be skipped (Jakarta-length trips use the gym pause instead). */
+const SKIP_AHEAD_DAYS = 31;
+
+function slotSkipped(state: GateState, name: string): boolean {
+  if (!state.skips?.length || name.startsWith("gym/") || name.startsWith("penance/")) return false;
+  const day = name.split("/")[0];
+  const item = itemKey(name);
+  return state.skips.some((s) => s.day === day && s.item === item);
+}
+
+/**
+ * Skips one requirement: a gym plan (never a miss) or one day's photo (never due).
+ * `by` and `reason` are required and kept. Idempotent. Penances never skip: an
+ * unjustified ruling is revised (POST /hygiene/debt/:id/revise), not skipped.
+ */
+export function skipItem(
+  state: GateState,
+  target: SkipTarget,
+  input: { by: string; reason: string; debtId?: string },
+  now: number,
+): SkipResult {
+  const by = input.by.trim().slice(0, 120);
+  const reason = input.reason.trim().slice(0, 300);
+  if (!by || !reason) return { ok: false, error: "a skip needs by and reason" };
+  if (target.startsWith("gym/")) {
+    if (!state.gym) return { ok: false, error: `no plan ${target.slice(4)}` };
+    const r = skipPlan(state.gym, target.slice(4), { by, reason, debtId: input.debtId }, now);
+    return r.ok ? { ok: true, target, message: r.message } : r;
+  }
+  if (target.startsWith("penance/")) return { ok: false, error: "a penance can't be skipped; revise the ruling instead" };
+  const m = SKIP_DAY.exec(target);
+  const item = m ? itemKey(target) : "";
+  if (!m || !RECURRING_ITEMS.some((key) => key === item) || addDays(m[1], 0) !== m[1])
+    return { ok: false, error: `target must be gym/<plan id> or YYYY-MM-DD/<item> with item one of ${RECURRING_ITEMS.join(", ")}` };
+  const day = m[1];
+  const today = localTime(now).day;
+  if (day < addDays(today, -1)) return { ok: false, error: `${day} is past; nothing from before yesterday can lock` };
+  if (day > addDays(today, SKIP_AHEAD_DAYS)) return { ok: false, error: `a photo skip reaches at most ${SKIP_AHEAD_DAYS} days ahead` };
+  const existing = state.skips?.find((s) => s.day === day && s.item === item);
+  if (existing) return { ok: true, target: `${day}/${item}`, message: `${day}/${item} was already skipped (${existing.reason})` };
+  if (state.filled[`${day}/${item}`]) return { ok: false, error: `${day}/${item} is already done` };
+  (state.skips ??= []).push({ day, item, at: new Date(now).toISOString(), by, reason, ...(input.debtId ? { debtId: input.debtId } : {}) });
+  return { ok: true, target: `${day}/${item}`, message: `skipped ${item} on ${dayLabel(day)} (${reason})` };
+}
+
+/** Undoes a skip (rollback, or a skip made by mistake). */
+export function unskipItem(state: GateState, target: SkipTarget, by: string, now: number): SkipResult {
+  if (target.startsWith("gym/")) {
+    if (!state.gym) return { ok: false, error: `no plan ${target.slice(4)}` };
+    const r = unskipPlan(state.gym, target.slice(4), by, now);
+    return r.ok ? { ok: true, target, message: r.message } : r;
+  }
+  const m = SKIP_DAY.exec(target);
+  const item = m ? itemKey(target) : "";
+  const i = m ? (state.skips ?? []).findIndex((s) => s.day === m[1] && s.item === item) : -1;
+  if (i < 0) return { ok: false, error: `${target} isn't skipped` };
+  state.skips!.splice(i, 1);
+  return { ok: true, target: `${m![1]}/${item}`, message: `unskipped ${item} on ${dayLabel(m![1])}; it is due again` };
+}
+
+/** Skips from yesterday on, photos and gym plans, for gate status. */
+export function skipsView(state: GateState, now: number) {
+  const from = addDays(localTime(now).day, -1);
+  return [
+    ...(state.skips ?? []).filter((s) => s.day >= from).map((s) => ({ target: `${s.day}/${s.item}`, ...s })),
+    ...(state.gym?.plans ?? [])
+      .filter((p) => p.skipped && localTime(Date.parse(p.start)).day >= from)
+      .map((p) => ({ target: `gym/${p.id}`, day: localTime(Date.parse(p.start)).day, item: `gym/${p.id}`, ...p.skipped! })),
+  ].sort((a, b) => a.at.localeCompare(b.at));
+}
+
+/**
+ * Which of a ruled debt's items a justified ruling skips. Default: its gym plans only. A
+ * missed gym plan can't be done later, so a justified skip of it must not re-arm when the
+ * bypass window ends (Nov 10: bypass #30 justified, #31 forced on the same plan). Photos
+ * stay due by default (Nov 10 00:23: "brushing right after eating, teeth photo still due");
+ * the ruling skips them with skip:true (all items) or a list of item keys.
+ */
+export function skipChoice(debt: Debt, skip: unknown): string[] | { error: string } {
+  const items = debt.items ?? [];
+  if (skip === undefined || skip === null) return items.filter((i) => i.startsWith("gym/"));
+  if (skip === false) return [];
+  if (skip === true) return items.filter((i) => !i.startsWith("penance/"));
+  if (Array.isArray(skip) && skip.every((i) => typeof i === "string" && items.includes(i) && !i.startsWith("penance/")))
+    return skip as string[];
+  return { error: `skip must be true, false, or a list of this debt's items (${items.join(", ") || "none"})` };
+}
+
+/**
+ * Applies a justified ruling's skips: each gym item skips its plan; each photo item skips
+ * the slot the bypass was covering (found as it stood at the bypass; a slot done since
+ * needs nothing). Returns what it skipped.
+ */
+export function skipRuledItems(state: GateState, debt: Debt, items: string[], by: string, reason: string, now: number): string[] {
+  const done: string[] = [];
+  const at = Date.parse(debt.at);
+  const covered = Number.isFinite(at) ? outstanding(state, at) : [];
+  for (const item of items) {
+    const target = item.startsWith("gym/") ? item : covered.find((r) => itemKey(r.slot) === item)?.slot;
+    if (!target) continue;
+    const r = skipItem(state, target, { by, reason: reason || `justified ruling on ${debt.id}`, debtId: debt.id }, now);
+    if (r.ok) done.push(r.target);
+    else console.error(`hygiene-gate: ruling ${debt.id} could not skip ${target}: ${r.error}`);
+  }
+  return done;
+}
+
 function enforced(state: GateState, slotName: string, now: number): boolean {
-  if (itemStopped(state, itemKey(slotName), now) || armedDuringSuspension(state, slotName)) return false;
+  if (itemStopped(state, itemKey(slotName), now) || armedDuringSuspension(state, slotName) || slotSkipped(state, slotName)) return false;
   if (armMs(slotName) < Date.parse(state.startsAt)) return false;
   // A travel day: no slot armed in the 24 h after a zone change (or the silent flight before it) locks.
   if (inTransit(armMs(slotName))) return false;
@@ -506,7 +631,7 @@ export function outstanding(state: GateState, now: number): Requirement[] {
     });
   result.push(...gymOutstanding(state.gym, now));
   // A slot moved to later today locks from its new time instead.
-  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !movedAway(state, r.slot, now));
+  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !slotSkipped(state, r.slot) && !movedAway(state, r.slot, now));
 }
 
 /** Requirements due later today that do not lock yet. */
@@ -541,7 +666,7 @@ export function dueToday(state: GateState, now: number): Requirement[] {
     else result.push({ slot: name, kind: slotKind(name), label });
   }
   result.push(...gymDueToday(state.gym, now));
-  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot));
+  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !slotSkipped(state, r.slot));
 }
 
 // ---- MOVE / LATER: rescheduling within the day ----
@@ -801,7 +926,7 @@ export function openPenance(state: GateState): Debt[] {
 export function candidateSlots(state: GateState, kind: ProofKind, now: number): string[] {
   const { day, minutes } = localTime(now);
   const yesterday = addDays(day, -1);
-  const open = (name: string) => !state.filled[name] && !itemStopped(state, itemKey(name), now) && !armedDuringSuspension(state, name);
+  const open = (name: string) => !state.filled[name] && !itemStopped(state, itemKey(name), now) && !armedDuringSuspension(state, name) && !slotSkipped(state, name);
   if (kind === "penance") return openPenance(state).map((d) => slot.penance(d.id)).filter(open);
   if (kind === "weight")
     return minutes >= MORNING_MINUTE && open(slot.weight(day)) && enforced(state, slot.weight(day), now)
@@ -1372,6 +1497,7 @@ export function noteText(debt: Debt, baseUrl: string): string {
     `- unjustified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"unjustified","reason":"<one line>","penance":"<a short, safe, doable photo task, e.g. photo of you on a walk outside>"}'`,
     `Use reasonClass:"gate_fault" for a broken gate, or "other" otherwise. A justified gate_fault requires item (one of the bypassed item keys: ${(debt.items ?? []).join(", ") || "legacy debt: identify the faulty item"}) and fixRef: {"kind":"q","id":"<existing open queue item>"} or {"kind":"chat","id":"<chat UUID with an open task-ledger record>","eta":"<future ISO time with offset>","task":<ledger record number if the chat has multiple open tasks>}. Create or identify the repair first; do not merely repeat a gate-fault justification. A second fault for the same item within 24 h suspends it until the repair closes.`,
     "An unjustified ruling locks the gate until Alex sends the penance photo.",
+    `A justified ruling skips the bypassed gym plans, so they never lock again; bypassed photos stay due later today. Add "skip":true to excuse every bypassed item for the day, a list of item keys to excuse some, or "skip":false to keep even the gym plan due.`,
     `</${NOTE_TAG}>`,
   ].join("\n");
 }

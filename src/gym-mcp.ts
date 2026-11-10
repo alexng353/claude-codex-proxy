@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * MCP server (stdio, JSON-RPC 2.0) for gym plans on the hygiene gate. Lets a
- * chat (Bubble) add, move and cancel the sessions Alex tells it about. Hand
+ * chat (Bubble) add, move, cancel and skip the sessions Alex tells it about. Hand
  * credit is deliberately absent: it stays on the CLI.
  *
  * Register in Codex: [mcp_servers.gym] command = "bun", args = ["<repo>/src/gym-mcp.ts"].
@@ -15,7 +15,7 @@ export const TOOLS = [
   {
     name: "gym_status",
     description:
-      "Alex's planned gym sessions and what Uplifting reported: each plan's id, start, status (upcoming, in-progress, kept, missed, made-up, cancelled) and deadline.",
+      "Alex's planned gym sessions and what Uplifting reported: each plan's id, start, status (upcoming, in-progress, kept, missed, made-up, cancelled, paused, skipped) and deadline.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -36,7 +36,7 @@ export const TOOLS = [
   {
     name: "gym_plan_move",
     description:
-      "Move a plan at Alex's request. A plan for a later day can move to any future time. Today's plan moves only within today, at most twice a day (counting Alex's own MOVE replies), never while a Start at the gym is open; once it has started, only before its start-by time (start + grace). Past that it is a miss and can't move; to skip today's plan, cancel it (after its start that counts as a miss).",
+      "Move a plan at Alex's request. A plan for a later day can move to any future time. Today's plan moves only within today, at most twice a day (counting Alex's own MOVE replies), never while a Start at the gym is open; once it has started, only before its start-by time (start + grace). Past that it is a miss and can't move; if Alex has a real reason not to go (sick, injured), use gym_plan_skip.",
     inputSchema: {
       type: "object",
       properties: { id: { type: "string" }, start: { type: "string", description: WHEN }, note: { type: "string" } },
@@ -52,6 +52,20 @@ export const TOOLS = [
       type: "object",
       properties: { id: { type: "string" }, note: { type: "string" } },
       required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "gym_plan_skip",
+    description:
+      "Excuse a plan so it is never a miss and never locks the gate, before or after its start. Use it only when you judge Alex's reason sound (sick, injured, an emergency), the same standard as a justified BYPASS ruling; a plain change of plans is a move or a cancel. Logged with your reason and shown in gate status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        reason: { type: "string", description: "Why, in one line, e.g. 'Alex is sick (cough, fever), skip today's gym'." },
+      },
+      required: ["id", "reason"],
       additionalProperties: false,
     },
   },
@@ -80,6 +94,11 @@ export async function callTool(name: string, args: Record<string, unknown>): Pro
     }
     case "gym_plan_cancel":
       return result(await gymCall(`/plans/${encodeURIComponent(String(args.id ?? ""))}/cancel`, { by: by(), note }));
+    case "gym_plan_skip": {
+      const reason = typeof args.reason === "string" ? args.reason.trim() : "";
+      if (!reason) return { text: "a skip needs a reason", isError: true };
+      return result(await gymCall(`/plans/${encodeURIComponent(String(args.id ?? ""))}/skip`, { by: by(), reason }));
+    }
     default:
       return { text: `unknown tool ${name}`, isError: true };
   }

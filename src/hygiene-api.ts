@@ -122,6 +122,7 @@ function status() {
     open_debts: s.openDebts,
     suspensions: s.suspensions,
     cancellations: s.cancellations,
+    skips: s.skips,
   };
 }
 
