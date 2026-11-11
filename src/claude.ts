@@ -110,6 +110,7 @@ export function resolveModel(model: string): string {
 const MEDIUM_DEFAULT_MODELS = new Set([
   "claude-opus-5-5",
   "claude-fable-5-1",
+  "claude-fable-5-2",
   "claude-sonnet-5-5",
 ]);
 

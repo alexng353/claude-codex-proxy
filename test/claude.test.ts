@@ -200,8 +200,13 @@ test("rejects GPT models instead of substituting Claude", () => {
   ).toThrow("Unsupported Claude model");
 });
 
-test("passes exact effort levels and defaults Opus and Sonnet 5.5 to medium", () => {
-  for (const model of ["claude-opus-5-5", "claude-sonnet-5-5"])
+test("passes exact effort levels and defaults the picker's Claude models to medium", () => {
+  for (const model of [
+    "claude-opus-5-5",
+    "claude-fable-5-1",
+    "claude-fable-5-2",
+    "claude-sonnet-5-5",
+  ])
     for (const effort of ["low", "medium", "high", "xhigh", "max", undefined]) {
       const args = buildClaudeArgs({ model, input: "hello", reasoning: { effort } });
       expect(args[args.indexOf("--effort") + 1]).toBe(effort ?? "medium");
