@@ -117,3 +117,8 @@ proxy upgrades, delete `~/.codex/models_cache.json`.
    `write` should be small. A large `write` on every turn means caching is broken.
 
 Report what you verified and what you could not.
+
+## Changing this code
+
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+Keep user-visible behaviour, wire formats and public APIs as they are unless the task asks to change them; put refactors in their own commit, and name every behaviour change in your final report.
