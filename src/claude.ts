@@ -29,6 +29,7 @@ import {
 import { recordUsage } from "./usage";
 import { failureCategory, recordFailure } from "./failures";
 import { normalizeVisualizeReferences } from "./visualize";
+import { repairLiteralNewlines } from "./literal-newlines";
 import {
   estimateRequestTokens,
   estimateVisibleTokens,
@@ -1089,7 +1090,12 @@ async function runClaudeTurn(
     callId: `call_${crypto.randomUUID().replaceAll("-", "")}`,
   }));
   // Normalize before parking so Codex's echo of this turn matches lastTurn.text.
-  const text = normalizeVisualizeReferences(structured.text);
+  // rawAnswer (the transcript's own text, which prediction forks look up) is left as
+  // the model wrote it.
+  const repair = repairLiteralNewlines(structured.text);
+  if (repair.repaired > 0)
+    console.log(JSON.stringify({ textNewlinesRepaired: repair.repaired, threadId: turn.threadId }));
+  const text = normalizeVisualizeReferences(repair.text);
   worker.park(inputItems(request), {
     text,
     callIds: new Set(toolCalls.map((call) => call.callId)),
