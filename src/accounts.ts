@@ -188,18 +188,40 @@ function orderAccounts(accounts: Account[]): Account[] {
     .map(({ account }) => account);
 }
 
-/** `CLAUDE_ACCOUNT_WEEKLY_CAP` (e.g. `martin=50`): seven-day percent at which an account stops taking turns. */
-function weeklyCap(name: string): number | undefined {
-  for (const part of (process.env.CLAUDE_ACCOUNT_WEEKLY_CAP ?? "").split(",")) {
+/** The `NAME=PERCENT` entry for `name` in a comma-separated env var, if any. */
+function capFrom(variable: string, name: string): number | undefined {
+  for (const part of (process.env[variable] ?? "").split(",")) {
     const [key, value] = part.split("=").map((item) => item.trim());
     if (key === name && value && Number.isFinite(Number(value))) return Number(value);
   }
   return undefined;
 }
 
+const LAST_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The seven-day percent at which an account stops taking turns now, or undefined
+ * for none. `CLAUDE_ACCOUNT_WEEKLY_CAP` (e.g. `martin=50`) is the cap;
+ * `CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY` (e.g. `martin=95`) raises it while the
+ * account's seven-day window resets within 24 h (proxy-lastday-cap). It only
+ * raises: an uncapped account stays uncapped. A stale reading (restored after a
+ * restart or slot swap) counts like a fresh one, as it does for the normal cap:
+ * its reset time is absolute. The router and `/accounts` both use this.
+ */
+export function effectiveWeeklyCap(name: string, now = Date.now()): number | undefined {
+  const normal = capFrom("CLAUDE_ACCOUNT_WEEKLY_CAP", name);
+  const lastDay = capFrom("CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY", name);
+  if (normal === undefined || lastDay === undefined) return normal;
+  const resetsAt = seenInfo(name, now)?.info.unifiedWindows?.seven_day?.resetsAt;
+  if (!resetsAt) return normal;
+  const left = resetsAt * 1000 - now;
+  if (left <= 0 || left > LAST_DAY_MS) return normal;
+  return Math.max(normal, lastDay);
+}
+
 /** True once the account's last reported seven-day usage reaches its configured cap. */
 export function isOverWeeklyCap(account: Account, now = Date.now()): boolean {
-  const cap = weeklyCap(account.name);
+  const cap = effectiveWeeklyCap(account.name, now);
   if (cap === undefined) return false;
   const window = seenInfo(account.name, now)?.info.unifiedWindows?.seven_day;
   if (window?.utilization === undefined) return false;
@@ -393,7 +415,7 @@ export function accountStatus() {
     const served = lastTurn.get(account.name);
     return {
       name: account.name,
-      weeklyCap: weeklyCap(account.name) ?? 100,
+      weeklyCap: effectiveWeeklyCap(account.name, now) ?? 100,
       dir: account.dir,
       active: account.name === active,
       lastTurnAt: served ? new Date(served).toISOString() : null,

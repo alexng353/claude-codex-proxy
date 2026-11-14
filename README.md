@@ -161,6 +161,8 @@ An inherited `CLAUDE_CODE_OAUTH_TOKEN` is removed from the child environment bef
 
 Each extra account lives in `$PROXY_STATE_DIR/accounts/<name>`. That directory keeps its own `.credentials.json` and `.claude.json`; every other entry is a symlink to your main Claude config. Because `projects/` is shared, a conversation can resume its transcript on another account. A switch still misses the prompt cache once, since each account has its own cache.
 
+`CLAUDE_ACCOUNT_WEEKLY_CAP` (e.g. `default=80,martin=80`) benches an account once its seven-day usage reaches that percent; an account not named has no cap. `CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY` (same form, e.g. `default=95`) raises a named account's cap to that value while its seven-day window resets within 24 hours, so the last day's spare quota is used. It only raises a cap: the result is the larger of the two, and an account with no `CLAUDE_ACCOUNT_WEEKLY_CAP` stays uncapped. `/accounts` `weeklyCap` reports the cap in force now.
+
 #### Moving pins
 
 A local API edits pins (`thread_accounts` in `sessions.sqlite`, keyed by the Codex thread id, not the Today thread id). It changes pins only: fields naming account order, weekly caps, credentials or login get a 403.
