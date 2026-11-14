@@ -215,11 +215,12 @@ export function effectiveWeeklyCap(name: string, now = Date.now()): number | und
   const resetsAt = seenInfo(name, now)?.info.unifiedWindows?.seven_day?.resetsAt;
   if (!resetsAt) return normal;
   const left = resetsAt * 1000 - now;
+  // seenInfo already drops a window that has reset; this only guards the boundary.
   if (left <= 0 || left > LAST_DAY_MS) return normal;
   return Math.max(normal, lastDay);
 }
 
-/** True once the account's last reported seven-day usage reaches its configured cap. */
+/** True once the account's last reported seven-day usage reaches the cap in force now (effectiveWeeklyCap). */
 export function isOverWeeklyCap(account: Account, now = Date.now()): boolean {
   const cap = effectiveWeeklyCap(account.name, now);
   if (cap === undefined) return false;
