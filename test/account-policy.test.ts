@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   accountStatus,
+  effectiveWeeklyCap,
   isUnavailable,
   listAccounts,
   markTurn,
@@ -174,6 +175,30 @@ test("last day: an uncapped account stays uncapped (the value only raises)", asy
   observeRateLimit(hinson, week(0.97, inHours(23)));
   expect(isUnavailable(hinson)).toBe(false);
   expect(capOf("hinson")).toBe(100);
+});
+
+// Round 1 L-max: a last-day value below the normal cap never lowers it.
+test("last day: a value below the normal cap leaves the normal cap", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "martin=70";
+  const martin = byName("martin");
+  observeRateLimit(martin, week(0.75, inHours(23)));
+  expect(capOf("martin")).toBe(80);
+  expect(isUnavailable(martin)).toBe(false);
+});
+
+// Round 1 L-24h: exactly 24 h before the reset is inside the last day, 1 ms more is not.
+test("last day: the 24 h boundary is inclusive", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "martin=95";
+  const martin = byName("martin");
+  // Whole seconds, so resetsAt * 1000 - now is exact.
+  const now = Math.ceil(Date.now() / 1000) * 1000 + 1000;
+  observeRateLimit(martin, week(0.9, now / 1000 + 86_400));
+  expect(effectiveWeeklyCap("martin", now)).toBe(95);
+  expect(effectiveWeeklyCap("martin", now - 1)).toBe(80);
 });
 
 test("last day: other accounts, unknown and passed resets keep today's rules", async () => {
