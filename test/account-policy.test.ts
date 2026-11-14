@@ -12,7 +12,7 @@ import {
   resetAccountState,
 } from "../src/accounts";
 
-const keys = ["CLAUDE_ACCOUNT_ORDER", "CLAUDE_ACCOUNT_WEEKLY_CAP", "PROXY_STATE_DIR", "CLAUDE_CONFIG_DIR"];
+const keys = ["CLAUDE_ACCOUNT_ORDER", "CLAUDE_ACCOUNT_WEEKLY_CAP", "CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY", "PROXY_STATE_DIR", "CLAUDE_CONFIG_DIR"];
 const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 
 afterEach(() => {
@@ -138,4 +138,87 @@ test("a probe that started before a turn's report does not replace it", async ()
   observeRateLimit(martin, week(0.4)); // a real turn, during the probe
   observeRateLimit(martin, week(0.2), probeStarted); // the probe lands late
   expect(accountStatus().find((a) => a.name === "martin")!.windows.seven_day?.usedPercent).toBe(40);
+});
+
+// proxy-lastday-cap (Alex, Nov 14): in the last 24 h of an account's seven-day window
+// its cap may rise to CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY. It only ever raises a cap.
+const inHours = (hours: number) => Date.now() / 1000 + hours * 3600;
+const capOf = (name: string) => accountStatus().find((a) => a.name === name)!.weeklyCap;
+const byName = (name: string) => listAccounts().find((a) => a.name === name)!;
+
+test("last day: the raised cap applies only when the window resets within 24 h", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "martin=95";
+  const martin = byName("martin");
+  // (a) 90%: taking turns in its last day, benched a day before it.
+  observeRateLimit(martin, week(0.9, inHours(23)));
+  expect(isUnavailable(martin)).toBe(false);
+  // (c) /accounts reports the cap the router enforces.
+  expect(capOf("martin")).toBe(95);
+  observeRateLimit(martin, week(0.9, inHours(25)));
+  expect(isUnavailable(martin)).toBe(true);
+  expect(capOf("martin")).toBe(80);
+  // (b) the raised cap still benches at its own threshold.
+  observeRateLimit(martin, week(0.95, inHours(23)));
+  expect(isUnavailable(martin)).toBe(true);
+  expect(capOf("martin")).toBe(95);
+});
+
+test("last day: an uncapped account stays uncapped (the value only raises)", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "hinson=95,martin=95";
+  const hinson = byName("hinson");
+  // (d) no normal cap: 97% in the last day is not benched, and reads 100.
+  observeRateLimit(hinson, week(0.97, inHours(23)));
+  expect(isUnavailable(hinson)).toBe(false);
+  expect(capOf("hinson")).toBe(100);
+});
+
+test("last day: other accounts, unknown and passed resets keep today's rules", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80,hinson=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "martin=95";
+  const martin = byName("martin");
+  const hinson = byName("hinson");
+  // (e) not named in LAST_DAY: its normal cap, last day or not.
+  observeRateLimit(hinson, week(0.9, inHours(23)));
+  expect(isUnavailable(hinson)).toBe(true);
+  expect(capOf("hinson")).toBe(80);
+  // Unknown reset time: the normal cap.
+  observeRateLimit(martin, { status: "allowed", unifiedWindows: { seven_day: { utilization: 0.9 } } });
+  expect(isUnavailable(martin)).toBe(true);
+  expect(capOf("martin")).toBe(80);
+  // A window that already reset no longer counts.
+  observeRateLimit(martin, week(0.99, Date.now() / 1000 - 1));
+  expect(isUnavailable(martin)).toBe(false);
+  expect(capOf("martin")).toBe(80);
+});
+
+// A slot swap starts a new copy and every reading turns stale. resetsAt is an absolute
+// time, so a stale reading in its last day still gets the raised cap, as the normal
+// cap applies to stale readings (approved change to the brief, Nov 14).
+test("last day: a stale reading inside the last day gets the raised cap", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "martin=95";
+  const martin = byName("martin");
+  observeRateLimit(martin, week(0.9, inHours(23)));
+  resetAccountState();
+  expect(accountStatus().find((a) => a.name === "martin")!.stale).toBe(true);
+  expect(isUnavailable(martin)).toBe(false);
+  expect(capOf("martin")).toBe(95);
+});
+
+test("last day: a stale reading whose window has reset is not over cap", async () => {
+  await setup();
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP = "martin=80";
+  process.env.CLAUDE_ACCOUNT_WEEKLY_CAP_LAST_DAY = "martin=95";
+  const martin = byName("martin");
+  observeRateLimit(martin, week(0.99, Date.now() / 1000 + 1));
+  resetAccountState();
+  await Bun.sleep(1_100);
+  expect(isUnavailable(martin)).toBe(false);
+  expect(capOf("martin")).toBe(80);
 });
