@@ -1378,11 +1378,11 @@ describe("Cairn API", () => {
   // `sent_at`, the moment Alex pressed send (Nov 14: a shower photo queued during the proxy
   // outage reached the gate 34 min after it was taken and was called stale).
   const min = (n: number) => n * 60_000;
-  const sendQueued = (name: string, sentAt: unknown) =>
+  const sendQueued = (name: string, sentAt: unknown, kind = "teeth_morning") =>
     api("/proofs", {
       method: "POST",
       token: "phone",
-      body: JSON.stringify({ kind: "teeth_morning", image: Buffer.from(name).toString("base64"), sent_at: sentAt }),
+      body: JSON.stringify({ kind, image: Buffer.from(name).toString("base64"), sent_at: sentAt }),
     });
 
   test("a proof that waited in Cairn's queue is aged from when Alex sent it", async () => {
@@ -1424,7 +1424,37 @@ describe("Cairn API", () => {
     // Not a time at all: refused before anything is checked.
     expect((await sendQueued("bad-time", "yesterday")).status).toBe(400);
     expect((await sendQueued("bad-time", true)).status).toBe(400);
+    // Only ISO with an explicit zone, or epoch milliseconds as a JSON number.
+    expect((await sendQueued("bad-time", "2026-10-08T05:30")).status).toBe(400);
+    expect((await sendQueued("bad-time", "11/15/2026")).status).toBe(400);
+    expect((await sendQueued("bad-time", String(clock))).status).toBe(400);
+    expect((await sendQueued("bad-time", Math.floor(clock / 1000))).status).toBe(400);
     expect(classified).toBe(1);
+  });
+
+  test("the 3 h edge: a send exactly 3 h before receipt is believed, a millisecond more is not", async () => {
+    // Taken 3 h 30 min before receipt, sent 3 h before: the oldest photo that can pass.
+    exif["edge-in"] = clock - min(210);
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    expect(await (await sendQueued("edge-in", clock - min(180))).json()).toMatchObject({ verdict: "accepted" });
+    // A resend of the same bytes with a later send time keeps the first verdict, unchecked.
+    expect(await (await sendQueued("edge-in", clock)).json()).toMatchObject({ verdict: "accepted" });
+    expect(classified).toBe(1);
+    exif["edge-out"] = clock - min(181);
+    expect(await (await sendQueued("edge-out", clock - min(180) - 1, "shower")).json()).toMatchObject({
+      verdict: "stale",
+      message: "❌ photo rejected: its camera timestamp is 181 minutes old (limit 30).",
+    });
+    // A stale verdict sticks too: the same bytes with a believable send time stay stale.
+    expect(await (await sendQueued("edge-out", clock - min(170), "shower")).json()).toMatchObject({ verdict: "stale" });
+    // null is the same as leaving it out.
+    exif["null-sent"] = clock - min(5);
+    verdicts.push({ kind: "shower", confidence: 0.95, reason: "wet hair" });
+    const nullSent = await sendQueued("null-sent", null, "shower");
+    expect(await nullSent.json()).toMatchObject({ verdict: "accepted", slot: `${DAY}/shower` });
+    const state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    expect(state.images.at(-1)).toMatchObject({ verdict: "accepted", kind: "shower" });
+    expect(state.images.at(-1).sentAt).toBeUndefined();
   });
 
   test("without sent_at a proof is aged at receipt, as before", async () => {

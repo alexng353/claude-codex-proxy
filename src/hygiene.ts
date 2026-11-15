@@ -91,7 +91,10 @@ export type ImageRecord = {
    * and no later than `at`. EXIF age is measured from it; credit still goes by `at`.
    */
   sentAt?: string;
-  /** A rejection the gate got wrong, set by hand: it counts for nothing and stays for the record. */
+  /**
+   * A rejection the gate got wrong, set by hand. Display only: gate events say "later annulled"
+   * (a rejected record already counts against nothing).
+   */
   annulled?: { by: string; reason: string; at: string };
   /** The message the image arrived in; a replay of that message reuses this record. */
   source: { thread: string; key: string };

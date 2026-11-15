@@ -198,9 +198,9 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     // When Alex pressed send: Cairn's queue may deliver a proof well after (the gate bounds it).
     let sentAt: number | undefined;
     if (body.sent_at !== undefined && body.sent_at !== null) {
-      sentAt =
-        typeof body.sent_at === "string" ? Date.parse(body.sent_at) : typeof body.sent_at === "number" ? body.sent_at : NaN;
-      if (!Number.isFinite(sentAt)) return json({ error: "sent_at must be an ISO time or epoch milliseconds" }, 400);
+      sentAt = parseSentAt(body.sent_at);
+      if (sentAt === undefined)
+        return json({ error: "sent_at must be an ISO time with Z or an offset, or epoch milliseconds as a number" }, 400);
     }
     const result = await submitProof(image, target, sentAt);
     return json({ ...result, gate: status() });
@@ -236,4 +236,19 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
   }
 
   return json({ error: "not found" }, 404);
+}
+
+/** ISO 8601 with an explicit zone (what Cairn sends), so no reading depends on this machine's zone. */
+const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
+/** Below this a number is epoch seconds (or nonsense), not milliseconds: refused, not misread as 1970. */
+const MIN_EPOCH_MS = 1e11;
+
+function parseSentAt(value: unknown): number | undefined {
+  const ms =
+    typeof value === "string" && ISO_WITH_ZONE.test(value)
+      ? Date.parse(value)
+      : typeof value === "number" && value >= MIN_EPOCH_MS
+        ? value
+        : NaN;
+  return Number.isFinite(ms) ? ms : undefined;
 }
