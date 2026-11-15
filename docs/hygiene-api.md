@@ -20,7 +20,7 @@ Cairn uses this API to send hygiene proof photos and to read the gate. The gate 
 Sends one proof photo.
 
 ```json
-{ "kind": "teeth_morning", "image": "<base64 or data:image/jpeg;base64,...>", "media_type": "image/jpeg" }
+{ "kind": "teeth_morning", "image": "<base64 or data:image/jpeg;base64,...>", "media_type": "image/jpeg", "sent_at": "2026-11-14T18:44:30.000Z" }
 ```
 
 - **`kind`** is one of:
@@ -33,7 +33,8 @@ Sends one proof photo.
   - `shower`: any time that day, or an overdue shower requirement from the day before
 
   The photo can fill only a requirement of the stated kind. The classifier still has to see that kind in the photo.
-- **`image`** holds the original file bytes, with EXIF kept if possible. The gate uses EXIF `DateTimeOriginal`, when present, to reject photos taken more than 30 minutes before sending.
+- **`image`** holds the original file bytes, with EXIF kept if possible. The gate uses EXIF `DateTimeOriginal` (with `OffsetTimeOriginal`), when present, to reject photos taken more than 30 minutes before sending.
+- **`sent_at`** (since 2026-11-15, optional): when Alex pressed send, as an ISO time or epoch milliseconds. Send it for a proof that waited in a queue while the gate was unreachable: the 30 minutes are then counted up to `sent_at`, not to when the gate got the photo. The gate believes `sent_at` only up to 3 hours before it receives the photo; an earlier one is ignored and the gate's own clock is used, and a later one counts as the moment of receipt. Which requirement the photo fills still goes by receipt time. Anything that is not a time is `400`.
 - **`media_type`** is optional and is ignored when `image` is a data URL. The default is `image/jpeg`. HEIC is accepted and stored, but convert to JPEG if you can: the classifier reads JPEG, PNG, WebP and GIF reliably.
 
 A check takes about 5 to 10 seconds. Send the same bytes again and you get the first verdict back without a new check, so retrying after a timeout is safe.

@@ -48,6 +48,13 @@ export const EXIF_MAX_AGE_MS = 30 * 60 * 1000;
 /** Phone clocks drift; a capture time slightly in the future is not suspicious. */
 export const EXIF_FUTURE_SLACK_MS = 10 * 60 * 1000;
 /**
+ * How long before the gate received it a Cairn proof's `sent_at` (when Alex pressed send) is
+ * believed. Cairn keeps a proof while the gate is unreachable and sends it later; past this,
+ * the gate's own clock decides, so a client claiming an old send can't make an old photo fresh.
+ * Covers the longest outage so far (Nov 14, 2 h 36 min).
+ */
+export const SENT_AT_MAX_DELAY_MS = 3 * 60 * 60 * 1000;
+/**
  * dHash bits (of 256) within which a photo counts as a copy of an earlier
  * accepted proof. Measured 2026-10-07 on 30 of Alex's photos: re-encoded or
  * resized copies landed 0-9 bits away (a few heavy edits 11-20); consecutive
@@ -79,6 +86,13 @@ export type ImageRecord = {
   at: string;
   /** Recent follower receipt, metadata only; never used for proof credit or EXIF age. */
   receivedAt?: string;
+  /**
+   * Cairn only: when Alex pressed send, as the phone reported it, inside `SENT_AT_MAX_DELAY_MS`
+   * and no later than `at`. EXIF age is measured from it; credit still goes by `at`.
+   */
+  sentAt?: string;
+  /** A rejection the gate got wrong, set by hand: it counts for nothing and stays for the record. */
+  annulled?: { by: string; reason: string; at: string };
   /** The message the image arrived in; a replay of that message reuses this record. */
   source: { thread: string; key: string };
   kind: ClassifiedKind | null;
@@ -1068,7 +1082,7 @@ export function gateEvents(state: GateState, since: number, until: number): Gate
               : r.kind && r.kind !== "none"
                 ? `${what} rejected (not due, or not clear enough)`
                 : "photo rejected (no hygiene proof seen)";
-    out.push({ key: `image:${r.sha256}:${r.at}`, at: r.at, text });
+    out.push({ key: `image:${r.sha256}:${r.at}`, at: r.at, text: r.annulled ? `${text}, later annulled (gate error)` : text });
   }
   for (const at of state.bypass.history) {
     if (!within(Date.parse(at))) continue;

@@ -184,7 +184,7 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
 
   if (path === "/proofs" && request.method === "POST") {
     if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
-    let body: { kind?: unknown; image?: unknown; media_type?: unknown };
+    let body: { kind?: unknown; image?: unknown; media_type?: unknown; sent_at?: unknown };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -195,7 +195,14 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     const image = decodeImage(body);
     if (!image) return json({ error: "image must be base64 or a data: URL" }, 400);
     if (image.bytes.length > MAX_IMAGE_BYTES) return json({ error: "image is larger than 25 MB" }, 413);
-    const result = await submitProof(image, target);
+    // When Alex pressed send: Cairn's queue may deliver a proof well after (the gate bounds it).
+    let sentAt: number | undefined;
+    if (body.sent_at !== undefined && body.sent_at !== null) {
+      sentAt =
+        typeof body.sent_at === "string" ? Date.parse(body.sent_at) : typeof body.sent_at === "number" ? body.sent_at : NaN;
+      if (!Number.isFinite(sentAt)) return json({ error: "sent_at must be an ISO time or epoch milliseconds" }, 400);
+    }
+    const result = await submitProof(image, target, sentAt);
     return json({ ...result, gate: status() });
   }
 

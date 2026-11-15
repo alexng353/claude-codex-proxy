@@ -38,6 +38,7 @@ import {
   MIN_CONFIDENCE,
   MORNING_MINUTE,
   NEAR_DUPLICATE_BITS,
+  SENT_AT_MAX_DELAY_MS,
   addDays,
   bypassActive,
   candidateSlots,
@@ -562,11 +563,12 @@ async function checkImageRecorded(
   source: { thread: string; key: string },
   now: number,
   only?: ProofTarget,
+  sentAt?: number,
 ): Promise<ImageOutcome> {
   // A gym photo also goes through the hygiene check: a shower photo at the gym is still a shower photo.
   const gym = only ? null : await gymPhoto(state, url, now);
   const before = state.images.length;
-  const outcome = await whileChecking(statePath(), () => checkImage(state, url, source, now, only));
+  const outcome = await whileChecking(statePath(), () => checkImage(state, url, source, now, only, sentAt));
   // Only a record this call added is news; a retried message returns its first verdict silently.
   const added = state.images.length > before ? state.images.at(-1) : undefined;
   // "No hygiene proof visible" on a gym photo is not shown in the chat either.
@@ -657,6 +659,8 @@ async function checkImage(
   source: { thread: string; key: string },
   now: number,
   only?: ProofTarget,
+  /** When Alex pressed send, already bounded by `sendTime`; the EXIF age is measured from it. */
+  sentAt?: number,
 ): Promise<ImageOutcome> {
   const decoded = decodeDataUrl(url);
   if (!decoded) return { line: null };
@@ -679,6 +683,7 @@ async function checkImage(
     verdict: "rejected",
     // Read before this photo can fill anything: was it sent to unlock the gate?
     locked: outstanding(state, now).length > 0 && !bypassActive(state, now),
+    ...(sentAt !== undefined ? { sentAt: new Date(sentAt).toISOString() } : {}),
   };
   // Only passed proofs count: a retake right after a rejected photo must not collide with it.
   // A gym-only photo never proved hygiene, so it can't make a later photo a copy.
@@ -698,8 +703,11 @@ async function checkImage(
     }
   }
   const taken = await deps.captureTime(decoded.bytes);
-  if (taken !== null && (now - taken > EXIF_MAX_AGE_MS || taken - now > EXIF_FUTURE_SLACK_MS)) {
-    const minutes = Math.round((now - taken) / 60_000);
+  // Fresh at the moment Alex sent it: a proof that waited in Cairn's queue while the gate was
+  // down is not older for the wait (Nov 14 shower, 34 min).
+  const sent = sentAt ?? now;
+  if (taken !== null && (sent - taken > EXIF_MAX_AGE_MS || taken - now > EXIF_FUTURE_SLACK_MS)) {
+    const minutes = Math.round((sent - taken) / 60_000);
     state.images.push({ ...record, verdict: "stale", reason: `taken ${minutes} min before sending` });
     return { line: `❌ photo rejected: its camera timestamp is ${minutes} minutes old (limit 30).` };
   }
@@ -2026,14 +2034,19 @@ export type SubmitResult = {
 /**
  * Runs the chat checks (reuse, EXIF age, classifier) on a photo sent outside
  * a chat. Resending the same bytes returns the first verdict.
+ * `sentAt`: when Alex pressed send (Cairn's queue may deliver it later); see `sendTime`.
  */
-export async function submitProof(image: { mediaType: string; bytes: Buffer }, target: ProofTarget): Promise<SubmitResult> {
+export async function submitProof(
+  image: { mediaType: string; bytes: Buffer },
+  target: ProofTarget,
+  sentAt?: number,
+): Promise<SubmitResult> {
   return serialized(async () => {
     const state = structuredClone(loadState());
     const now = deps.now();
     const hash = sha256(image.bytes);
     const url = `data:${image.mediaType};base64,${image.bytes.toString("base64")}`;
-    const outcome = await checkImageRecorded(state, url, { thread: "cairn", key: hash }, now, target);
+    const outcome = await checkImageRecorded(state, url, { thread: "cairn", key: hash }, now, target, sendTime(sentAt, now));
     if (JSON.stringify(state) !== JSON.stringify(loadState())) saveState(state);
     const record = outcome.record;
     const pass = record?.verdict === "accepted";
@@ -2048,6 +2061,15 @@ export async function submitProof(image: { mediaType: string; bytes: Buffer }, t
       ...(weighIn ? { reading: record.reading ?? null, weight_lb: parseWeightReading(record.reading) } : {}),
     };
   });
+}
+
+/**
+ * The client's send time when the gate can believe it: no more than `SENT_AT_MAX_DELAY_MS`
+ * before receipt, and never after it. Otherwise undefined, and the gate's clock decides.
+ */
+export function sendTime(sentAt: number | undefined, now: number): number | undefined {
+  if (sentAt === undefined || !Number.isFinite(sentAt) || now - sentAt > SENT_AT_MAX_DELAY_MS) return undefined;
+  return Math.min(sentAt, now);
 }
 
 /** Accepted proofs grouped by local day, newest day first. */
