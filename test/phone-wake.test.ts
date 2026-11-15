@@ -282,16 +282,17 @@ describe("shieldSignature", () => {
     setGateDeps({ now: () => t, wake: async () => "sent" });
     await state(null);
     resetGateCache();
-    expect(shieldSignature()).toBe("clear|");
+    // state|bypass end|badge (the badge count wakes Cairn too: cairn-gate-badge)
+    expect(shieldSignature()).toBe("clear||0");
     t = at(7 * 60);
-    expect(shieldSignature()).toBe("armed|");
+    expect(shieldSignature()).toBe("armed||1");
     const until = new Date(at(8 * 60)).toISOString();
     await state(until);
     resetGateCache();
-    expect(shieldSignature()).toBe(`bypassed|${until}`);
+    expect(shieldSignature()).toBe(`bypassed|${until}|0`);
     t = at(8 * 60);
-    expect(shieldSignature()).toBe("armed|");
+    expect(shieldSignature()).toBe("armed||1");
     await writeFile(process.env.HYGIENE_GATE_DISABLED_FILE!, "");
-    expect(shieldSignature()).toBe("disabled|");
+    expect(shieldSignature()).toBe("disabled||0");
   });
 });

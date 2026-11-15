@@ -110,6 +110,7 @@ function status() {
   return {
     enabled: s.enabled,
     state: s.state,
+    badge: s.badge,
     now: s.now,
     zone: s.zone,
     today: localTime(Date.parse(s.now)).day,

@@ -1361,13 +1361,13 @@ export function startGymPolling(intervalMs?: number): () => Promise<void> {
 }
 
 /**
- * What the phone's shield depends on: whether the gate is armed, and when a
- * bypass ends (the phone schedules its own re-lock from it). A change here
- * wakes Cairn (phone-wake.ts).
+ * What the phone depends on: whether the gate is armed, when a bypass ends
+ * (the phone schedules its own re-lock from it) and the icon badge count.
+ * A change here wakes Cairn (phone-wake.ts).
  */
 export function shieldSignature(): string {
   const status = gateStatus();
-  return `${status.state}|${status.bypass.activeUntil ?? ""}`;
+  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}`;
 }
 
 /** Wakes Cairn when the shield signature changes (authority only; never under tests). */
@@ -1566,10 +1566,13 @@ export function gateStatus() {
   const state = loadState();
   const due = outstanding(state, now);
   const bypass = bypassActive(state, now);
+  const gateState = disabled ? "disabled" : due.length === 0 ? "clear" : bypass ? "bypassed" : "armed";
   return {
     enabled: !disabled,
     armed: !disabled && due.length > 0 && !bypass,
-    state: disabled ? "disabled" : due.length === 0 ? "clear" : bypass ? "bypassed" : "armed",
+    state: gateState,
+    // Cairn's icon badge: items missing right now, only while they lock the gate.
+    badge: gateState === "armed" ? due.length : 0,
     now: new Date(now).toISOString(),
     zone: zoneAt(now),
     startsAt: state.startsAt,
