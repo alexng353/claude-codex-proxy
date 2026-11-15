@@ -69,6 +69,7 @@ Response (`200`, also when the photo fails):
 {
   "enabled": true,
   "state": "armed",
+  "badge": 1,
   "now": "2026-10-07T12:05:00.000Z",
   "today": "2026-10-07",
   "outstanding": [{ "slot": "2026-10-07/morning-teeth", "kind": "teeth", "label": "morning teeth photo" }],
@@ -86,6 +87,7 @@ Response (`200`, also when the photo fails):
   - `clear`: nothing is locked
   - `bypassed`: locked, but a BYPASS hour is open
   - `disabled`: the kill switch is on
+- **`badge`** (since 2026-11-15) is the number for Cairn's app icon badge: the length of `outstanding` while `state` is `armed`, else 0. A change in it wakes the phone (silent push), so the icon follows the gate without Cairn being opened. A status read that fails should leave the badge as it is.
 - **`outstanding`** lists what locks the gate now. Its `kind` is `teeth`, `shower`, `weight`, `creatine`, `walk`, `penance` or `gym`. A `gym` item (slot `gym/<plan id>`, since 2026-11-02) is a planned gym session with no qualifying Uplifting session, for at most 24 h. This API has no gym kind for proofs; a geotagged gym photo counts only when sent in a chat (README, gym sessions).
 - **`due_today`** lists what is due later today but does not lock yet, including today's planned gym sessions and one in progress.
 - **`open_debts`** lists BYPASS uses (and, since 2026-11-05, moves not kept by midnight) that the model has not ruled on yet, or penances that are still unpaid: `{ id, at, skipped[], status: "open" | "penance", penance?: { description, setAt }, source: "bypass" | "move" }`. A penance photo is sent as kind `penance` (oldest first) or in a chat.
