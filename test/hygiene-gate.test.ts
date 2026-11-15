@@ -1374,6 +1374,67 @@ describe("Cairn API", () => {
     expect((await api(`/photos/${"0".repeat(64)}`, { token: "phone" })).status).toBe(404);
   });
 
+  // Cairn keeps a proof in its queue while the gate is unreachable and sends it later with
+  // `sent_at`, the moment Alex pressed send (Nov 14: a shower photo queued during the proxy
+  // outage reached the gate 34 min after it was taken and was called stale).
+  const min = (n: number) => n * 60_000;
+  const sendQueued = (name: string, sentAt: unknown) =>
+    api("/proofs", {
+      method: "POST",
+      token: "phone",
+      body: JSON.stringify({ kind: "teeth_morning", image: Buffer.from(name).toString("base64"), sent_at: sentAt }),
+    });
+
+  test("a proof that waited in Cairn's queue is aged from when Alex sent it", async () => {
+    const sentAt = clock - min(34);
+    exif["queued-teeth"] = sentAt - 30_000;
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    const body = await (await sendQueued("queued-teeth", new Date(sentAt).toISOString())).json();
+    expect(body).toMatchObject({ result: "pass", verdict: "accepted", slot: `${DAY}/morning-teeth` });
+    const state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    // Credited when the gate saw it; the send time is kept beside it.
+    expect(state.images.at(-1)).toMatchObject({
+      verdict: "accepted",
+      at: new Date(clock).toISOString(),
+      sentAt: new Date(sentAt).toISOString(),
+    });
+  });
+
+  test("a send time can't make an old photo fresh", async () => {
+    // Taken 31 min before Alex sent it: stale, counted from the send.
+    exif["old-at-send"] = clock - min(10) - min(31);
+    expect(await (await sendQueued("old-at-send", clock - min(10))).json()).toMatchObject({
+      verdict: "stale",
+      message: "❌ photo rejected: its camera timestamp is 31 minutes old (limit 30).",
+    });
+    // Claimed more than 3 h before the gate got it: ignored, the gate's clock decides.
+    exif["backdated"] = clock - min(3 * 60 + 5);
+    expect(await (await sendQueued("backdated", new Date(clock - min(3 * 60 + 1)).toISOString())).json()).toMatchObject({
+      verdict: "stale",
+      message: "❌ photo rejected: its camera timestamp is 185 minutes old (limit 30).",
+    });
+    let state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    expect(state.images.at(-1).sentAt).toBeUndefined();
+    // A send time after receipt counts as receipt: it can't age a photo either way past the clock.
+    exif["future-sent"] = clock - min(25);
+    verdicts.push({ kind: "teeth", confidence: 0.95, reason: "brushing" });
+    expect(await (await sendQueued("future-sent", new Date(clock + min(20)).toISOString())).json()).toMatchObject({ verdict: "accepted" });
+    state = JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8"));
+    expect(state.images.at(-1).sentAt).toBe(new Date(clock).toISOString());
+    // Not a time at all: refused before anything is checked.
+    expect((await sendQueued("bad-time", "yesterday")).status).toBe(400);
+    expect((await sendQueued("bad-time", true)).status).toBe(400);
+    expect(classified).toBe(1);
+  });
+
+  test("without sent_at a proof is aged at receipt, as before", async () => {
+    exif["late-teeth"] = clock - min(34);
+    expect(await (await submit("teeth_morning", "late-teeth")).json()).toMatchObject({
+      verdict: "stale",
+      message: "❌ photo rejected: its camera timestamp is 34 minutes old (limit 30).",
+    });
+  });
+
   test("Cairn can send the morning weigh-in once it is enabled", async () => {
     expect(await (await submit("weight_morning", "too-early")).json()).toMatchObject({ result: "fail", verdict: "not_due" });
     const path = process.env.HYGIENE_GATE_STATE!;
