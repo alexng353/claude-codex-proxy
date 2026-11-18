@@ -20,17 +20,26 @@ const MCP_PREFIX = "mcp__";
  */
 export function codexToolFor(native: string, allowed: ReadonlySet<string>): string | undefined {
   const bare = native.startsWith(MCP_PREFIX) ? native.slice(MCP_PREFIX.length) : native;
-  const candidates = [native, bare];
-  // Claude Code spells MCP tools mcp__server__tool; Codex spells them server.tool.
+  const candidates = [native];
+  // Claude Code spells MCP tools mcp__server__tool. Codex lists them as
+  // mcp__server.tool (Today's own tools come under both mcp__today and today), so
+  // that spelling is tried before server.tool.
   const split = bare.indexOf("__");
-  if (bare !== native && split > 0)
-    candidates.push(`${bare.slice(0, split)}.${bare.slice(split + 2)}`);
+  if (bare !== native && split > 0) {
+    const tool = `${bare.slice(0, split)}.${bare.slice(split + 2)}`;
+    candidates.push(`${MCP_PREFIX}${tool}`, bare, tool);
+  } else candidates.push(bare);
   for (const candidate of candidates) if (allowed.has(candidate)) return candidate;
   // A bare name (create_thread) means a namespaced tool only when exactly one matches.
   if (bare.includes(".") || split > 0) return undefined;
   const matches = [...allowed].filter((name) => name.endsWith(`.${bare}`));
   return matches.length === 1 ? matches[0] : undefined;
 }
+
+/** Nudges sent so far for one Codex request, shared by all its account attempts. */
+export type NudgeState = { nudged: Set<string>; count: number };
+
+export const newNudgeState = (): NudgeState => ({ nudged: new Set(), count: 0 });
 
 export function nudgeMessage(names: readonly string[]): string {
   const lines = names.map(
@@ -41,17 +50,16 @@ export function nudgeMessage(names: readonly string[]): string {
 }
 
 /**
- * One Codex turn's record of native calls. `check` returns the corrective message to
- * send for an answer, or undefined when there is nothing to correct; it throws when
- * the model keeps calling natively, so the turn ends with a visible error.
+ * Checks one worker's answers for native calls. `check` returns the corrective
+ * message to send for an answer, or undefined when there is nothing to correct; it
+ * throws when the model keeps calling natively, so the turn ends with a visible
+ * error. The caps live in `state`, which a failover to another account keeps.
  */
 export class NativeToolGuard {
-  private readonly nudged = new Set<string>();
-  private nudges = 0;
-
   constructor(
     private readonly allowed: ReadonlySet<string>,
     private readonly sessionId: string,
+    private readonly state: NudgeState,
   ) {}
 
   check(nativeNames: readonly string[], toolCalls: readonly { name: string }[]): string | undefined {
@@ -61,18 +69,18 @@ export class NativeToolGuard {
       ...new Set(nativeNames.map((name) => codexToolFor(name, this.allowed))),
     ].filter((name): name is string => name !== undefined && !called.has(name));
     if (pending.length === 0) return undefined;
-    const repeat = pending.find((name) => this.nudged.has(name));
+    const repeat = pending.find((name) => this.state.nudged.has(name));
     if (repeat)
       throw new Error(
         `Claude called Codex tool ${repeat} as a native tool again after a correction (session ${this.sessionId}); no tool ran`,
       );
-    if (this.nudges >= MAX_NUDGES)
+    if (this.state.count >= MAX_NUDGES)
       throw new Error(
         `Claude kept calling Codex tools as native tools after ${MAX_NUDGES} corrections: ${pending[0]} (session ${this.sessionId}); no tool ran`,
       );
-    this.nudges++;
+    this.state.count++;
     for (const name of pending) {
-      this.nudged.add(name);
+      this.state.nudged.add(name);
       console.log(JSON.stringify({ nativeToolNudge: { sessionId: this.sessionId, name } }));
     }
     return nudgeMessage(pending);

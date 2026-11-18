@@ -53,7 +53,7 @@ import {
   type SessionKey,
 } from "./sessions";
 import { markThreadInFlight } from "./in-flight";
-import { NativeToolGuard, noteThirdPerson } from "./native-tools";
+import { NativeToolGuard, newNudgeState, noteThirdPerson, type NudgeState } from "./native-tools";
 import { recordForkSource, retireForkSourcesOf } from "./prediction-fork";
 import {
   conversationRequest,
@@ -925,11 +925,13 @@ async function runClaudeRequest(
 ): Promise<ProxyOutput> {
   const requestId = crypto.randomUUID();
   const checkpoints = new Map<string, string | undefined>();
+  // One Codex request's nudge caps, kept across failovers to other accounts.
+  const nudges = newNudgeState();
   for (;;) {
     const turn: TurnContext = { requestId, threadId };
     let output: ProxyOutput;
     try {
-      output = await runClaudeTurn(request, turn, checkpoints);
+      output = await runClaudeTurn(request, turn, checkpoints, nudges);
     } catch (error) {
       // Corrections can also fail authentication or hit quota; replay before any tool calls are returned.
       if (failoverAccount(requestId, turn.account, errorCategory(error)))
@@ -954,6 +956,7 @@ async function runClaudeTurn(
   original: ResponsesRequest,
   turn: TurnContext,
   checkpoints: Map<string, string | undefined>,
+  nudges: NudgeState,
 ): Promise<ProxyOutput> {
   validateCompactionItems(original);
   // Read from SQLite at every turn start; nothing caches pins, so an API edit applies here.
@@ -1083,7 +1086,7 @@ async function runClaudeTurn(
   );
   const compaction = isCompactionRequest(request);
   // A compaction turn wants no tool calls at all, so a native call there is not nudged.
-  const native = compaction ? undefined : new NativeToolGuard(allowedTools, worker.sessionId);
+  const native = compaction ? undefined : new NativeToolGuard(allowedTools, worker.sessionId, nudges);
   if (compaction)
     return await compactionOutput(worker, request, turn, structured, native);
 
