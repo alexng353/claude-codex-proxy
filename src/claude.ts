@@ -53,6 +53,7 @@ import {
   type SessionKey,
 } from "./sessions";
 import { markThreadInFlight } from "./in-flight";
+import { NativeToolGuard, noteThirdPerson } from "./native-tools";
 import { recordForkSource, retireForkSourcesOf } from "./prediction-fork";
 import {
   conversationRequest,
@@ -237,6 +238,8 @@ type PendingTurn = {
   reject: (error: Error) => void;
   // Plain text the model wrote this turn outside StructuredOutput.
   prose: string[];
+  // Native tool_use names other than StructuredOutput (see native-tools.ts).
+  nativeTools: string[];
 };
 /** What the worker answered last, so the next request can be checked against it. */
 type LastTurn = { text: string; callIds: Set<string> };
@@ -282,6 +285,8 @@ class ClaudeWorker {
   seenCount = 0;
   prefixHash = "";
   lastTurn: LastTurn = { text: "", callIds: new Set() };
+  /** Native tool_use names (not StructuredOutput) the latest run produced. */
+  nativeToolUses: string[] = [];
   private readonly subprocess: Bun.Subprocess<"pipe", "pipe", "pipe">;
   private pending?: PendingTurn;
   private readonly workerId = crypto.randomUUID();
@@ -415,6 +420,7 @@ class ClaudeWorker {
           reject(error);
         },
         prose: [],
+        nativeTools: [],
       };
       const message = { type: "user", message: { role: "user", content } };
       this.subprocess.stdin.write(`${JSON.stringify(message)}\n`);
@@ -545,7 +551,7 @@ class ClaudeWorker {
     let event:
       | ClaudeResult
       | { type: "rate_limit_event"; rate_limit_info?: Record<string, unknown> }
-      | { type: "assistant"; message?: { content?: Array<{ type: string; text?: string }> } }
+      | { type: "assistant"; message?: { content?: Array<{ type: string; text?: string; name?: string }> } }
       | undefined;
     try {
       event = JSON.parse(line);
@@ -557,11 +563,15 @@ class ClaudeWorker {
       return;
     }
     if (event?.type === "assistant") {
-      for (const block of event.message?.content ?? [])
+      for (const block of event.message?.content ?? []) {
         if (block.type === "text" && block.text?.trim()) this.pending?.prose.push(block.text);
+        if (block.type === "tool_use" && typeof block.name === "string" && block.name !== "StructuredOutput")
+          this.pending?.nativeTools.push(block.name);
+      }
       return;
     }
     if (event?.type !== "result" || !this.pending) return;
+    this.nativeToolUses = this.pending.nativeTools;
     if (!event.is_error) markAuthSucceeded(this.account, this.observedAuthIncident);
     // The model sometimes answers in plain text and then submits StructuredOutput
     // with empty text; keep the answer instead of returning nothing to Codex.
@@ -1066,14 +1076,17 @@ async function runClaudeTurn(
     await prepared.cleanup();
   }
 
-  if (isCompactionRequest(request))
-    return await compactionOutput(worker, request, turn, structured);
-
   // Tool names are validated here instead of by a schema enum (see
   // outputSchema).
   const allowedTools = new Set(
     toolDescriptors(requestTools(request)).map((tool) => tool.proxyName),
   );
+  const compaction = isCompactionRequest(request);
+  // A compaction turn wants no tool calls at all, so a native call there is not nudged.
+  const native = compaction ? undefined : new NativeToolGuard(allowedTools, worker.sessionId);
+  if (compaction)
+    return await compactionOutput(worker, request, turn, structured, native);
+
   structured = await corrected(worker, turn, structured, (output) => {
     const unknown = output.tool_calls
       .map((call) => call.name)
@@ -1083,7 +1096,9 @@ async function runClaudeTurn(
       message: `<tool_error>\nNo tool calls were executed. Unknown tool name(s): ${unknown.join(", ")}. Use only exact names from <available_tools> or tools loaded by tool search, formatted namespace.name for namespaced tools. Reply again with the corrected text and tool_calls.\n</tool_error>`,
       failure: `Claude CLI requested unavailable tool: ${unknown[0]}`,
     };
-  });
+  }, native);
+  // Measured only (a blocking check is a follow-up): the text goes out unchanged.
+  noteThirdPerson(structured.text, worker.sessionId);
 
   const toolCalls = structured.tool_calls.map((call) => ({
     ...call,
@@ -1112,23 +1127,28 @@ type Correction = { message: string; failure: string };
 
 /**
  * Sends corrections to the same worker, which keeps its prompt cache, until
- * `check` accepts the answer. The worker is closed if it never does.
+ * `check` accepts the answer. The worker is closed if it never does. A native call
+ * of a Codex tool is corrected first, by `native`, which bounds its own nudges, so
+ * they do not use MAX_CORRECTIONS.
  */
 async function corrected(
   worker: ClaudeWorker,
   turn: TurnContext,
   structured: StructuredOutput,
   check: (output: StructuredOutput) => Correction | undefined,
+  native?: NativeToolGuard,
 ): Promise<StructuredOutput> {
   try {
-    for (let retry = 0; ; retry++) {
-      const correction = check(structured);
-      if (!correction) return structured;
-      if (retry >= MAX_CORRECTIONS) throw new Error(correction.failure);
+    let retries = 0;
+    for (let attempt = 2; ; attempt++) {
+      const nudge = native?.check(worker.nativeToolUses, structured.tool_calls);
+      const correction = nudge === undefined ? check(structured) : undefined;
+      if (nudge === undefined && !correction) return structured;
+      if (correction && retries++ >= MAX_CORRECTIONS) throw new Error(correction.failure);
       const result = await worker.run(
-        [{ type: "text", text: correction.message }],
+        [{ type: "text", text: nudge ?? correction!.message }],
         turn,
-        retry + 2,
+        attempt,
       );
       structured = parseStructuredOutput(result);
     }
@@ -1164,12 +1184,13 @@ async function compactionOutput(
   request: ResponsesRequest,
   turn: TurnContext,
   structured: StructuredOutput,
+  native: NativeToolGuard | undefined,
 ): Promise<ProxyOutput> {
   const { text } = await corrected(worker, turn, structured, (output) =>
     output.tool_calls.length > 0 || !output.text.trim()
       ? COMPACTION_CORRECTION
       : undefined,
-  );
+  native);
   // The summary replaces this history, so no later request can extend this worker.
   worker.close();
   return {
