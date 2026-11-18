@@ -115,6 +115,91 @@ test("codexToolFor maps native spellings to the exact Codex name in the list", (
   expect(codexToolFor("StructuredOutput", allowed)).toBeUndefined();
 });
 
+test("codexToolFor maps mcp__server__tool to mcp__server.tool before server.tool", () => {
+  // Real Today requests can list the same tools under both `today` and `mcp__today`.
+  const both = new Set(["today.create_thread", "mcp__today.create_thread", "mcp__today.send_message_to_thread"]);
+  expect(codexToolFor("mcp__today__create_thread", both)).toBe("mcp__today.create_thread");
+  expect(codexToolFor("mcp__today.create_thread", both)).toBe("mcp__today.create_thread");
+  expect(codexToolFor("mcp__today__send_message_to_thread", both)).toBe("mcp__today.send_message_to_thread");
+  expect(codexToolFor("mcp__today__create_thread", new Set(["today.create_thread"]))).toBe("today.create_thread");
+});
+
+test("codexToolFor: an exact name beats a suffix match; an ambiguous bare name maps to nothing", () => {
+  expect(codexToolFor("create_thread", new Set(["create_thread", "today.create_thread"]))).toBe("create_thread");
+  expect(codexToolFor("create_thread", new Set(["today.create_thread", "other.create_thread"]))).toBeUndefined();
+  expect(codexToolFor("create_thread", new Set(["today.create_thread", "mcp__today.create_thread"]))).toBeUndefined();
+  expect(codexToolFor("today.create_thread", new Set(["today.create_thread", "mcp__today.create_thread"]))).toBe("today.create_thread");
+});
+
+test("a native mcp__today__create_thread is nudged as mcp__today.create_thread when both namespaces are listed", async () => {
+  const fake = await fakeClaude([
+    { native: ["mcp__today__create_thread"], text: `${MODEL_SENTINEL} tools broken` },
+    { text: "", tool_calls: [{ name: "mcp__today.create_thread", arguments: "{}" }] },
+  ]);
+  const tools = [
+    ...TOOLS!,
+    { type: "namespace", name: "mcp__today", tools: [{ type: "function", name: "create_thread", parameters: { type: "object" } }] },
+  ];
+  const output = await runClaude({ model: "sonnet", input: "start", tools, prompt_cache_key: crypto.randomUUID() });
+  expect(output.toolCalls.map((call) => call.name)).toEqual(["mcp__today.create_thread"]);
+  const messages = await fake.messages();
+  expect(messages).toHaveLength(2);
+  expect(messages[1]).toContain("`mcp__today.create_thread` is a Codex tool");
+  expect(messages[1]).not.toContain("`today.create_thread`");
+});
+
+// Found in review (round 1, Boyle): an auth failure during a correction replays the
+// request on another account in a fresh turn, which used to start with fresh caps.
+test("the once-per-name and two-nudge caps hold across an account failover in one request", async () => {
+  await mkdir(join(root, "state/accounts/spare"), { recursive: true });
+  await writeFile(join(root, "state/accounts/spare/.credentials.json"), "{}");
+  const inbox = join(root, "failover-inbox");
+  const fake = join(root, "failover-fake.mjs");
+  await writeFile(fake, `#!${process.execPath}
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const spare = process.env.CLAUDE_CONFIG_DIR.endsWith("/spare");
+let count = 0;
+for await (const line of createInterface({ input: process.stdin })) {
+  count++;
+  appendFileSync(${JSON.stringify(inbox)}, JSON.stringify({ spare, count }) + "\\n");
+  if (!spare && count === 3) {
+    console.log(JSON.stringify({ type: "result", subtype: "success", is_error: true, api_error_status: 401, result: "Unauthorized" }));
+    continue;
+  }
+  const native = spare ? count === 1 : true;
+  if (native) console.log(JSON.stringify({ type: "assistant", message: { content: [
+    { type: "tool_use", id: "toolu_" + count, name: !spare && count === 2 ? "second" : "first", input: {} }] } }));
+  console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, structured_output: { text: "done", tool_calls: [] } }));
+}
+`);
+  await chmod(fake, 0o755);
+  process.env.CLAUDE_BIN = fake;
+  const error = await runClaude({
+    model: "sonnet",
+    input: "synthetic cap probe",
+    tools: [
+      { type: "function", name: "first", parameters: { type: "object" } },
+      { type: "function", name: "second", parameters: { type: "object" } },
+    ],
+  }).then(
+    () => undefined,
+    (cause: Error) => cause,
+  );
+  // Two nudges on the first account; the replay's native call is past both caps.
+  expect(nudgeLines().map((line) => line.name)).toEqual(["first", "second"]);
+  expect(error).toBeInstanceOf(Error);
+  expect(error!.message).toContain("first");
+  expect(error!.message).toContain("no tool ran");
+  const messages = (await readFile(inbox, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+  expect(messages).toEqual([
+    { spare: false, count: 1 },
+    { spare: false, count: 2 },
+    { spare: false, count: 3 },
+    { spare: true, count: 1 },
+  ]);
+});
+
 test("(a) adb13227 shape: one corrective turn names the exact Codex tool, then tool_calls pass through", async () => {
   const fake = await fakeClaude([
     { native: ["mcp__today.create_thread"], text: `${MODEL_SENTINEL} my tools look broken` },
