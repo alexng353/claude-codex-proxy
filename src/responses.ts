@@ -1,4 +1,5 @@
 import type { ProxyOutput, ResponsesRequest } from "./types";
+import { repairToolArguments } from "./args-json";
 import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, encodeCompaction, requestTools, toolDescriptors } from "./request";
 
 type OutputItem = Record<string, unknown>;
@@ -20,12 +21,15 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
     });
   }
   const descriptors = toolDescriptors(requestTools(request));
+  const threadId = typeof request.prompt_cache_key === "string" ? request.prompt_cache_key : undefined;
   for (const call of output.toolCalls) {
     const descriptor = descriptors.find((tool) => tool.proxyName === call.name);
+    // Custom (freeform) input is raw text, not JSON: only the JSON branches repair.
+    const args = () => repairToolArguments(call.arguments, { tool: call.name, threadId });
     if (call.name === TOOL_SEARCH_NAME || descriptor?.type === "tool_search") {
       let argumentsValue: unknown;
       try {
-        argumentsValue = JSON.parse(call.arguments);
+        argumentsValue = JSON.parse(args());
       } catch {
         throw new Error("Tool search arguments must be valid JSON");
       }
@@ -41,7 +45,7 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
     if (call.name === COMPUTER_TOOL_NAME || descriptor?.type === "computer") {
       let action: unknown;
       try {
-        action = JSON.parse(call.arguments);
+        action = JSON.parse(args());
       } catch {
         throw new Error("Computer tool arguments must be valid JSON");
       }
@@ -64,7 +68,7 @@ function outputItems(request: ResponsesRequest, output: ProxyOutput): OutputItem
     }
     items.push({
       id: id("fc"), type: "function_call", status: "completed",
-      call_id: call.callId ?? id("call"), name: descriptor?.name ?? call.name, namespace: descriptor?.namespace, arguments: call.arguments,
+      call_id: call.callId ?? id("call"), name: descriptor?.name ?? call.name, namespace: descriptor?.namespace, arguments: args(),
     });
   }
   return items;
