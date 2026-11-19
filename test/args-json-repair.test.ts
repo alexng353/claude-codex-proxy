@@ -82,15 +82,12 @@ describe("tool-call argument JSON repair", () => {
     expect(execArgs(j`{"cmd":"a⏎b⇥c␁d"}`)).toBe(j`{"cmd":"a⧵nb⧵tc⧵u0001d"}`);
   });
 
-  test("the rule is per string: a properly encoded key does not block a repair in another", () => {
-    const args = execArgs(j`{"msg":"line⧵nnext ⧵"q⧵"","cmd":"echo ⧵$HOME"}`);
-    expect(args).toBe(j`{"msg":"line⧵nnext ⧵"q⧵"","cmd":"echo ⧵⧵$HOME"}`);
-    expect(JSON.parse(args)).toEqual({ msg: j`line⏎next "q"`, cmd: j`echo ⧵$HOME` });
-  });
-
-  // PAJR-H1: a lone backslash or raw control character shows the model wrote that
-  // string as raw text, so its valid-looking escapes were raw too. Decoding them would
-  // run a different command than the one written; Codex rejecting it is the safe outcome.
+  // PAJR-H1/H2: a lone backslash or raw control character shows the model typed the
+  // call as raw text, so every valid-looking escape in it, in any string, was raw too.
+  // Decoding them would run a different command than the one written; Codex rejecting
+  // it is the safe outcome. The decision is call-wide (r3): in r2 it was per string,
+  // and a properly encoded key beside a key needing a repair was repaired; that case
+  // now passes through, as the sibling-string rows below.
   for (const [name, original] of [
     ["rm with backslash-n and a lone backslash (would split at a newline)", j`{"cmd":"rm -rf /tmp/reports⧵note⧵ files"}`],
     ["backslash-u003b with a lone backslash-q (would inject a ;)", j`{"cmd":"echo ⧵u003b echo SECOND ⧵q"}`],
@@ -99,12 +96,20 @@ describe("tool-call argument JSON repair", () => {
     ["a lone backslash-dollar beside an escaped quote", j`{"cmd":"echo ⧵"hi⧵" ⧵$x"}`],
     ["a lone backslash-dollar beside an escaped backslash", j`{"cmd":"echo ⧵⧵ ⧵$x"}`],
     ["an odd backslash run (a valid pair, then a lone backslash)", j`{"cmd":"echo ⧵⧵⧵$HOME"}`],
+    ["sibling strings: backslash-n in cmd, a lone backslash-dollar in justification (probe4)", j`{"cmd":"rm -rf /tmp/reports⧵note","justification":"clean ⧵$TMP reports"}`],
+    ["argv: backslash-b in one element, a lone backslash-paren in another", j`{"cmd":["grep","-E","⧵bfoo⧵b","--","a⧵(b"]}`],
+    ["sibling strings: a raw newline in one, an escaped quote in another", j`{"cmd":"cat <<EOF⏎hi⏎EOF","note":"say ⧵"hi⧵""}`],
+    ["was r2's per-string repair: an encoded backslash-n key beside a lone backslash-dollar key", j`{"msg":"line⧵nnext ⧵"q⧵"","cmd":"echo ⧵$HOME"}`],
   ] as const) {
-    test(`mixed valid and invalid escapes in one string pass through unchanged: ${name}`, () => {
+    test(`a valid escape anywhere in a call that needs a repair passes it through unchanged: ${name}`, () => {
       expect(execArgs(original)).toBe(original);
       expect(repairLogs()).toEqual([]);
     });
   }
+
+  test("a call with several strings, none holding a valid escape, is repaired in every string", () => {
+    expect(execArgs(j`{"cmd":["grep","a⧵|b","x⏎y"],"workdir":"/w"}`)).toBe(j`{"cmd":["grep","a⧵⧵|b","x⧵ny"],"workdir":"/w"}`);
+  });
 
   test("a backslash-u without four hex digits is a bad escape", () => {
     const args = execArgs(j`{"cmd":"printf ⧵u12"}`);
