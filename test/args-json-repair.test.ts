@@ -54,7 +54,11 @@ describe("tool-call argument JSON repair", () => {
   test("the 2026-11-11 13:03:56 wakeup-add call reaches Codex as valid JSON with a literal backslash-dollar", () => {
     const original = readFileSync(join(import.meta.dir, "fixtures/args-invalid-escape-1303.txt"), "utf8");
     expect(() => JSON.parse(original)).toThrow();
-    const parsed = JSON.parse(execArgs(original)) as { cmd: string };
+    // The fixture holds exactly one backslash, the lone one before "$ prices".
+    expect(original.split(String.fromCharCode(92)).length - 1).toBe(1);
+    const args = execArgs(original);
+    expect(args).toBe(original.replace(j`⧵$ prices`, j`⧵⧵$ prices`));
+    const parsed = JSON.parse(args) as { cmd: string };
     expect(parsed.cmd).toContain(j`⧵$ prices bold fix`);
     expect(parsed.cmd).toStartWith("~/.local/share/today-ops/bin/wakeup-add 'Mac Today OTA done");
     expect(parsed.cmd).toEndWith("; echo EXIT=$?");
@@ -70,12 +74,37 @@ describe("tool-call argument JSON repair", () => {
     expect(JSON.parse(args)).toEqual({ cmd: j`grep -n 'f⧵(x⧵)' a.ts`, workdir: "/w" });
   });
 
-  test("an odd backslash run: escaped pairs and valid escapes stay, only the lone backslash is doubled", () => {
-    // Three backslashes then $: one valid pair, then a lone backslash-dollar.
-    const args = execArgs(j`{"cmd":"echo ⧵⧵⧵$HOME and ⧵n ⧵u00e9"}`);
-    expect(args).toBe(j`{"cmd":"echo ⧵⧵⧵⧵$HOME and ⧵n ⧵u00e9"}`);
-    expect(JSON.parse(args)).toEqual({ cmd: j`echo ⧵⧵$HOME and ⏎ é` });
+  test("a string with only lone backslashes is repaired byte-exact", () => {
+    expect(execArgs(j`{"cmd":"grep 'a⧵|b⧵(c⧵)' ⧵$x ⧵q"}`)).toBe(j`{"cmd":"grep 'a⧵⧵|b⧵⧵(c⧵⧵)' ⧵⧵$x ⧵⧵q"}`);
   });
+
+  test("a string with only raw control characters is repaired byte-exact", () => {
+    expect(execArgs(j`{"cmd":"a⏎b⇥c␁d"}`)).toBe(j`{"cmd":"a⧵nb⧵tc⧵u0001d"}`);
+  });
+
+  test("the rule is per string: a properly encoded key does not block a repair in another", () => {
+    const args = execArgs(j`{"msg":"line⧵nnext ⧵"q⧵"","cmd":"echo ⧵$HOME"}`);
+    expect(args).toBe(j`{"msg":"line⧵nnext ⧵"q⧵"","cmd":"echo ⧵⧵$HOME"}`);
+    expect(JSON.parse(args)).toEqual({ msg: j`line⏎next "q"`, cmd: j`echo ⧵$HOME` });
+  });
+
+  // PAJR-H1: a lone backslash or raw control character shows the model wrote that
+  // string as raw text, so its valid-looking escapes were raw too. Decoding them would
+  // run a different command than the one written; Codex rejecting it is the safe outcome.
+  for (const [name, original] of [
+    ["rm with backslash-n and a lone backslash (would split at a newline)", j`{"cmd":"rm -rf /tmp/reports⧵note⧵ files"}`],
+    ["backslash-u003b with a lone backslash-q (would inject a ;)", j`{"cmd":"echo ⧵u003b echo SECOND ⧵q"}`],
+    ["grep with backslash-b and a lone backslash-pipe (would grep for a backspace)", j`{"cmd":"grep -E '⧵bfoo⧵|bar⧵b' f"}`],
+    ["heredoc with raw newlines and a backslash-n in a Python string", j`{"cmd":"python3 - <<'EOF'⏎print('a⧵nb ⧵$x')⏎EOF"}`],
+    ["a lone backslash-dollar beside an escaped quote", j`{"cmd":"echo ⧵"hi⧵" ⧵$x"}`],
+    ["a lone backslash-dollar beside an escaped backslash", j`{"cmd":"echo ⧵⧵ ⧵$x"}`],
+    ["an odd backslash run (a valid pair, then a lone backslash)", j`{"cmd":"echo ⧵⧵⧵$HOME"}`],
+  ] as const) {
+    test(`mixed valid and invalid escapes in one string pass through unchanged: ${name}`, () => {
+      expect(execArgs(original)).toBe(original);
+      expect(repairLogs()).toEqual([]);
+    });
+  }
 
   test("a backslash-u without four hex digits is a bad escape", () => {
     const args = execArgs(j`{"cmd":"printf ⧵u12"}`);
