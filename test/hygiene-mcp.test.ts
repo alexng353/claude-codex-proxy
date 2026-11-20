@@ -6,7 +6,7 @@ import { handleRequest } from "../src/app";
 import { handle } from "../src/gym-mcp";
 import { emptyState, zonedTime, type GateState } from "../src/hygiene";
 import { resetGateCache, setGateDeps } from "../src/hygiene-gate";
-import { ROUTES, setHygieneFetcher, type Fetcher } from "../src/hygiene-mcp";
+import { callHygieneTool, ROUTES, setHygieneFetcher, type Fetcher } from "../src/hygiene-mcp";
 
 // Alex, Nov 20 08:34: "Just give yourself an mcp for that surely" (Bubble excusing
 // hygiene items). Tools: hygiene_status, hygiene_skip, hygiene_unskip on the gym server.
@@ -151,6 +151,39 @@ describe("hygiene_skip", () => {
 });
 
 describe("no tool reaches anything but status, skip and unskip", () => {
+  // HMCP-M2 (Lagrange, 56dc840): a fetch that throws escaped the audit log.
+  test("a gate that can't be reached still gives one audit line with the chat, and an MCP error", async () => {
+    setHygieneFetcher(async () => {
+      throw new Error("Unable to connect. Is the computer able to access the url?");
+    });
+    const cases: [string, Record<string, unknown>, string | undefined][] = [
+      ["hygiene_status", {}, undefined],
+      ["hygiene_skip", { item: "shower", reason: "fever" }, undefined],
+      ["hygiene_skip", { target: "2026-11-21/shower", reason: "fever" }, "2026-11-21/shower"],
+      ["hygiene_unskip", { target: "2026-11-21/shower" }, "2026-11-21/shower"],
+    ];
+    for (const [i, [name, args, target]] of cases.entries()) {
+      const r = await call(name, args);
+      expect(r.isError).toBe(true);
+      expect(r.content[0].text).toStartWith("gate unreachable: Unable to connect");
+      const lines = logLines();
+      expect(lines.length).toBe(i + 1);
+      expect(lines[i]).toMatchObject({ tool: name, chat: THREAD, by: `chat:${THREAD}`, ok: false });
+      expect(lines[i].target).toBe(target);
+      expect(lines[i].error).toStartWith("gate unreachable:");
+      expect(JSON.stringify(lines[i])).not.toContain("    at ");
+    }
+    expect(logLines()[1].reason).toBe("fever");
+  });
+
+  test("an unknown tool name is logged too", async () => {
+    const calls = fake(MAKASSAR);
+    const r = await callHygieneTool("hygiene_bypass", {}, { threadId: THREAD });
+    expect(r.isError).toBe(true);
+    expect(logLines()).toMatchObject([{ tool: "hygiene_bypass", chat: THREAD, ok: false, error: "unknown tool hygiene_bypass" }]);
+    expect(calls).toEqual([]);
+  });
+
   test("the route table is exactly three local routes", () => {
     expect(Object.values(ROUTES).map((r) => `${r.method} ${r.path}`)).toEqual(["GET /hygiene/status", "POST /hygiene/skip", "POST /hygiene/unskip"]);
   });

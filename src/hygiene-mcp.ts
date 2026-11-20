@@ -225,30 +225,41 @@ export async function callHygieneTool(name: string, args: Record<string, unknown
   const chat = callingChat(meta);
   const by = byLabel(chat);
   const reason = typeof args.reason === "string" ? args.reason.trim().slice(0, 300) : "";
+  // The target once known, so a call that throws is still logged with it.
+  let target: string | undefined;
   const done = (r: Result, extra: Record<string, unknown> = {}) => {
-    log({ tool: name, chat, by, ...extra, ok: !r.isError, ...(r.isError ? { error: r.text.slice(0, 200) } : {}) });
+    log({
+      tool: name, chat, by, ...(target ? { target } : {}), ...(reason ? { reason: reason.slice(0, 120) } : {}), ...extra,
+      ok: !r.isError, ...(r.isError ? { error: r.text.slice(0, 200) } : {}),
+    });
     return r;
   };
-  switch (name) {
-    case "hygiene_status": {
-      const r = await fetcher("status");
-      if (r.status >= 400) return done({ text: r.body?.error ?? `failed (${r.status})`, isError: true });
-      const s = summarize(r.body);
-      return done({ text: describeSummary(s), isError: false, structuredContent: s });
+  try {
+    switch (name) {
+      case "hygiene_status": {
+        const r = await fetcher("status");
+        if (r.status >= 400) return done({ text: r.body?.error ?? `failed (${r.status})`, isError: true });
+        const s = summarize(r.body);
+        return done({ text: describeSummary(s), isError: false, structuredContent: s });
+      }
+      case "hygiene_skip":
+      case "hygiene_unskip": {
+        const undo = name === "hygiene_unskip";
+        // Refused before any gate call: a skip is a judgement, and its reason is the record.
+        if (!undo && !reason) return done({ text: "a skip needs a reason", isError: true });
+        const resolved = await resolveTarget(args);
+        if ("error" in resolved) return done({ text: resolved.error, isError: true });
+        target = resolved.target;
+        const r = await fetcher(undo ? "unskip" : "skip", { target, by, ...(reason ? { reason } : {}) });
+        if (r.status >= 400 || r.body?.ok === false)
+          return done({ text: r.body?.error ?? `failed (${r.status})`, isError: true }, { status: r.status });
+        return done({ text: `${r.body?.message ?? "done"} (gate ${r.body?.gate?.state ?? "?"})`, isError: false }, { status: r.status });
+      }
+      default:
+        return done({ text: `unknown tool ${name}`, isError: true });
     }
-    case "hygiene_skip":
-    case "hygiene_unskip": {
-      const undo = name === "hygiene_unskip";
-      // Refused before any gate call: a skip is a judgement, and its reason is the record.
-      if (!undo && !reason) return done({ text: "a skip needs a reason", isError: true });
-      const resolved = await resolveTarget(args);
-      if ("error" in resolved) return done({ text: resolved.error, isError: true }, { reason: reason.slice(0, 120) });
-      const r = await fetcher(undo ? "unskip" : "skip", { target: resolved.target, by, ...(reason ? { reason } : {}) });
-      const extra = { target: resolved.target, reason: reason.slice(0, 120), status: r.status };
-      if (r.status >= 400 || r.body?.ok === false) return done({ text: r.body?.error ?? `failed (${r.status})`, isError: true }, extra);
-      return done({ text: `${r.body?.message ?? "done"} (gate ${r.body?.gate?.state ?? "?"})`, isError: false }, extra);
-    }
-    default:
-      return { text: `unknown tool ${name}`, isError: true };
+  } catch (error) {
+    // Refused, timed out: still one audit line with the calling chat (message only, no stack).
+    return done({ text: `gate unreachable: ${String((error as Error)?.message ?? error).slice(0, 180)}`, isError: true });
   }
 }
