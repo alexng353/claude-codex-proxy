@@ -6,7 +6,7 @@ import { STRIPPED_ENV } from "./claude-env";
  * is written, to the archive.
  */
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as accounts from "./accounts";
@@ -25,7 +25,7 @@ import {
 const unavailable =
   ((accounts as Record<string, unknown>).isUnavailable as ((account: Account) => boolean) | undefined) ??
   ((account: Account) => isLimited(account));
-import type { ClassifiedKind, ProofKind } from "./hygiene";
+import { MIN_CONFIDENCE, type ClassifiedKind, type ProofKind } from "./hygiene";
 import { offsetAt, wallTime } from "./zone";
 
 const PHONE_ZONE = "America/Vancouver";
@@ -225,6 +225,9 @@ export function classifierPrompt(wanted: { kinds: ProofKind[]; penance?: string 
   const lines = [
     "Classify the photo above as exactly one kind:",
     '- "teeth": a person brushing their teeth, with a toothbrush in or near their mouth.',
+    // Nov 19: a slim white brush seen end-on with its head in the mouth was refused as "a white
+    // cylinder with a flat capped end near his lips, with no visible bristles".
+    "  The toothbrush may be manual or electric. Its head is often inside the mouth, so only the handle shows, and seen end-on that handle can look like a plain stick or cylinder at the lips. A handle held at the lips in a brushing pose, foam, or toothpaste counts as brushing; bristles need not be visible. A thing that is clearly not a toothbrush (a pen, cigarette, vape, straw, cup, spoon or food) does not.",
     '- "shower": a person who has just showered: visibly wet hair, or wet skin with a shower or bathroom background. A shoulders-up selfie is enough.',
   ];
   if (wanted.kinds.includes("weight"))
@@ -327,6 +330,24 @@ export function parseVerdict(value: unknown): Verdict {
 }
 
 const CLASSIFIER_MODEL = process.env.HYGIENE_CLASSIFIER_MODEL ?? "haiku";
+/** The model asked again when the cheap one refuses a photo without being sure. */
+const SECOND_OPINION_MODEL = process.env.HYGIENE_SECOND_OPINION_MODEL ?? "sonnet";
+/** A refusal at or above this confidence (a screenshot, an empty room) is not asked again. */
+export const SECOND_OPINION_BELOW = 0.9;
+/** A second opinion with less time left than this isn't asked; the first verdict stands. */
+const SECOND_OPINION_MIN_MS = 15_000;
+
+/**
+ * Whether the gate would refuse this verdict for these kinds while the model wasn't sure.
+ * Nov 19: haiku refused a real teeth photo at 0.6 ("a white cylinder ... near his lips") and
+ * Alex had to BYPASS. Only refusals are asked again, so a second look never makes the gate
+ * stricter, and confident refusals cost nothing extra.
+ */
+export function needsSecondOpinion(verdict: Verdict, kinds: ProofKind[]): boolean {
+  const refused =
+    verdict.kind === "none" || !kinds.includes(verdict.kind as ProofKind) || verdict.confidence < MIN_CONFIDENCE;
+  return refused && verdict.confidence < SECOND_OPINION_BELOW;
+}
 /** Read at call time so a test can shorten it. */
 const classifierTimeoutMs = () => Number(process.env.HYGIENE_CLASSIFIER_TIMEOUT_MS) || 60_000;
 /** After the timeout's SIGTERM, how long a child gets before SIGKILL and the try is given up. */
@@ -351,27 +372,48 @@ class ClassifierCallError extends Error {}
  * weekly cap, limited) aren't retried; with none available the first is tried once, as before.
  */
 export const claudeClassifier: Classifier = async (image, wanted) => {
+  const deadline = Date.now() + CLASSIFIER_BUDGET_MS;
+  const first = await classifyWith(CLASSIFIER_MODEL, image, wanted, deadline);
+  if (!needsSecondOpinion(first, wanted.kinds) || deadline - Date.now() < SECOND_OPINION_MIN_MS) return first;
+  try {
+    const second = await classifyWith(SECOND_OPINION_MODEL, image, wanted, deadline);
+    // Nov 19 live check: sonnet misread a scale (77.24 kg for 227.3 lb). A weigh-in is credited
+    // with its reading, so only the first model's reading ever counts.
+    if (second.kind === "weight") return first;
+    return { ...second, reason: `${second.reason} (second look)`.slice(0, 200) };
+  } catch (error) {
+    console.error(`hygiene-gate: second opinion failed: ${(error as Error).message}`);
+    return first;
+  }
+};
+
+async function classifyWith(
+  model: string,
+  image: Parameters<Classifier>[0],
+  wanted: Parameters<Classifier>[1],
+  deadline: number,
+): Promise<Verdict> {
   const all = listAccounts();
   const available = all.filter((a) => !unavailable(a));
   const order = available.length ? available : all.slice(0, 1);
-  const deadline = Date.now() + CLASSIFIER_BUDGET_MS;
   let last: Error | undefined;
   for (const account of order.slice(0, CLASSIFIER_ACCOUNT_TRIES)) {
     const left = deadline - Date.now();
     if (last && left < CLASSIFIER_MIN_TRY_MS) break;
     try {
-      return await classifyOn(account, image, wanted, Math.min(classifierTimeoutMs(), left));
+      return await classifyOn(account, model, image, wanted, Math.min(classifierTimeoutMs(), left));
     } catch (error) {
       if (!(error instanceof ClassifierCallError)) throw error;
       last = error;
-      console.error(`hygiene-gate: classifier on ${account.name}: ${error.message}`);
+      console.error(`hygiene-gate: classifier (${model}) on ${account.name}: ${error.message}`);
     }
   }
   throw last ?? new Error("no Claude account for the classifier");
-};
+}
 
 async function classifyOn(
   account: Account,
+  model: string,
   image: Parameters<Classifier>[0],
   wanted: Parameters<Classifier>[1],
   timeoutMs: number,
@@ -390,7 +432,7 @@ async function classifyOn(
       "stream-json",
       "--verbose",
       "--model",
-      CLASSIFIER_MODEL,
+      model,
       "--safe-mode",
       "--setting-sources",
       "",
@@ -526,6 +568,36 @@ export function archivePhoto(image: DecodedImage, kind: string, at: number, hash
   }
   const ext = EXTENSIONS[image.mediaType.toLowerCase()] ?? "img";
   const file = join(directory, `${kind}-${parts.hour}${parts.minute}${parts.second}-${hash.slice(0, 8)}.${ext}`);
+  writeFileSync(file, image.bytes, { mode: 0o600 });
+  chmodSync(file, 0o600);
+  return file;
+}
+
+/** How long a refused proof photo is kept for a second look. */
+export const REJECTED_KEEP_DAYS = 14;
+
+/**
+ * Saves a refused proof photo as `<root>/rejected/YYYY-MM-DD/<kind>-<HHMMSS>-<sha8>.<ext>` and
+ * drops day folders older than REJECTED_KEEP_DAYS. Nov 19: Alex asked to look at a refused teeth
+ * photo and nothing had kept it. Same modes as the keepsakes.
+ */
+export function archiveRejected(image: DecodedImage, kind: string, at: number, hash: string): string {
+  const w = wallTime(at, PHONE_ZONE);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const day = `${w.year}-${pad(w.month)}-${pad(w.day)}`;
+  const root = join(photoDir(), "rejected");
+  mkdirSync(photoDir(), { recursive: true, mode: 0o700 });
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  const cutoff = wallTime(at - REJECTED_KEEP_DAYS * 86_400_000, PHONE_ZONE);
+  const oldest = `${cutoff.year}-${pad(cutoff.month)}-${pad(cutoff.day)}`;
+  for (const entry of readdirSync(root))
+    if (/^\d{4}-\d{2}-\d{2}$/.test(entry) && entry < oldest) rmSync(join(root, entry), { recursive: true, force: true });
+  const directory = join(root, day);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  chmodSync(directory, 0o700);
+  const ext = EXTENSIONS[image.mediaType.toLowerCase()] ?? "img";
+  const file = join(directory, `${kind}-${pad(w.hour)}${pad(w.minute)}${pad(w.second)}-${hash.slice(0, 8)}.${ext}`);
   writeFileSync(file, image.bytes, { mode: 0o600 });
   chmodSync(file, 0o600);
   return file;

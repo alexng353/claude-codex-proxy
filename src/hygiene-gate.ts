@@ -89,6 +89,7 @@ import {
 } from "./hygiene";
 import {
   archivePhoto,
+  archiveRejected,
   captureTime,
   gpsFix,
   stripGps,
@@ -100,6 +101,7 @@ import {
   penanceProofKinds,
   sha256,
   type Classifier,
+  type DecodedImage,
 } from "./hygiene-proof";
 import { tryLock, unlock } from "./filelock";
 import {
@@ -155,6 +157,8 @@ export type GateDeps = {
   stripGps: typeof stripGps;
   /** Saves an accepted photo and returns its path. */
   archive: typeof archivePhoto;
+  /** Keeps a refused proof photo for a short time and returns its path. */
+  archiveRejected: typeof archiveRejected;
   /** Base URL the model uses for the ruling endpoint. */
   baseUrl: string;
   /** Starts a turn in a chat whose messages the gate held (hygiene-wake.ts). */
@@ -174,6 +178,7 @@ const defaults: GateDeps = {
   gpsFix,
   stripGps,
   archive: archivePhoto,
+  archiveRejected,
   baseUrl: `http://127.0.0.1:${process.env.PORT ?? 3456}`,
   wake: todayWake,
   gymRefreshMs: 5_000,
@@ -653,6 +658,21 @@ async function gymPhoto(
   return { line, recorded: outcome === "recorded", hash, dhash };
 }
 
+/**
+ * Keeps a refused photo that was sent as proof (through Cairn, or to unlock the gate), so a
+ * wrong refusal can be looked at later. Chat images checked in passing are not kept.
+ */
+async function keepRefused(record: ImageRecord, decoded: DecodedImage, now: number): Promise<void> {
+  if (!record.locked && record.source.thread !== "cairn") return;
+  try {
+    const keep = await deps.stripGps(decoded);
+    if (!keep) throw new Error("could not remove the photo's location tags");
+    record.refusedFile = deps.archiveRejected(keep, record.kind ?? "none", now, record.sha256);
+  } catch (error) {
+    console.error("hygiene-gate: could not keep the refused photo:", (error as Error).message);
+  }
+}
+
 async function checkImage(
   state: GateState,
   url: string,
@@ -744,6 +764,7 @@ async function checkImage(
     record.reason = verdict.reason;
   }
   if (verdict.kind === "none" || !kinds.includes(verdict.kind as ProofKind)) {
+    await keepRefused(record, decoded, now);
     state.images.push(record);
     return {
       line:
@@ -753,6 +774,7 @@ async function checkImage(
     };
   }
   if (verdict.confidence < MIN_CONFIDENCE) {
+    await keepRefused(record, decoded, now);
     state.images.push(record);
     return { line: `❌ photo not clear enough to accept: ${verdict.reason || "low confidence"}` };
   }

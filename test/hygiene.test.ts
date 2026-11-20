@@ -188,6 +188,10 @@ describe("requirements", () => {
   test("classifier prompt: walk and creatine only when wanted; a matching penance wins", () => {
     const plain = classifierPrompt({ kinds: ["teeth", "shower"] });
     expect(plain).not.toContain('"walk"');
+    // Nov 19: a brush seen end-on, head in the mouth, read as "a white cylinder" and was refused.
+    expect(plain).toContain("manual or electric");
+    expect(plain).toContain("bristles need not be visible");
+    expect(plain).toContain("vape");
     expect(plain).toContain("or images with no person.");
     const both = classifierPrompt({ kinds: ["walk", "creatine", "penance"], penance: "photo of you on a walk outside" });
     expect(both).toContain('- "walk": a photo taken outdoors');

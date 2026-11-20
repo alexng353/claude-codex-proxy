@@ -20,6 +20,8 @@ process.env.TMPDIR = root;
 process.env.PROXY_STATE_DIR = join(root, "state");
 process.env.XDG_STATE_HOME = join(root, "xdg-state");
 process.env.CLAUDE_CONFIG_DIR = join(root, "claude");
+// Kept and refused proof photos must never land in Alex's real photo folder.
+process.env.HYGIENE_PHOTO_DIR = join(root, "hygiene-photos");
 for (const path of [process.env.PROXY_STATE_DIR, process.env.XDG_STATE_HOME, process.env.CLAUDE_CONFIG_DIR])
   mkdirSync(path, { recursive: true });
 delete process.env.CLAUDE_CODE_OAUTH_TOKEN;

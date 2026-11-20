@@ -117,6 +117,8 @@ export type ImageRecord = {
   confidence?: number;
   /** Where an accepted photo was saved (original bytes, EXIF intact). */
   file?: string;
+  /** Where a refused proof photo is kept for a short time (location tags removed). */
+  refusedFile?: string;
   /** The gate was locked (and not bypassed) when this photo was checked. */
   locked?: boolean;
   /** Original capture time; null means EXIF was absent at acceptance. */

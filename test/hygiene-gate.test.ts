@@ -864,6 +864,29 @@ describe("dthread messages", () => {
   });
 });
 
+describe("refused proof photos", () => {
+  // Nov 19: Alex asked to look at a refused teeth photo and nothing had kept it.
+  test("a refused Cairn proof is kept for a second look; old refusals are dropped", async () => {
+    const old = join(process.env.HYGIENE_PHOTO_DIR!, "rejected", "2026-09-01");
+    await mkdir(old, { recursive: true });
+    await writeFile(join(old, "none-070000-deadbeef.jpg"), "old");
+    clock = at(DAY, "06:40");
+    verdicts.push({ kind: "none", confidence: 0.6, reason: "a white cylinder near his lips" } as Verdict);
+    const refused = await submitProof(
+      { mediaType: "image/jpeg", bytes: Buffer.from("end-on-brush") },
+      { kind: "teeth", slot: (s) => s.endsWith("/morning-teeth") },
+    );
+    expect(refused.result).not.toBe("pass");
+    const record = JSON.parse(await readFile(process.env.HYGIENE_GATE_STATE!, "utf8")).images.at(-1);
+    expect(record.verdict).toBe("rejected");
+    expect(record.file).toBeUndefined();
+    expect(record.refusedFile).toStartWith(join(process.env.HYGIENE_PHOTO_DIR!, "rejected", DAY, "none-0640"));
+    expect(await readFile(record.refusedFile, "utf8")).toBe("end-on-brush");
+    expect((statSync(record.refusedFile).mode & 0o777).toString(8)).toBe("600");
+    expect(existsSync(old)).toBe(false);
+  });
+});
+
 describe("held messages wake their chat when the gate unlocks", () => {
   const OTHER = "01a15cc2-0000-7000-8000-000000000001";
   const teeth = { kind: "teeth", confidence: 0.95, reason: "brushing" } as Verdict;

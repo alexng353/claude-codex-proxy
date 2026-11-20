@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isLimitError, isLimited, listAccounts, markLimited, resetAccountState } from "../src/accounts";
-import { claudeClassifier } from "../src/hygiene-proof";
+import { claudeClassifier, needsSecondOpinion } from "../src/hygiene-proof";
 
 // Nov 3, 13:31: the first account in order answered "You've hit your weekly limit" (is_error),
 // wasn't marked limited, and every photo got "couldn't check the photo (classifier error)".
@@ -29,10 +29,11 @@ function setup(names: string[]) {
  * Each launch prints the next scripted stream-json lines and records the account's token. A
  * string reply is the child's own code instead.
  */
-function script(replies: (unknown[] | string)[]) {
+function script(replies: (unknown[] | string)[], models: string[] = []) {
   const tokens: string[] = [];
-  (Bun as any).spawn = (_args: string[], options: any) => {
+  (Bun as any).spawn = (args: string[], options: any) => {
     tokens.push(options.env.CLAUDE_CODE_OAUTH_TOKEN);
+    models.push(args[args.indexOf("--model") + 1]);
     const reply = replies.shift() ?? [];
     const code =
       typeof reply === "string"
@@ -176,4 +177,63 @@ test("a launch that throws fails at once; limited accounts aren't retried", asyn
   await expect(claudeClassifier(image, { kinds: ["creatine"] })).rejects.toThrow();
   expect(tokens[0]).toBe("fake-token-second");
   expect(tokens).not.toContain("fake-token-first");
+});
+
+// Nov 19, slot 2026-11-20/morning-teeth: haiku refused a real teeth photo at 0.6 ("A man holds a
+// white cylinder with a flat capped end near his lips, with no visible bristles") and Alex had to
+// BYPASS. An unsure refusal now gets a second look from a stronger model.
+const result = (kind: string, confidence: number, reason: string) => [
+  { type: "result", is_error: false, structured_output: { kind, confidence, reason, reading: "" } },
+];
+const endOn = result("none", 0.6, "A man holds a white cylinder with a flat capped end near his lips, with no visible bristles.");
+
+test("which verdicts get a second look: only refusals the model wasn't sure of", () => {
+  const v = (kind: string, confidence: number) => ({ kind, confidence, reason: "" }) as any;
+  expect(needsSecondOpinion(v("none", 0.6), ["teeth"])).toBe(true);
+  expect(needsSecondOpinion(v("shower", 0.7), ["teeth"])).toBe(true);
+  expect(needsSecondOpinion(v("teeth", 0.5), ["teeth"])).toBe(true);
+  // A screenshot or an empty room is refused with certainty: no extra call.
+  expect(needsSecondOpinion(v("none", 0.99), ["teeth"])).toBe(false);
+  // An accepted photo is never asked again, so a second look can't make the gate stricter.
+  expect(needsSecondOpinion(v("teeth", 0.97), ["teeth"])).toBe(false);
+  expect(needsSecondOpinion(v("teeth", 0.6), ["teeth"])).toBe(false);
+});
+
+test("an unsure refusal of a brush seen end-on is asked again on the stronger model", async () => {
+  setup(["first"]);
+  const models: string[] = [];
+  script([endOn, result("teeth", 0.9, "A toothbrush handle is held at his lips with its head in his mouth.")], models);
+  const v = await claudeClassifier(image, { kinds: ["teeth"] });
+  expect(v.kind).toBe("teeth");
+  expect(v.reason).toContain("(second look)");
+  expect(models).toEqual(["haiku", "sonnet"]);
+});
+
+test("a confident refusal costs one call; the second look can still refuse; its failure keeps the first verdict", async () => {
+  setup(["first"]);
+  const once: string[] = [];
+  script([result("none", 0.99, "A screenshot of a Safari error page.")], once);
+  expect((await claudeClassifier(image, { kinds: ["teeth"] })).kind).toBe("none");
+  expect(once).toEqual(["haiku"]);
+
+  const twice: string[] = [];
+  script([endOn, result("none", 0.85, "He holds a white vape to his lips.")], twice);
+  const refused = await claudeClassifier(image, { kinds: ["teeth"] });
+  expect(refused.kind).toBe("none");
+  expect(refused.reason).toContain("vape");
+  expect(twice).toEqual(["haiku", "sonnet"]);
+
+  // The stronger model erroring: the cheap verdict stands, nothing throws.
+  const failing = [{ type: "result", is_error: true, result: "API Error: 500" }];
+  script([endOn, failing]);
+  const kept = await claudeClassifier(image, { kinds: ["teeth"] });
+  expect(kept.kind).toBe("none");
+  expect(kept.confidence).toBe(0.6);
+
+  // A weigh-in is never credited on the second look's reading.
+  const scale = [{ type: "result", is_error: false, structured_output: { kind: "weight", confidence: 0.8, reason: "scale", reading: "77.24 kg" } }];
+  script([result("none", 0.5, "blurry display"), scale]);
+  const weighed = await claudeClassifier(image, { kinds: ["weight"] });
+  expect(weighed.kind).toBe("none");
+  expect(weighed.reading).toBeUndefined();
 });
