@@ -2,11 +2,13 @@
 /**
  * MCP server (stdio, JSON-RPC 2.0) for gym plans on the hygiene gate. Lets a
  * chat (Bubble) add, move, cancel and skip the sessions Alex tells it about. Hand
- * credit is deliberately absent: it stays on the CLI.
+ * credit is deliberately absent: it stays on the CLI. Also serves the hygiene_*
+ * tools (hygiene-mcp.ts): gate status and photo-day skips.
  *
  * Register in Codex: [mcp_servers.gym] command = "bun", args = ["<repo>/src/gym-mcp.ts"].
  */
 import { describeReport, gymCall, startArg } from "./gym-client";
+import { callHygieneTool, HYGIENE_TOOL_NAMES, HYGIENE_TOOLS } from "./hygiene-mcp";
 
 const WHEN =
   'Wall time "YYYY-MM-DD HH:MM" in the phone\'s current zone (e.g. "2026-11-04 18:00"; Vancouver unless Cairn reports another), or with a zone name for a time elsewhere ("2026-12-05 18:00 America/Vancouver"), or ISO with an offset. Must be in the future. The reply shows the zone when it isn\'t Vancouver.';
@@ -119,10 +121,17 @@ export async function handle(message: Rpc): Promise<object | null> {
     case "ping":
       return reply({});
     case "tools/list":
-      return reply({ tools: TOOLS });
+      return reply({ tools: [...TOOLS, ...HYGIENE_TOOLS] });
     case "tools/call": {
       try {
-        const { text, isError } = await callTool(String(message.params?.name), message.params?.arguments ?? {});
+        const name = String(message.params?.name);
+        const args = message.params?.arguments ?? {};
+        if (HYGIENE_TOOL_NAMES.includes(name)) {
+          // _meta.threadId is Codex's stamp of the calling chat (hygiene-mcp.ts).
+          const { text, isError, structuredContent } = await callHygieneTool(name, args, message.params?._meta);
+          return reply({ content: [{ type: "text", text }], isError, ...(structuredContent ? { structuredContent } : {}) });
+        }
+        const { text, isError } = await callTool(name, args);
         return reply({ content: [{ type: "text", text }], isError });
       } catch (error) {
         return reply({ content: [{ type: "text", text: `gate unreachable: ${(error as Error).message}` }], isError: true });

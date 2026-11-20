@@ -239,6 +239,14 @@ judgement, never from a keyword Alex types to the gate.
   to 31 days ahead). `POST /hygiene/unskip` `{target, by}` undoes it. Penances never
   skip. Also `POST /hygiene/gym/plans/:id/skip|unskip`, MCP `gym_plan_skip`, and
   `scripts/gym.ts skip ID --reason TEXT`.
+- MCP (the `gym` server, `src/hygiene-mcp.ts`, Nov 20): `hygiene_status` (today's
+  items in the gate's local day, what locks now, skips, bypass count, open debt
+  count; never BYPASS words), `hygiene_skip {target | item, reason}` and
+  `hygiene_unskip {target | item}`. `item` means today in the gate's day; a blank
+  reason is refused before any request. `by` is `chat:<codex thread id>` from the
+  call's `_meta.threadId` (Codex stamps it), else `<GYM_BY> (unattributed)`. These
+  tools reach only `GET /hygiene/status` and `POST /hygiene/skip|unskip`; every call
+  is logged to `$PROXY_STATE_DIR/hygiene-mcp.jsonl`.
 - `/hygiene/status` and `/hygiene/api/v1/status` include `skips`: entries from
   yesterday on with `target`, `day`, `item` (`gym/<id>` for plans), `at`, `by`,
   `reason` and optional `debtId`. Gym plans in `/hygiene/gym` show `skipped`.
