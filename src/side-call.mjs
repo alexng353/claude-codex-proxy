@@ -106,6 +106,31 @@ export function sideCallCheck(request, { refuse = false } = {}) {
   return tools.length ? { tools, refuse } : null;
 }
 
+/**
+ * Side-call state for one websocket connection (R1-M2). Codex continues a response
+ * on the same connection with previous_response_id and only the new input: the
+ * marker and code mode's additional_tools item were sent earlier and are not
+ * repeated. So once a frame on the connection is a side call, every later frame is
+ * one too, and it carries every tool seen on the connection so far. For the tool
+ * check and its log only: the hygiene gate keeps its own per-request test.
+ * The caller makes one per connection and drops it on close.
+ */
+export function sideCallConnection() {
+  let side = false;
+  const seen = new Set();
+  return {
+    /** null: not a side connection. Otherwise every tool it carries (possibly none). */
+    check(frame, { refuse = false } = {}) {
+      const marked = isSideCall(frame);
+      if (!side && !marked) return null;
+      const sticky = side && !marked;
+      side = true;
+      for (const tool of carriedTools(frame)) seen.add(tool);
+      return { tools: [...seen], refuse, sticky };
+    },
+  };
+}
+
 export const SIDE_CALL_REFUSED_CODE = "side_call_tools_refused";
 
 export function refusalMessage(model, tools) {
@@ -124,20 +149,42 @@ export function refusalBody(model, tools) {
   };
 }
 
-/** A websocket `error` frame carrying the refusal, the shape the router already uses. */
+/**
+ * A websocket `error` frame carrying the refusal. The top-level status is what makes
+ * Codex treat it as an HTTP 400 that ends the turn (codex-api responses_websocket.rs
+ * map_wrapped_websocket_error_event, 0.163.0 and 0.171.0); without it Codex drops
+ * the frame, waits for the stream idle timeout and retries (R1-M1).
+ */
 export function refusalFrame(model, tools) {
-  return { type: "error", ...refusalBody(model, tools) };
+  return { type: "error", status: 400, ...refusalBody(model, tools) };
 }
 
 export function wireModel(model) {
   return typeof model === "string" && Object.hasOwn(SIDE_MODEL_ALIASES, model) ? SIDE_MODEL_ALIASES[model] : model;
 }
 
-/** The request with an aliased model replaced; the same object when nothing changes. */
+/**
+ * The request with an aliased model replaced, top level and inside
+ * client_metadata's turn metadata (a JSON string, or an object); the same object
+ * when nothing changes.
+ */
 export function aliasRequest(request) {
   if (!request || typeof request !== "object") return request;
   const model = wireModel(request.model);
-  return model === request.model ? request : { ...request, model };
+  let out = model === request.model ? request : { ...request, model };
+  const metadata = request.client_metadata;
+  const key = "x-codex-turn-metadata";
+  if (metadata && typeof metadata === "object" && key in metadata) {
+    const value = metadata[key];
+    let aliased = value;
+    if (typeof value === "string") aliased = aliasMetadataHeader(value);
+    else if (value && typeof value === "object" && typeof value.model === "string") {
+      const inner = wireModel(value.model);
+      if (inner !== value.model) aliased = { ...value, model: inner };
+    }
+    if (aliased !== value) out = { ...out, client_metadata: { ...metadata, [key]: aliased } };
+  }
+  return out;
 }
 
 /** The x-codex-turn-metadata header with an aliased model replaced; unchanged otherwise. */

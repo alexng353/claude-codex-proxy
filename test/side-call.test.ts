@@ -13,6 +13,7 @@ import {
   refusalBody,
   refusalFrame,
   refuseEnabled,
+  sideCallConnection,
   sideCallCheck,
   wireModel,
 } from "../src/side-call.mjs";
@@ -43,8 +44,10 @@ describe("side-call marker", () => {
       { model: "gpt-6.1-sol", instructions: ` ${SIDE_CALL_MARKER}\n`, input: [] },
       { model: "gpt-6.1-sol", input: [{ ...MARKED_DEV, type: "function_call_output" }] },
     ];
-    expect(cases.map(isSideCall)).toEqual([true, true, true, true, false, false, false, false]);
-    expect(cases.map((c) => isSidePrompt(c as ResponsesRequest))).toEqual(cases.map(isSideCall));
+    const expected = [true, true, true, true, false, false, false, false];
+    expect(cases.map(isSideCall)).toEqual(expected);
+    // Against the hand-written row, not against isSideCall: the gate's own answer.
+    expect(cases.map((c) => isSidePrompt(c as ResponsesRequest))).toEqual(expected);
   });
   test("anything that is not a request is not a side call", () => {
     for (const value of [null, undefined, 1, "x", [], {}]) expect(isSideCall(value)).toBe(false);
@@ -80,7 +83,10 @@ describe("side-call check", () => {
     expect(body.error.code).toBe(SIDE_CALL_REFUSED_CODE);
     expect(body.error.message).toContain("functions.exec, functions.wait");
     expect(body.error.message).toContain("No request was sent to the model");
-    expect(refusalFrame("gpt-6.1-sol", ["x"])).toEqual({ type: "error", ...refusalBody("gpt-6.1-sol", ["x"]) });
+    // R1-M1: Codex takes a websocket `error` frame as terminal only with a top-level
+    // status (codex-api responses_websocket.rs map_wrapped_websocket_error_event); 400
+    // is not retried. Without it the turn waits for the stream idle timeout and retries.
+    expect(refusalFrame("gpt-6.1-sol", ["x"])).toEqual({ type: "error", status: 400, ...refusalBody("gpt-6.1-sol", ["x"]) });
     const many = refusalBody("m", Array.from({ length: 11 }, (_, i) => `t${i}`)).error.message;
     expect(many).toContain("t7, and 3 more");
   });
@@ -95,6 +101,40 @@ describe("side-call check", () => {
 });
 
 describe("side slug alias", () => {
+  // R1-M2: a websocket continuation (previous_response_id, the already-sent input
+  // prefix stripped) carries neither the marker nor code mode's additional_tools item.
+  test("a websocket connection stays a side call once one frame was", () => {
+    const conn = sideCallConnection();
+    const first = side({}, [MARKED_DEV, CODE_MODE, USER]);
+    const continuation = { model: "gpt-6.1-sol", previous_response_id: "resp_1", input: [USER] };
+    expect(conn.check({ model: "gpt-6.1-sol", input: [USER] }, { refuse: true })).toBeNull();
+    expect(conn.check(first, { refuse: false })).toEqual({ tools: ["functions.exec", "functions.wait"], refuse: false, sticky: false });
+    // The flag is read per frame: refusing turned on between the two.
+    expect(conn.check(continuation, { refuse: true })).toEqual({ tools: ["functions.exec", "functions.wait"], refuse: true, sticky: true });
+    expect(sideCallCheck(continuation, { refuse: true })).toBeNull();
+    // Another connection starts clean.
+    expect(sideCallConnection().check(continuation, { refuse: true })).toBeNull();
+  });
+  test("a tool-free side connection stays tool-free, and new tools on it count", () => {
+    const conn = sideCallConnection();
+    expect(conn.check(side(), { refuse: true })).toEqual({ tools: [], refuse: true, sticky: false });
+    expect(conn.check({ input: [USER] }, { refuse: true })).toEqual({ tools: [], refuse: true, sticky: true });
+    expect(conn.check({ input: [CODE_MODE] }, { refuse: true })).toEqual({ tools: ["functions.exec", "functions.wait"], refuse: true, sticky: true });
+  });
+  test("the model inside client_metadata's turn metadata is renamed too (R1-L1)", () => {
+    const asString = aliasRequest({
+      model: "gpt-6.1-sol-side",
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ model: "gpt-6.1-sol-side", turn_id: "t" }), other: "x" },
+    });
+    expect(asString.model).toBe("gpt-6.1-sol");
+    expect(JSON.parse(asString.client_metadata["x-codex-turn-metadata"])).toEqual({ model: "gpt-6.1-sol", turn_id: "t" });
+    expect(asString.client_metadata.other).toBe("x");
+    const asObject = aliasRequest({ model: "gpt-6.1-sol", client_metadata: { "x-codex-turn-metadata": { model: "gpt-6.1-sol-side" } } });
+    expect(asObject.client_metadata["x-codex-turn-metadata"]).toEqual({ model: "gpt-6.1-sol" });
+    expect(JSON.stringify(asString)).not.toContain("gpt-6.1-sol-side");
+    const untouched = { model: "gpt-6.1-sol", client_metadata: { "x-codex-turn-metadata": JSON.stringify({ model: "gpt-6.1-sol" }) } };
+    expect(aliasRequest(untouched)).toBe(untouched);
+  });
   test("only the exact side slug is renamed", () => {
     expect(wireModel("gpt-6.1-sol-side")).toBe("gpt-6.1-sol");
     for (const m of ["gpt-6.1-sol", "gpt-6.1-sol-side2", "gpt-6.1-sol-sid", "x-gpt-6.1-sol-side", "gpt-6.2-sol-side", "toString", "__proto__", undefined, 3])
