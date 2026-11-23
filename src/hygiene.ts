@@ -36,6 +36,7 @@ import type { ResponseContentPart, ResponseInputItem, ResponsesRequest } from ".
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { offsetAt, wallTime, zoneSource } from "./zone";
+import { SIDE_CALL_MARKER as MARKER, isSideCall } from "./side-call.mjs";
 
 export const TIME_ZONE = "America/Vancouver";
 export const MORNING_MINUTE = 5 * 60;
@@ -1306,15 +1307,15 @@ export function isBareUserMessage(item: ResponseInputItem): boolean {
  * thread_memory, perpetual_memory), always after the start and with `<` escaped,
  * so quoted history can't mark a chat. A Today without the marker leaves side
  * calls gated. Without this, a /summary on 2026-10-29 got the gate text.
+ * "No tools" is checked on the wire, not here: the Codex model router logs (or,
+ * once switched on, refuses) a marked request that still carries tools, such as
+ * code mode's exec from a catalog entry (src/side-call.mjs, q no-tools-code-mode).
+ * The test itself lives in side-call.mjs, so the gate and the router agree.
  */
-export const SIDE_CALL_MARKER = "<today-side-call/>";
+export const SIDE_CALL_MARKER = MARKER;
 
 export function isSidePrompt(request: ResponsesRequest): boolean {
-  const marked = (text: unknown) =>
-    typeof text === "string" && (text === SIDE_CALL_MARKER || text.startsWith(`${SIDE_CALL_MARKER}\n`));
-  if (marked(request.instructions)) return true;
-  if (!Array.isArray(request.input)) return false;
-  return request.input.some((item) => isContextMessage(item) && partsOf(item).some((part) => marked(part.text)));
+  return isSideCall(request);
 }
 
 /**
