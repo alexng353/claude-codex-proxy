@@ -28,6 +28,7 @@
  * - Planned gym sessions (gym.ts): a plan with no Start at the gym in
  *   Uplifting by its start plus a grace locks until a qualifying session.
  */
+import type { ScreenTimeSnapshot } from "./hygiene-screen-time";
 import type { FixRef, FixStatus } from "./hygiene-fix";
 import { createHash } from "node:crypto";
 import type { BypassPhraseState } from "./bypass-phrase";
@@ -152,6 +153,8 @@ export type Debt = {
   source?: "move";
   /** Phone bedtime exception; its ruling cannot excuse or suspend a hygiene requirement. */
   bedtime?: true;
+  /** Separate phone filter bypass; never excuses a hygiene requirement. */
+  kind?: "adult-filter";
   moveSlot?: string;
   /** Move debts: when the gate charged it (after the midnight in `at`). */
   chargedAt?: string;
@@ -230,6 +233,9 @@ export type GateState = {
    * keyed by source + tap time so an offline retry never opens a second window.
    */
   shieldBypasses?: ShieldBypass[];
+  /** Latest received configuration per authenticated device, no report history. */
+  screenTime?: ScreenTimeSnapshot[];
+  adultFilter?: { unlockUntil?: string } & BypassPhraseState;
   /** Phone-only bedtime grants; never opens the hygiene gate. */
   bedtime?: {
     unlockUntil?: string;
@@ -255,8 +261,8 @@ export type ShieldBypass = {
 };
 
 /** Keep accounting history shared without attributing bedtime grants to hygiene coverage. */
-export function recordBypass(state: GateState, at: string, scope: "hygiene" | "bedtime"): void {
-  if (scope === "bedtime") state.bypass.hygieneHistory ??= [...state.bypass.history];
+export function recordBypass(state: GateState, at: string, scope: "hygiene" | "bedtime" | "adult-filter"): void {
+  if (scope !== "hygiene") state.bypass.hygieneHistory ??= [...state.bypass.history];
   else state.bypass.hygieneHistory?.push(at);
   state.bypass.count++;
   state.bypass.history.push(at);
@@ -1567,8 +1573,11 @@ export const isWithheld = (record: ImageRecord) =>
 export function noteText(debt: Debt, baseUrl: string): string {
   const at = Date.parse(debt.at);
   const endpoint = `${baseUrl}/hygiene/debt/${debt.id}/resolve`;
+  const phoneBypass = debt.bedtime || debt.kind === "adult-filter";
   const what =
-    debt.bedtime
+    debt.kind === "adult-filter"
+      ? `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex used a 15-minute phone filter bypass.`
+      : debt.bedtime
       ? `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex unlocked his phone at bedtime.`
       : debt.source === "move"
       ? `Alex had moved a photo with MOVE/LATER and the day ended without it, which counts as a skip (charged at ${clockLabel(at)} on ${dayLabel(localTime(at).day)}): ${debt.skipped.join(", ")}.`
@@ -1581,9 +1590,9 @@ export function noteText(debt: Debt, baseUrl: string): string {
     "Once he answers, record your ruling with exactly one call:",
     `- justified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"justified","reason":"<one line>"}'`,
     `- unjustified: curl -s -X POST ${endpoint} -H 'content-type: application/json' -d '{"verdict":"unjustified","reason":"<one line>","penance":"<a short, safe, doable photo task, e.g. photo of you on a walk outside>"}'`,
-    debt.bedtime ? `Use reasonClass:"other" for bedtime. This debt covers no hygiene item, so do not supply item, fixRef or gate_fault. Report a phone shield fault separately.` : `Use reasonClass:"gate_fault" for a broken gate, or "other" otherwise. A justified gate_fault requires item (one of the bypassed item keys: ${(debt.items ?? []).join(", ") || "legacy debt: identify the faulty item"}) and fixRef: {"kind":"q","id":"<existing open queue item>"} or {"kind":"chat","id":"<chat UUID with an open task-ledger record>","eta":"<future ISO time with offset>","task":<ledger record number if the chat has multiple open tasks>}. Create or identify the repair first; do not merely repeat a gate-fault justification. A second fault for the same item within 24 h suspends it until the repair closes.`,
+    phoneBypass ? `Use reasonClass:"other" for this phone bypass. This debt covers no hygiene item, so do not supply item, fixRef or gate_fault. Report a phone shield fault separately.` : `Use reasonClass:"gate_fault" for a broken gate, or "other" otherwise. A justified gate_fault requires item (one of the bypassed item keys: ${(debt.items ?? []).join(", ") || "legacy debt: identify the faulty item"}) and fixRef: {"kind":"q","id":"<existing open queue item>"} or {"kind":"chat","id":"<chat UUID with an open task-ledger record>","eta":"<future ISO time with offset>","task":<ledger record number if the chat has multiple open tasks>}. Create or identify the repair first; do not merely repeat a gate-fault justification. A second fault for the same item within 24 h suspends it until the repair closes.`,
     "An unjustified ruling locks the gate until Alex sends the penance photo.",
-    debt.bedtime ? "A justified bedtime ruling excuses no hygiene requirement." : `A justified ruling also excuses the gym plans the bypass covered: they never lock again, so judge the session too. Excuse it for a sound reason not to train (sick, injured, an emergency); if the bypass was needed but the session should still be made up, add "skip":false. Bypassed photos stay due later today unless you add "skip":true (every bypassed item) or a list of item keys. A gate_fault ruling excuses only its faulty item by default.`,
+    phoneBypass ? "A justified phone bypass ruling excuses no hygiene requirement." : `A justified ruling also excuses the gym plans the bypass covered: they never lock again, so judge the session too. Excuse it for a sound reason not to train (sick, injured, an emergency); if the bypass was needed but the session should still be made up, add "skip":false. Bypassed photos stay due later today unless you add "skip":true (every bypassed item) or a list of item keys. A gate_fault ruling excuses only its faulty item by default.`,
     `</${NOTE_TAG}>`,
   ].join("\n");
 }

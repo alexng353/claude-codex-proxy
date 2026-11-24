@@ -8,6 +8,8 @@
  * in /v1/responses. Decisions for new human turns are serialized so two
  * chats cannot spend the same photo or bypass.
  */
+import { adultFilterUnlockUntil, bypassAdultFilter } from "./hygiene-adult-filter";
+import { screenTimeView, storeScreenTime, type ScreenTimeReport } from "./hygiene-screen-time";
 import { BEDTIME_MS, BEDTIME_OWNER, bedtimeUnlockUntil, bypassBedtime, chargeBedtime, decideBedtime, requestBedtime, type BedtimeResult } from "./hygiene-bedtime";
 import { createHash } from "node:crypto";
 import { readFixStatus, type FixRef } from "./hygiene-fix";
@@ -929,6 +931,23 @@ export async function bedtimeAction(action: "request" | "bypass" | "approve" | "
   return result;
 }
 
+export async function screenTimeReport(report: ScreenTimeReport, deviceId: string): Promise<void> {
+  await serialized(async () => {
+    const state = structuredClone(loadState());
+    storeScreenTime(state, report, deviceId, deps.now());
+    saveState(state);
+  });
+}
+
+export async function adultFilterBypass(phrase: unknown) {
+  return serialized(async () => {
+    const state = structuredClone(loadState());
+    const result = bypassAdultFilter(state, phrase, deps.now(), deps.bypassWords);
+    if (result.ok) saveState(state);
+    return result;
+  });
+}
+
 export type ShieldBypassResult =
   | { ok: true; applied: boolean; duplicate: boolean; until: string | null; debt_id: string | null }
   | { ok: false; status: number; error: string };
@@ -1434,7 +1453,7 @@ export function startGymPolling(intervalMs?: number): () => Promise<void> {
  */
 export function shieldSignature(): string {
   const status = gateStatus();
-  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}${status.bedtime_unlock_until ? `|bedtime:${status.bedtime_unlock_until}` : ""}`;
+  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}${status.bedtime_unlock_until ? `|bedtime:${status.bedtime_unlock_until}` : ""}${status.adult_filter_unlock_until ? `|adult-filter:${status.adult_filter_unlock_until}` : ""}`;
 }
 
 /** Wakes Cairn when the shield signature changes (authority only; never under tests). */
@@ -1635,6 +1654,8 @@ export function gateStatus() {
   const bypass = bypassActive(state, now);
   const gateState = disabled ? "disabled" : due.length === 0 ? "clear" : bypass ? "bypassed" : "armed";
   return {
+    screen_time: screenTimeView(state, now),
+    ...(adultFilterUnlockUntil(state, now) ? { adult_filter_unlock_until: adultFilterUnlockUntil(state, now) } : {}),
     ...(bedtimeUnlockUntil(state, now) ? { bedtime_unlock_until: bedtimeUnlockUntil(state, now) } : {}),
     enabled: !disabled,
     armed: !disabled && due.length > 0 && !bypass,
@@ -1662,7 +1683,7 @@ export function gateStatus() {
     skips: skipsView(state, now),
     openDebts: state.debts
       .filter((d) => d.status === "open" || d.status === "penance")
-      .map(({ id, at, skipped, status, penance, source }) => ({ id, at, skipped, status, penance, source: source ?? "bypass" })),
+      .map(({ id, at, skipped, status, penance, source, kind }) => ({ id, at, skipped, status, penance, source: source ?? "bypass", ...(kind ? { kind } : {}) })),
     lastProofs: state.images
       .filter((r) => r.verdict === "accepted")
       .slice(-5)
@@ -1755,8 +1776,8 @@ export async function resolveDebt(
     if (debt.status !== "open") return { status: 409, body: { error: `debt already ${debt.status}` } };
     if (body.reasonClass !== undefined && body.reasonClass !== "gate_fault" && body.reasonClass !== "other")
       return { status: 422, body: { error: "reasonClass must be gate_fault or other" } };
-    if (debt.bedtime && (body.reasonClass === "gate_fault" || body.item !== undefined || body.fixRef !== undefined))
-      return { status: 422, body: { error: "bedtime debts cover no hygiene item; use reasonClass other and report phone faults separately" } };
+    if ((debt.bedtime || debt.kind === "adult-filter") && (body.reasonClass === "gate_fault" || body.item !== undefined || body.fixRef !== undefined))
+      return { status: 422, body: { error: "phone bypass debts cover no hygiene item; use reasonClass other and report phone faults separately" } };
     let fixRef: FixRef | undefined;
     let item: string | undefined;
     if (body.verdict === "justified" && body.reasonClass === "gate_fault") {

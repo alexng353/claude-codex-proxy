@@ -345,3 +345,73 @@ All bedtime mutations return `503` while the gate's terminal kill switch is set.
 Existing clients can ignore the added status field; old proxy copies preserve the
 optional stored bedtime state but cannot serve the new endpoints. Deploy the proxy
 before enabling bedtime in Cairn.
+
+## Screen Time diagnostics
+
+`POST /screen-time/status` accepts this config-only report using the usual Cairn
+bearer token. Every field is required, including fields whose value may be null.
+
+```json
+{
+  "version": 1,
+  "build": "123",
+  "reported_at": "2026-11-24T10:00:00Z",
+  "authorization": "approved",
+  "time_zone": "Asia/Jakarta",
+  "bedtime_enabled": true,
+  "late_start_minute": 1380,
+  "full_start_minute": 0,
+  "wake_minute": 420,
+  "late_app_count": 2,
+  "late_category_count": 0,
+  "late_web_count": 0,
+  "allowlist_app_count": 1,
+  "allowlist_category_count": 0,
+  "allowlist_web_count": 0,
+  "scheduled_at": null,
+  "adult_filter_enabled": true,
+  "adult_filter_applied": true,
+  "adult_filter_unlock_until": null
+}
+```
+
+Bodies are limited to 4096 bytes, including whitespace (`413` when exceeded).
+Unknown fields, including client identity, are rejected with `400`; app names,
+tokens, URLs and browsing data have no accepted fields. `build` is at most 64
+characters; `time_zone` is a recognized IANA zone, at most 64 characters.
+`authorization` is `approved`, `denied` or `notDetermined`. Minutes are integers
+0–1439 and counts are integers 0–10000. All enabled/applied fields are booleans.
+Timestamps are zoned ISO datetimes; `scheduled_at` and the reported unlock may
+be null. Success is `200 {"ok":true}`.
+
+The server stamps `device_id` from authentication and `received_at` from its
+clock. Each device has only its latest received report, with no history.
+`GET /hygiene/status` and the read-only `hygiene_status` MCP tool expose the most
+recently received device report as `screen_time`, or null before any report.
+`stale` is true when its server receipt is more than 24 hours old. Phone-reported
+times are diagnostic, including the unlock field: they never create a grant,
+change the hygiene zone or affect enforcement. Telemetry remains available when
+the hygiene kill switch is set. Cairn tolerates unavailable telemetry and keeps
+its own enforcement unchanged.
+
+## Adult-filter bypass
+
+`POST /adult-filter/bypass {"phrase":"BYPASS"}` returns the same challenge flow
+as bedtime: `200 {ok:true, granted:false, message, gate}`. Correctly submitting
+the complete phrase grants 15 minutes and returns `granted:true`. Its phrase and
+expiry are independent of bedtime and hygiene. Repeating a request while the
+grant is active returns the original expiry and does not charge or extend it.
+There is no adult-filter request, approval, denial or agent grant tool.
+
+The authoritative optional `adult_filter_unlock_until` appears in phone status,
+local status and every embedded phone `gate` response only while unexpired. A
+change or expiry triggers the existing phone wake mechanism. Cairn must also
+schedule expiry locally. Bedtime grants, Bubble approvals, hygiene bypasses and
+reported telemetry cannot open the adult filter. An adult-filter grant cannot
+open bedtime or hygiene.
+
+Each successful grant increments the shared bypass count/history and creates an
+open debt with `kind: "adult-filter"`, also shown in open-debt status. Such debts
+can receive ordinary justified/unjustified rulings and penance, but cannot excuse
+or suspend hygiene items. The existing public debt `source` retains its meaning.
+The adult-filter bypass route returns `503` when the hygiene kill switch is set.

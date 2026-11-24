@@ -11,7 +11,8 @@ import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, parseMoveItems, type ProofKind } from "./hygiene";
-import { bedtimeAction, chargeMoves, refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { adultFilterBypass, screenTimeReport, bedtimeAction, chargeMoves, refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { parseScreenTime } from "./hygiene-screen-time";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -108,6 +109,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 function status() {
   const s = gateStatus();
   return {
+    ...(s.adult_filter_unlock_until ? { adult_filter_unlock_until: s.adult_filter_unlock_until } : {}),
     ...(s.bedtime_unlock_until ? { bedtime_unlock_until: s.bedtime_unlock_until } : {}),
     enabled: s.enabled,
     state: s.state,
@@ -128,15 +130,63 @@ function status() {
   };
 }
 
+/** Stop before buffering more than 4 KiB, including on followers and chunked requests. */
+async function boundedConfigBody(request: Request): Promise<string | Response> {
+  const reader = request.body?.getReader();
+  if (!reader) return json({ error: "body must be JSON" }, 400);
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > 4096) {
+        await reader.cancel();
+        return json({ error: "body exceeds 4 KiB" }, 413);
+      }
+      chunks.push(value);
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+  } catch {
+    return json({ error: "body must be UTF-8 JSON" }, 400);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /** Routes under /hygiene/api/v1. Null for other paths. */
 export async function handleHygieneApi(request: Request, url: URL): Promise<Response | null> {
   if (url.pathname !== API_PREFIX && !url.pathname.startsWith(`${API_PREFIX}/`)) return null;
+  const path = url.pathname.slice(API_PREFIX.length);
+  let configBody: string | undefined;
+  if (request.method === "POST" && (path === "/screen-time/status" || path === "/adult-filter/bypass")) {
+    const bounded = await boundedConfigBody(request);
+    if (bounded instanceof Response) return bounded;
+    configBody = bounded;
+    request = new Request(request, { body: bounded });
+  }
   // Another machine holds the gate: it checks the token and keeps the proofs.
   const remote = remoteGate();
   if (remote) return passThrough(remote, request, url);
   const who = await device(request);
   if (who instanceof Response) return who;
-  const path = url.pathname.slice(API_PREFIX.length);
+
+  if (configBody !== undefined) {
+    let body;
+    try { body = JSON.parse(configBody); } catch { return json({ error: "body must be JSON" }, 400); }
+    if (path === "/screen-time/status") {
+      const report = parseScreenTime(body);
+      if (!report) return json({ error: "invalid Screen Time v1 report: required config fields only" }, 400);
+      await screenTimeReport(report, who.id);
+      return json({ ok: true });
+    }
+    if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(k => k !== "phrase"))
+      return json({ error: "body must contain only phrase" }, 400);
+    const result = await adultFilterBypass(body.phrase);
+    return result.ok ? json({ ...result, gate: status() }) : json({ error: result.error }, result.statusCode);
+  }
 
   if (path === "/weight-reviews" && request.method === "GET") return json(weightReviews());
 

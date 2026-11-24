@@ -13,6 +13,7 @@
  * spawns this process per thread with no thread id in its environment, so the
  * per-call stamp is the only identity there is. Without one, `by` says so.
  */
+import { summarizeScreenTime } from "./hygiene-screen-time";
 import { BEDTIME_OWNER } from "./hygiene-bedtime";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -175,6 +176,7 @@ export function summarize(status: any) {
   });
   const labels = (rs: any[]) => rs.map((r) => `${str(r?.label) ?? "?"} [${str(r?.slot) ?? "?"}]`);
   return {
+    screen_time: summarizeScreenTime(status?.screen_time),
     day,
     zone: str(status?.zone) ?? null,
     now: str(status?.now) ?? null,
@@ -203,6 +205,10 @@ export function describeSummary(s: ReturnType<typeof summarize>): string {
   lines.push(`Locks now: ${s.locksNow.length ? s.locksNow.join("; ") : "nothing"}`);
   if (s.dueLater.length) lines.push(`Due later today: ${s.dueLater.join("; ")}`);
   lines.push(`Bypasses: ${s.bypassCount ?? "?"}; open debts: ${s.openDebts ?? "?"}`);
+  if (s.screen_time) {
+    const t = s.screen_time;
+    lines.push(`Screen Time ${t.stale ? "stale" : "current"}; device ${t.device_id}; build ${JSON.stringify(t.build)}; received ${t.received_at}; authorization ${t.authorization}; zone ${t.time_zone}; bedtime ${t.bedtime_enabled}; late/full/wake minutes ${t.late_start_minute}/${t.full_start_minute}/${t.wake_minute}; late app/category/web counts ${t.late_app_count}/${t.late_category_count}/${t.late_web_count}; allowlist app/category/web counts ${t.allowlist_app_count}/${t.allowlist_category_count}/${t.allowlist_web_count}; scheduled ${t.scheduled_at ?? "never"}; adult filter enabled ${t.adult_filter_enabled}, applied ${t.adult_filter_applied}; phone-reported unlock ${t.adult_filter_unlock_until ?? "none"}.`);
+  }
   return lines.join("\n");
 }
 
