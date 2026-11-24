@@ -439,7 +439,8 @@ export function accountStatus() {
         ]),
       ),
       // Metadata only: distinguish an unfinished login from a healthy account
-      // before the auth-failure grace period has elapsed.
+      // before the auth-failure grace period has elapsed. "missing" means no
+      // usable credential, including token files rejected by the safety checks.
       credentials: credentials === "failed" ? "missing" as const : credentials,
     };
   });
