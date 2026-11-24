@@ -73,6 +73,7 @@ describe("MCP server", () => {
     const list = (await handle({ jsonrpc: "2.0", id: 2, method: "tools/list" })) as any;
     expect(list.result.tools.map((t: any) => t.name)).toEqual([
       "gym_status", "gym_plan_add", "gym_plan_move", "gym_plan_cancel", "gym_plan_skip",
+      "bedtime_unlock_approve", "bedtime_unlock_deny",
       "hygiene_status", "hygiene_skip", "hygiene_unskip",
     ]);
   });

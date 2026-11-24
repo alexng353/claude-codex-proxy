@@ -11,7 +11,7 @@ import { weightReviews } from "./weight-worker";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { addDays, localTime, parseMoveItems, type ProofKind } from "./hygiene";
-import { chargeMoves, refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
+import { bedtimeAction, chargeMoves, refreshFaults, gateDisabled, gateStatus, moveRequest, noteDeviceZone, proofDays, proofFile, shieldBypass, submitProof, type ProofTarget } from "./hygiene-gate";
 import { passThrough, remoteGate } from "./hygiene-remote";
 
 export const API_PREFIX = "/hygiene/api/v1";
@@ -108,6 +108,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 function status() {
   const s = gateStatus();
   return {
+    ...(s.bedtime_unlock_until ? { bedtime_unlock_until: s.bedtime_unlock_until } : {}),
     enabled: s.enabled,
     state: s.state,
     badge: s.badge,
@@ -146,6 +147,15 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     await refreshFaults();
     await chargeMoves();
     return json(status());
+  }
+
+  if ((path === "/bedtime/request" || path === "/bedtime/bypass") && request.method === "POST") {
+    if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
+    let body;
+    try { body = await request.json(); } catch { return json({ error: "body must be JSON" }, 400); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "body must be an object" }, 400);
+    const result = await bedtimeAction(path === "/bedtime/request" ? "request" : "bypass", body, `cairn:${who.id}`);
+    return result.ok ? json({ ...result, gate: status() }) : json({ error: result.error }, result.statusCode);
   }
 
   // Cairn's app-shield "Emergency" button (see shieldBypass).

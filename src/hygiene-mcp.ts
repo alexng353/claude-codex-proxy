@@ -4,17 +4,16 @@
  * reason sound. Served by the already registered `gym` server, so no Codex
  * config change is needed.
  *
- * Hard limits, by construction: the client below reaches exactly three local
- * gate routes (GET /hygiene/status, POST /hygiene/skip, POST /hygiene/unskip).
- * No tool can open or mint a bypass, read BYPASS words, resolve a debt or
- * penance, move a slot, or credit a photo by hand. Status output is rebuilt from
- * an allowlist of fields, never passed through.
+ * Bedtime approval/denial is restricted to Bubble's stamped calling chat and
+ * reaches separate local routes, never the Cairn API. Other tools cannot mint
+ * a bypass or read its words. Status is rebuilt from an allowlist of fields.
  *
  * `by` is the calling chat: Codex stamps `_meta.threadId` on every tools/call,
  * over anything a model writes (the model controls only `arguments`). Codex
  * spawns this process per thread with no thread id in its environment, so the
  * per-call stamp is the only identity there is. Without one, `by` says so.
  */
+import { BEDTIME_OWNER } from "./hygiene-bedtime";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -30,6 +29,8 @@ export const ROUTES = {
   status: { method: "GET", path: "/hygiene/status" },
   skip: { method: "POST", path: "/hygiene/skip" },
   unskip: { method: "POST", path: "/hygiene/unskip" },
+  bedtimeApprove: { method: "POST", path: "/hygiene/bedtime/approve" },
+  bedtimeDeny: { method: "POST", path: "/hygiene/bedtime/deny" },
 } as const;
 export type Route = keyof typeof ROUTES;
 
@@ -39,6 +40,11 @@ const TARGET_PROPS = {
 } as const;
 
 export const HYGIENE_TOOLS = [
+  ...["approve", "deny"].map(action => ({
+    name: `bedtime_unlock_${action}`,
+    description: `Bubble only: ${action} a pending Cairn bedtime permission request by id. Approval grants 15 minutes from now and is logged as a bypass with an open debt; denial grants nothing. Requests expire after 15 minutes.`,
+    inputSchema: { type: "object", properties: { id: { type: "string" }, reason: { type: "string", description: "Your reason for this decision." } }, required: ["id", "reason"], additionalProperties: false },
+  })),
   {
     name: "hygiene_status",
     description:
@@ -236,6 +242,16 @@ export async function callHygieneTool(name: string, args: Record<string, unknown
   };
   try {
     switch (name) {
+      case "bedtime_unlock_approve":
+      case "bedtime_unlock_deny": {
+        if (chat !== BEDTIME_OWNER) return done({ text: "only Bubble may decide a bedtime request", isError: true });
+        if (typeof args.id !== "string" || !/^[A-Za-z0-9._:-]{1,80}$/.test(args.id) || !reason)
+          return done({ text: "id and reason are required", isError: true });
+        target = args.id;
+        const r = await fetcher(name === "bedtime_unlock_approve" ? "bedtimeApprove" : "bedtimeDeny", { id: target, reason, by });
+        if (r.status >= 400 || r.body?.ok === false) return done({ text: r.body?.error ?? `failed (${r.status})`, isError: true });
+        return done({ text: r.body?.message ?? "done", isError: false });
+      }
       case "hygiene_status": {
         const r = await fetcher("status");
         if (r.status >= 400) return done({ text: r.body?.error ?? `failed (${r.status})`, isError: true });

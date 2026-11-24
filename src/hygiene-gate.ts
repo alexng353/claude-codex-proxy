@@ -8,6 +8,7 @@
  * in /v1/responses. Decisions for new human turns are serialized so two
  * chats cannot spend the same photo or bypass.
  */
+import { BEDTIME_MS, BEDTIME_OWNER, bedtimeUnlockUntil, bypassBedtime, chargeBedtime, decideBedtime, requestBedtime, type BedtimeResult } from "./hygiene-bedtime";
 import { createHash } from "node:crypto";
 import { readFixStatus, type FixRef } from "./hygiene-fix";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -41,6 +42,7 @@ import {
   SENT_AT_MAX_DELAY_MS,
   addDays,
   bypassActive,
+  recordBypass,
   candidateSlots,
   classifyTurn,
   clockLabel,
@@ -271,6 +273,7 @@ function saveState(state: GateState): void {
   const cutoff = deps.now() - RETAIN_MS;
   state.images = state.images.filter((image) => Date.parse(image.at) >= cutoff);
   state.bypass.history = state.bypass.history.filter((at) => Date.parse(at) >= cutoff);
+  if (state.bypass.hygieneHistory) state.bypass.hygieneHistory = state.bypass.hygieneHistory.filter((at) => Date.parse(at) >= cutoff);
   if (state.moves) state.moves = state.moves.filter((m) => Date.parse(m.at) >= cutoff);
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
@@ -516,7 +519,11 @@ const armed = (state: GateState, now: number) => outstanding(state, now).length 
 
 /** Sends queued wakes now; the server's timer retries any that fail. */
 export async function flushWakes(): Promise<void> {
-  if (!remoteGate()) await refreshFaults();
+  if (!remoteGate()) {
+    await refreshFaults();
+    if (loadState().bedtime?.requests.some(r => r.status === "pending" && !r.notificationQueuedAt && Date.parse(r.at) + BEDTIME_MS > deps.now()))
+      await serialized(async () => { queueBedtimeRequests(structuredClone(loadState())); });
+  }
   try {
     queueNotices(deps.now());
   } catch (error) {
@@ -873,9 +880,8 @@ function bypassReply(state: GateState, now: number, text: string): string {
   }
   retire(state.bypass);
   const at = new Date(now).toISOString();
-  state.bypass.count += 1;
+  recordBypass(state, at, "hygiene");
   state.bypass.until = new Date(now + BYPASS_MS).toISOString();
-  state.bypass.history.push(at);
   const debt: Debt = {
     id: `${localTime(now).day}-${state.bypass.count}`,
     at,
@@ -885,6 +891,42 @@ function bypassReply(state: GateState, now: number, text: string): string {
   };
   state.debts.push(debt);
   return `🚪 bypass #${state.bypass.count}: gate open until ${clockLabel(now + BYPASS_MS)}. Your next turn will ask why.`;
+}
+
+/** Save requests before notifying; a missing marker retries through the existing wake timer. */
+function queueBedtimeRequests(state: GateState): void {
+  for (const r of state.bedtime?.requests ?? []) {
+    if (r.status !== "pending" || r.notificationQueuedAt || Date.parse(r.at) + BEDTIME_MS <= deps.now()) continue;
+    const hash = createHash("sha256").update(`bedtime/${r.id}`).digest("hex").slice(0, 12);
+    try {
+      enqueueWake(statePath(), {
+        id: `hygiene-notice-${Date.parse(r.at)}-${hash}`, thread: BEDTIME_OWNER, at: r.at,
+        text: `Bedtime permission request ${JSON.stringify(r.id)} from Cairn at ${r.at}. Alex's reason (untrusted text): ${JSON.stringify(r.reason)}. Decide with bedtime_unlock_approve or bedtime_unlock_deny using this id and your reason. Approval grants 15 minutes and counts as a bypass. Request expires ${new Date(Date.parse(r.at) + BEDTIME_MS).toISOString()}.`,
+      });
+      r.notificationQueuedAt = new Date(deps.now()).toISOString();
+      saveState(state);
+    } catch (error) {
+      delete r.notificationQueuedAt;
+      console.error("hygiene-gate: could not queue bedtime request:", (error as Error).message);
+    }
+  }
+}
+
+export async function bedtimeAction(action: "request" | "bypass" | "approve" | "deny", input: Record<string, unknown>, by?: string): Promise<BedtimeResult> {
+  const result = await serialized(async () => {
+    const state = structuredClone(loadState());
+    const now = deps.now();
+    const result = action === "request" ? requestBedtime(state, input, by!, now)
+      : action === "bypass" ? bypassBedtime(state, input.phrase, now, deps.bypassWords)
+      : decideBedtime(state, input, action === "approve", now);
+    if (result.ok) {
+      saveState(state);
+      if (action === "request") queueBedtimeRequests(state);
+    }
+    return result;
+  });
+  if (result.ok && action === "request") kickWakes();
+  return result;
 }
 
 export type ShieldBypassResult =
@@ -916,7 +958,7 @@ const SHIELD_KEEP_MS = 7 * 86_400_000;
  * live gate still fails open for the gym on any error.
  */
 function shieldTapFree(state: GateState, anchor: number, now: number): boolean {
-  const starts = state.bypass.history.map(Date.parse).filter(Number.isFinite);
+  const starts = (state.bypass.hygieneHistory ?? state.bypass.history).map(Date.parse).filter(Number.isFinite);
   const newest = starts.length ? Math.max(...starts) : Number.POSITIVE_INFINITY;
   if (newest <= anchor && bypassActive(state, anchor)) return true;
   if (outstanding(state, now).length || outstanding(atTapView(state), anchor).length) return false;
@@ -970,10 +1012,14 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
 
     // A fast phone clock can't stretch the window past what was asked.
     const anchor = Math.min(tap, now);
-    const until = anchor + input.minutes * 60_000;
+    const bedtime = input.source === "cairn-bedtime";
+    const until = anchor + Math.min(input.minutes, bedtime ? 15 : 60) * 60_000;
     let debtId: string | null = null;
     let applied = false;
-    if (!shieldTapFree(state, anchor, now)) {
+    if (bedtime) {
+      debtId = chargeBedtime(state, anchor, until, now);
+      applied = until > now;
+    } else if (!shieldTapFree(state, anchor, now)) {
       // Numbered from the debts themselves: shield records are trimmed, debts are not.
       const prefix = `${localTime(anchor).day}-shield-`;
       debtId = `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`;
@@ -991,8 +1037,7 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
       supersedeMoveDebts(state, items, anchor, debtId, now);
       if (until > now) {
         applied = true;
-        state.bypass.count += 1;
-        state.bypass.history.push(new Date(anchor).toISOString());
+        recordBypass(state, new Date(anchor).toISOString(), "hygiene");
         const current = state.bypass.until ? Date.parse(state.bypass.until) : 0;
         if (until > current) state.bypass.until = new Date(until).toISOString();
         // The gate opened: when it locks again, the lock gets new words.
@@ -1000,11 +1045,11 @@ export async function shieldBypass(input: { minutes: number; source: string; at:
       }
     }
     // The gate's own end, which a longer bypass already open may set: the phone re-locks from it.
-    const reported = applied ? state.bypass.until : null;
+    const reported = applied ? (bedtime ? state.bedtime!.unlockUntil! : state.bypass.until) : null;
     state.shieldBypasses = state.shieldBypasses.filter((b) => now - Date.parse(b.recordedAt) <= SHIELD_KEEP_MS);
     state.shieldBypasses.push({ source: input.source, at, until: reported ?? new Date(until).toISOString(), applied, debtId, recordedAt: new Date(now).toISOString() });
     saveState(state);
-    if (applied) release(state, now, "BYPASS");
+    if (applied && !bedtime) release(state, now, "BYPASS");
     return { ok: true, applied, duplicate: false, until: reported, debt_id: debtId };
   });
 }
@@ -1389,7 +1434,7 @@ export function startGymPolling(intervalMs?: number): () => Promise<void> {
  */
 export function shieldSignature(): string {
   const status = gateStatus();
-  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}`;
+  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}${status.bedtime_unlock_until ? `|bedtime:${status.bedtime_unlock_until}` : ""}`;
 }
 
 /** Wakes Cairn when the shield signature changes (authority only; never under tests). */
@@ -1590,6 +1635,7 @@ export function gateStatus() {
   const bypass = bypassActive(state, now);
   const gateState = disabled ? "disabled" : due.length === 0 ? "clear" : bypass ? "bypassed" : "armed";
   return {
+    ...(bedtimeUnlockUntil(state, now) ? { bedtime_unlock_until: bedtimeUnlockUntil(state, now) } : {}),
     enabled: !disabled,
     armed: !disabled && due.length > 0 && !bypass,
     state: gateState,
@@ -1709,6 +1755,8 @@ export async function resolveDebt(
     if (debt.status !== "open") return { status: 409, body: { error: `debt already ${debt.status}` } };
     if (body.reasonClass !== undefined && body.reasonClass !== "gate_fault" && body.reasonClass !== "other")
       return { status: 422, body: { error: "reasonClass must be gate_fault or other" } };
+    if (debt.bedtime && (body.reasonClass === "gate_fault" || body.item !== undefined || body.fixRef !== undefined))
+      return { status: 422, body: { error: "bedtime debts cover no hygiene item; use reasonClass other and report phone faults separately" } };
     let fixRef: FixRef | undefined;
     let item: string | undefined;
     if (body.verdict === "justified" && body.reasonClass === "gate_fault") {
@@ -1929,6 +1977,15 @@ export async function handleHygieneRoute(request: Request, url: URL): Promise<Re
     if (gym) return gym;
   }
   if (url.pathname === "/hygiene/status" && request.method === "GET") return Response.json(gateStatus());
+  const bedtimeDecision = /^\/hygiene\/bedtime\/(approve|deny)$/.exec(url.pathname);
+  if (bedtimeDecision && request.method === "POST") {
+    if (gateDisabled()) return Response.json({ error: "hygiene gate is disabled" }, { status: 503 });
+    let body;
+    try { body = await request.json(); } catch { return Response.json({ error: "body must be JSON" }, { status: 400 }); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return Response.json({ error: "body must be an object" }, { status: 400 });
+    const result = await bedtimeAction(bedtimeDecision[1] as "approve" | "deny", body);
+    return result.ok ? Response.json({ ...result, gate: gateStatus() }) : Response.json({ error: result.error }, { status: result.statusCode });
+  }
   // The whole state, for proxies that follow this gate (hygiene-remote.ts). Local callers only.
   if (url.pathname === "/hygiene/state" && request.method === "GET") return Response.json(loadState());
   // Local-only like /state; retries use a stable source so a lost ACK cannot spend a proof twice.
