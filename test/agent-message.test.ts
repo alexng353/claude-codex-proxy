@@ -127,6 +127,8 @@ describe("multi-agent v2 agent_message items", () => {
     const followup = v2Task(`/root/${name}`);
     (followup.content as { text?: string }[])[0].text = `Message Type: MESSAGE\nTask name: /root/${name}\nSender: /root\nPayload:\n`;
     const request = { model: "claude-opus-5-5", input: [first, followup] };
+    const fresh = structuredClone(request);
+    expect(requestToPrompt(deltaRequest(fresh, [fresh.input[1]!]))).toContain("Keep working on the task already given");
     const text = requestToPrompt(request);
     expect(text).not.toContain("Reply only: ");
     expect(text).toContain("Keep working on the task already given");
