@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { classifyTurn } from "../src/hygiene";
 import * as health from "../src/auth-health";
-import { accountStatus, isAuthError, listAccounts, markAuthFailed, markAuthSucceeded, resetAccountState } from "../src/accounts";
+import { accountStatus, markLimited, isAuthError, listAccounts, markAuthFailed, markAuthSucceeded, resetAccountState } from "../src/accounts";
 
 const scratch = tmpdir();
 mkdirSync(scratch, { recursive: true, mode: 0o700 });
@@ -274,4 +274,48 @@ for (const mode of ["false", "throw"] as const) test(`failed warning delivery ($
     await health.flushAuthWarnings(fail, "forge");
     expect(attempts).toBe(3);
   } finally { log.mockRestore(); }
+});
+
+test('account status exposes credential presence before an auth incident exists', () => {
+  setup();
+  const fresh = join(root, 'accounts', 'fresh');
+  mkdirSync(fresh, { recursive: true });
+  const status = () => accountStatus().find(a => a.name === 'fresh')! as any;
+  expect(status().authFailedSince).toBeNull();
+  expect(status().credentials).toBe('missing');
+  writeFileSync(join(fresh, '.credentials.json'), JSON.stringify({ claudeAiOauth: { refreshToken: 'fixture-refresh' } }));
+  expect(status().credentials).toBe('present');
+  writeFileSync(join(fresh, '.credentials.json'), '{broken');
+  expect(status().credentials).toBe('unknown');
+  writeFileSync(join(fresh, '.credentials.json'), JSON.stringify({ claudeAiOauth: {} }));
+  expect(status().credentials).toBe('missing');
+});
+
+test('credential presence adds one field without changing legacy account response bytes', () => {
+  setup();
+  writeFileSync(join(root, '.credentials.json'), JSON.stringify({ claudeAiOauth: { refreshToken: 'fixture-refresh' } }));
+  const { credentials, ...legacy } = accountStatus()[0] as any;
+  expect(credentials).toBe('present');
+  expect(JSON.stringify(legacy)).toBe(JSON.stringify({
+    name: 'default', weeklyCap: 100, dir: root, active: true, lastTurnAt: null,
+    limitedUntil: null, authMode: 'login', tokenExpiresAt: null,
+    authFailedSince: null, refreshTokenExpiresAt: null, authFailedUntil: null,
+    observedAt: null, stale: false, windows: {},
+  }));
+});
+
+
+test('setup-token and quota-limited accounts report presence independently of availability', () => {
+  const account = setup();
+  const token = join(root, 'oauth-token');
+  writeFileSync(token, 'fixture-token', { mode: 0o600 });
+  const until = Date.now() + 60_000;
+  markLimited(account, until);
+  const status = accountStatus()[0] as any;
+  expect(status.credentials).toBe('present');
+  expect(status.authMode).toBe('token');
+  expect(status.limitedUntil).toBe(new Date(until).toISOString());
+  expect(JSON.stringify(status)).not.toContain('fixture-token');
+  writeFileSync(token, '');
+  expect((accountStatus()[0] as any).credentials).toBe('missing');
 });

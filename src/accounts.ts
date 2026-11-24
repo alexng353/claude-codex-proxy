@@ -14,7 +14,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { accountToken } from "./account-token";
-import { authHealth, clearAuthIncident, recordAuthFailure, clearRefreshSuspicion } from "./auth-health";
+import { credentialStatus, authHealth, clearAuthIncident, recordAuthFailure, clearRefreshSuspicion } from "./auth-health";
 import { withLock } from "./filelock";
 import { stateDir } from "./sessions";
 
@@ -414,6 +414,7 @@ export function accountStatus() {
     const authUntil = authFailedUntil.get(account.name) ?? 0;
     const windows = seen?.info.unifiedWindows ?? {};
     const served = lastTurn.get(account.name);
+    const credentials = credentialStatus(account).state;
     return {
       name: account.name,
       weeklyCap: effectiveWeeklyCap(account.name, now) ?? 100,
@@ -437,6 +438,9 @@ export function accountStatus() {
           },
         ]),
       ),
+      // Metadata only: distinguish an unfinished login from a healthy account
+      // before the auth-failure grace period has elapsed.
+      credentials: credentials === "failed" ? "missing" as const : credentials,
     };
   });
 }
