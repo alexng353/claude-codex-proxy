@@ -133,7 +133,11 @@ describe("multi-agent v2 agent_message items", () => {
     expect(text).not.toContain("Reply only: ");
     expect(text).toContain("Keep working on the task already given");
     expect(text).toContain("same final answer again");
-    expect(text).toContain("nonce line and STATUS");
+    expect(text).not.toContain("It does not change the task");
+    expect(text).toContain("the proxy could not read it, so it cannot tell what it asked");
+    expect(text).toContain("Keep NONCE and STATUS as the first two lines");
+    expect(text).toContain("then add exactly one line");
+    expect(text).toContain("NOTE: a follow-up from the parent was encrypted and unread; if it changed the task, spawn a new reader with a new task file.");
     const delta = requestToPrompt(deltaRequest(request, [followup]));
     expect(delta).toContain("Keep working on the task already given");
     expect(delta).not.toContain("Review PLUM");

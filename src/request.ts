@@ -361,7 +361,7 @@ function serializeAgentMessage(item: ResponseInputItem): string {
     );
   } else if (payload.kind === "unreadable-followup") {
     lines.push(
-      "[A follow-up from the parent was encrypted for OpenAI models and is unreadable. It does not change the task. Keep working on the task already given and finish it normally. If already finished, give the same final answer again, including the nonce line and STATUS.]",
+      "[A follow-up from the parent was encrypted for OpenAI models and the proxy could not read it, so it cannot tell what it asked. Keep working on the task already given and finish it normally. If already finished, give the same final answer again. Keep NONCE and STATUS as the first two lines, then add exactly one line: NOTE: a follow-up from the parent was encrypted and unread; if it changed the task, spawn a new reader with a new task file.]",
     );
   } else if (payload.kind === "blocked") {
     // The reply goes to the parent as plain text, so a NEW_TASK's reply carries the
