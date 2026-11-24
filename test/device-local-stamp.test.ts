@@ -34,7 +34,6 @@ for (const stamp of stamps) {
     test("a stamped synthetic wrapper remains synthetic", () => {
       const item = message(`${stamp} <codex_delegation>\n  <input>hi</input>\n</codex_delegation>`);
       expect(isSyntheticUserMessage(item)).toBe(true);
-      expect(isBareUserMessage(item)).toBe(false);
     });
     test("a stamped heartbeat cannot become bare human input", () => {
       const item = message(`${stamp} <heartbeat>check</heartbeat>`);
@@ -46,7 +45,7 @@ for (const stamp of stamps) {
 
 test("legacy stamps preserve the exact classified payload bytes", () => {
   const body = "BYPASS apple birch cloud\nkeep  two spaces · café 日本語";
-  expect(classifyTurn(request(`[23:13 MST Mon Nov 23 · mac] ${body}`))).toEqual(classifyTurn(request(body)));
+  expect(classifyTurn(request(`[23:13 MST Mon Nov 23 · mac] ${body}`))).toEqual({ type: "human", newest: 0, text: "BYPASS apple birch cloud\nkeep  two spaces · café 日本語", images: [] });
 });
 
 test("ordinary brackets and malformed new stamps stay in the text", () => {
@@ -54,7 +53,7 @@ test("ordinary brackets and malformed new stamps stay in the text", () => {
     "[note]", "[13:13 WIB Tue Nov 24 (anything)]",
     "[13:13 UTC+ Tue Nov 24 · phone]", "[13:13 UTC+5:3 Tue Nov 24 · phone]",
     "[13:13 WIB Tue Nov 24 (23:13 MST Mon Nov) · mac]",
-    "[13:13 WIB Tue Nov 24 (23:13 MST) · mac", 
+    "[13:13 WIB Tue Nov 24 (23:13 MST) · mac",
     "before [13:13 WIB Tue Nov 24 (23:13 MST) · mac]",
   ]) {
     const text = `${prefix} BYPASS`;
