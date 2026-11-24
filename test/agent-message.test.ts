@@ -141,6 +141,20 @@ describe("multi-agent v2 agent_message items", () => {
     expect(requestToPrompt({ model: request.model, input: [structuredClone(followup)] })).toContain("Reply only: ");
   });
 
+  test("an unreadable replacement task clears the earlier delivery for subsequent messages", () => {
+    const name = "/root/p1_claude__123456abcdef";
+    const path = join(dir, "p1_claude__123456abcdef.md");
+    writeFileSync(path, "Original review.", { mode: 0o600 });
+    const first = v2Task(name);
+    expect(serializeItem(first)).toContain("Original review.");
+    rmSync(path);
+    const replacement = v2Task(name);
+    const followup = v2Task(name);
+    (followup.content as { text?: string }[])[0].text = `Message Type: MESSAGE\nTask name: ${name}\nPayload:\n`;
+    requestToPrompt({ model: "claude-opus-5-5", input: [first, replacement, followup] });
+    expect(serializeItem(followup)).toContain("Reply only: ");
+  });
+
   test("another recipient's readable task does not unblock a follow-up", () => {
     writeFileSync(join(dir, "p1_claude__123456abcdef.md"), "Review PLUM.", { mode: 0o600 });
     const followup = v2Task("/root/p1_claude__fedcba654321");
