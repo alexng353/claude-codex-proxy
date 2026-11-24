@@ -150,7 +150,7 @@ describe("hygiene_skip", () => {
   });
 });
 
-describe("no tool reaches anything but status, skip and unskip", () => {
+describe("tools reach only their fixed local routes", () => {
   // HMCP-M2 (Lagrange, 56dc840): a fetch that throws escaped the audit log.
   test("a gate that can't be reached still gives one audit line with the chat, and an MCP error", async () => {
     setHygieneFetcher(async () => {
@@ -184,8 +184,8 @@ describe("no tool reaches anything but status, skip and unskip", () => {
     expect(calls).toEqual([]);
   });
 
-  test("the route table is exactly three local routes", () => {
-    expect(Object.values(ROUTES).map((r) => `${r.method} ${r.path}`)).toEqual(["GET /hygiene/status", "POST /hygiene/skip", "POST /hygiene/unskip"]);
+  test("the route table separates hygiene from bedtime decisions", () => {
+    expect(Object.values(ROUTES).map((r) => `${r.method} ${r.path}`)).toEqual(["GET /hygiene/status", "POST /hygiene/skip", "POST /hygiene/unskip", "POST /hygiene/bedtime/approve", "POST /hygiene/bedtime/deny"]);
   });
 
   test("over HTTP, every request any tool makes goes to one of them", async () => {

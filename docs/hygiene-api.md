@@ -267,3 +267,81 @@ Recurring slots that first arm within a suspension window remain unenforced
 after the repair closes; previously armed slots can resume. Ordinary leniency
 revisions use `reasonClass:"other"` and preserve the previous classification in
 the debt history, rather than inheriting an untracked fault classification.
+
+## Bedtime exceptions
+
+Cairn owns its bedtime schedule, app selection and enabled setting. No server
+registration is needed. Bedtime grants never open or arm the hygiene gate. Keep
+sending `X-Device-Time-Zone` on status reads. The existing gate-wake push prompts
+another status read when a bedtime grant starts, changes or expires.
+
+`GET /status` adds optional `bedtime_unlock_until`, an ISO UTC timestamp. It is
+omitted when there is no active grant. During its local bedtime schedule, the
+phone stays shielded unless it has an unexpired grant or its own emergency tap.
+The phone must schedule expiry locally; push delivery is not guaranteed.
+
+### POST /bedtime/request
+
+```json
+{ "id": "<new UUID>", "reason": "I need to call a taxi" }
+```
+
+`id` is 1–80 letters, digits, `.`, `_`, `:`, or `-`. The trimmed reason is 1–1000
+characters. A successful response is:
+
+```json
+{ "ok": true, "id": "<UUID>", "status": "pending", "duplicate": false, "message": "Request sent to Bubble. Waiting for permission.", "gate": {} }
+```
+
+`gate` has the same shape as status. Acceptance grants nothing. The proxy saves
+the request and wakes Bubble with its id and reason. Repeating the id and reason
+returns the stored request with `duplicate: true`; changing its reason is `409`.
+Request receipts are retained for idempotency; an old id never becomes a fresh request.
+Use a new id for a new request. Status is `pending`, `approved`, `denied`, or
+`expired`. A pending request expires after 15 minutes; a later approval is refused.
+
+Bubble's `gym` MCP server supplies `bedtime_unlock_approve` and
+`bedtime_unlock_deny`, each taking `{id, reason}`. Only Bubble's Codex-stamped
+calling chat may use them. They use local administrative proxy routes, protected
+by the existing proxy API key when configured; these routes are not exposed by
+Tailscale Serve or the Cairn API. As with the rest of the gate, local shell and
+proxy administrator access are trusted, not a sandbox against other local agents.
+
+Approval opens 15 minutes from the decision and records an open bypass debt with
+item label `bedtime`, plus the decision's reason and caller. Denial opens nothing.
+Repeating a decision is idempotent, including after its grant expires; reversing
+one is `409`. A new approval can extend the current grant to now plus 15 minutes,
+never add 15 minutes to its existing end. Bedtime debts cannot excuse or suspend
+hygiene items through a fault ruling. Their usual justified/unjustified rulings
+and penance remain available.
+
+### POST /bedtime/bypass
+
+```json
+{ "phrase": "BYPASS" }
+```
+
+A bare `BYPASS` or incorrect words return `200` with
+`{ok:true, granted:false, message:"Type BYPASS <three words> ...", gate:{...}}`.
+Display `message`. Submit the complete phrase, including `BYPASS`, to grant 15
+minutes and record a bypass debt. That response has `granted:true` and the expiry
+in `gate.bedtime_unlock_until`. Poll status to apply it. An active grant returns
+its original expiry without another charge or extension. The bedtime challenge
+uses the existing three-word mechanism but has its own lifecycle, separate from
+the hygiene challenge. Words are not exposed in status or agent tools.
+
+### Offline emergency taps
+
+Use the existing `POST /bypass` journal with `source: "cairn-bedtime"` while bedtime
+is actively shielding. Preserve the source and original `at` on retry. This source
+always counts, even when hygiene is clear or bypassed. The window is capped at 15
+minutes from the original tap (`minutes` still accepts the existing 1–60 range).
+A late report records the count and debt but opens no fresh window. Duplicate
+source/time reports return their original result and never charge again. Existing
+24-hour report age and 5-minute clock-skew bounds still apply; a permitted future
+tap is anchored to receipt time. Other journal sources keep their prior behavior.
+
+All bedtime mutations return `503` while the gate's terminal kill switch is set.
+Existing clients can ignore the added status field; old proxy copies preserve the
+optional stored bedtime state but cannot serve the new endpoints. Deploy the proxy
+before enabling bedtime in Cairn.
