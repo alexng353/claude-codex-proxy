@@ -181,7 +181,6 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
       await screenTimeReport(report, who.id);
       return json({ ok: true });
     }
-    if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
     if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some(k => k !== "phrase"))
       return json({ error: "body must contain only phrase" }, 400);
     const result = await adultFilterBypass(body.phrase);

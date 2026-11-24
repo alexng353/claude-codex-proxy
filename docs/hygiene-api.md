@@ -414,4 +414,5 @@ Each successful grant increments the shared bypass count/history and creates an
 open debt with `kind: "adult-filter"`, also shown in open-debt status. Such debts
 can receive ordinary justified/unjustified rulings and penance, but cannot excuse
 or suspend hygiene items. The existing public debt `source` retains its meaning.
-The adult-filter bypass route returns `503` when the hygiene kill switch is set.
+The adult-filter bypass remains available and counted when the hygiene kill switch
+is set; its active grant still appears in status. Bedtime behavior is unchanged.

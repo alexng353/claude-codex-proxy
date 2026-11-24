@@ -147,14 +147,12 @@ test("4 KiB cap measures actual bytes including whitespace and streamed chunks",
   expect(cancelled).toBe(true);
 });
 
-test("telemetry and adult bypass share Cairn auth; telemetry is accepted even when hygiene disabled", async () => {
+test("telemetry and adult bypass share Cairn auth", async () => {
   for (const path of ["/screen-time/status", "/adult-filter/bypass"]) {
     expect((await api(path, report(), "invalid")).code).toBe(401);
     expect((await api(path, report(), "agent")).code).toBe(403);
   }
-  writeFileSync(process.env.HYGIENE_GATE_DISABLED_FILE!, "disabled");
-  expect((await telemetry()).code).toBe(200);
-  expect((await adult()).code).toBe(503);
+
 });
 
 test("reported adult unlock is diagnostic only and never affects any grant or wake signature", async () => {
@@ -320,4 +318,27 @@ test("Bubble quotes phone-supplied build text on one line", async () => {
   const r = await callHygieneTool("hygiene_status", {}, { threadId: BUBBLE });
   expect(r.text).toContain(JSON.stringify(build));
   expect(r.text).not.toContain(build);
+});
+
+
+test("disabled hygiene still stores Screen Time diagnostics", async () => {
+  writeFileSync(process.env.HYGIENE_GATE_DISABLED_FILE!, "disabled");
+  expect((await telemetry()).code).toBe(200);
+  resetGateCache();
+  expect((await localStatus()).body.screen_time).toMatchObject({ build: "123", device_id: "phone" });
+});
+
+test("disabled hygiene still grants and counts an independent adult-filter pause", async () => {
+  writeFileSync(process.env.HYGIENE_GATE_DISABLED_FILE!, "disabled");
+  const signature = shieldSignature();
+  const grant = await adultGrant();
+  expect(grant.code).toBe(200);
+  expect(grant.body).toMatchObject({ granted: true, gate: { enabled: false, adult_filter_unlock_until: iso(START + 15 * MIN) } });
+  expect((await status()).body.adult_filter_unlock_until).toBe(iso(START + 15 * MIN));
+  expect(loadState().bypass.count).toBe(1);
+  expect(loadState().debts).toMatchObject([{ kind: "adult-filter", status: "open" }]);
+  expect(shieldSignature()).not.toBe(signature);
+  expect((await adult()).body.gate.adult_filter_unlock_until).toBe(iso(START + 15 * MIN));
+  expect(loadState().bypass.count).toBe(1);
+  expect((await api("/bedtime/bypass", { phrase: "BYPASS" })).code).toBe(503);
 });
