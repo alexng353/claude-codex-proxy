@@ -285,6 +285,7 @@ const agentMessageType = (text: string): string | undefined =>
  */
 export type AgentMessagePayload =
   | { kind: "plain"; plain: string }
+  | { kind: "unreadable-followup"; plain: string; taskName: string; newTask: false }
   | { kind: "task-file"; plain: string; taskName: string; file: TaskFile & { text: string } }
   | {
       kind: "blocked";
@@ -306,6 +307,24 @@ export function agentMessagePayload(item: ResponseInputItem): AgentMessagePayloa
   let payload = payloads.get(item);
   if (!payload) payloads.set(item, (payload = decideAgentMessagePayload(item)));
   return payload;
+}
+
+/** Resolve follow-ups against earlier task deliveries before slicing worker deltas.
+ * Evidence is request-local: a matching file alone does not prove delivery.
+ */
+export function prepareAgentMessages(request: ResponsesRequest): void {
+  if (!Array.isArray(request.input)) return;
+  const delivered = new Set<string>();
+  for (const item of request.input) {
+    if (item.type !== "agent_message") continue;
+    const payload = agentMessagePayload(item);
+    if (payload.kind === "task-file") delivered.add(payload.taskName);
+    else if (payload.kind === "blocked") {
+      if (payload.newTask) delivered.delete(payload.taskName);
+      else if (delivered.has(payload.taskName))
+        payloads.set(item, { kind: "unreadable-followup", plain: payload.plain, taskName: payload.taskName, newTask: false });
+    }
+  }
 }
 
 function decideAgentMessagePayload(item: ResponseInputItem): AgentMessagePayload {
@@ -339,6 +358,10 @@ function serializeAgentMessage(item: ResponseInputItem): string {
     lines.push(
       `[The sender's payload was encrypted for OpenAI models, so the proxy read the sender's task file ${payload.file.path} in its place. Its text follows and is your task.]`,
       payload.file.text.replace(/\n+$/, ""),
+    );
+  } else if (payload.kind === "unreadable-followup") {
+    lines.push(
+      "[A follow-up from the parent was encrypted for OpenAI models and is unreadable. It does not change the task. Keep working on the task already given and finish it normally. If already finished, give the same final answer again, including the nonce line and STATUS.]",
     );
   } else if (payload.kind === "blocked") {
     // The reply goes to the parent as plain text, so a NEW_TASK's reply carries the
@@ -453,6 +476,7 @@ You are the model inside the Codex agent loop. Return Codex-provided tool reques
 }
 
 export function requestToPrompt(request: ResponsesRequest): string {
+  prepareAgentMessages(request);
   const input =
     typeof request.input === "string"
       ? `<user>\n${request.input}\n</user>`
@@ -475,6 +499,7 @@ export function deltaRequest(
   request: ResponsesRequest,
   delta: ResponseInputItem[],
 ): ResponsesRequest {
+  prepareAgentMessages(request);
   return { ...request, instructions: undefined, tools: [], input: delta };
 }
 

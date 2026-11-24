@@ -134,6 +134,20 @@ describe("counting the encrypted-task BLOCKED path", () => {
     expect(pages).toEqual([]);
   });
 
+  test("an unreadable follow-up after task-file delivery is counted separately and never pages", async () => {
+    const name = "/root/p1_claude__123456abcdef";
+    writeFileSync(join(tasks, "p1_claude__123456abcdef.md"), "Review PLUM.", { mode: 0o600 });
+    const input = request(v2(name), v2(name, "gAAAA-followup", "MESSAGE"));
+    const result = await recordBlockedTasks(input, options(1_000_000));
+    expect(result.count).toBe(0);
+    expect(result.hits).toEqual([]);
+    expect(result.paged).toBeUndefined();
+    expect(stored()).toMatchObject({ count: 0, newTasks: 0, unreadableFollowups: 1 });
+    await recordBlockedTasks(structuredClone(input), options(1_000_100));
+    expect(stored().unreadableFollowups).toBe(1);
+    expect(pages).toEqual([]);
+  });
+
   test("a failed page frees the hour so the next hit retries", async () => {
     const failing = options(1_000_000, { send: async (text: string) => (pages.push(text), false) });
     await (await recordBlockedTasks(request(v2("/root/a")), failing)).paged;

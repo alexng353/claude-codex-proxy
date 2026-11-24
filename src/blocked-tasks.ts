@@ -24,7 +24,7 @@ import { dirname, join } from "node:path";
 import { STRIPPED_ENV } from "./claude-env";
 import { processAlive, tryLock, unlock } from "./filelock";
 import { localMachine, MACHINE_NAME, THREAD_ID, wakeMachines } from "./hygiene-wake";
-import { agentMessagePayload, blockedReason } from "./request";
+import { agentMessagePayload, blockedReason, prepareAgentMessages } from "./request";
 import { stateDir } from "./sessions";
 import type { ResponseInputItem, ResponsesRequest } from "./types";
 
@@ -51,6 +51,8 @@ type Store = {
   count: number;
   /** NEW_TASK hits alone: the tasks a reviewer never received. */
   newTasks: number;
+  /** Unreadable follow-ups whose original task was delivered; never BLOCKED or paged. */
+  unreadableFollowups: number;
   firstAt?: string;
   lastAt?: string;
   /** When a page was last sent. Written only after a send succeeded. */
@@ -62,7 +64,7 @@ type Store = {
   /** Message key -> when it was first seen. */
   seen: Record<string, number>;
 };
-type Seen = BlockedTaskHit & { key: string; blocked: boolean; newTask: boolean };
+type Seen = BlockedTaskHit & { key: string; blocked: boolean; unreadableFollowup: boolean; newTask: boolean };
 
 // ---- The request-path check ----
 
@@ -116,7 +118,7 @@ export async function drainBlockedTasks(): Promise<void> {
 
 // ---- The counter ----
 
-const empty = (): Store => ({ count: 0, newTasks: 0, seen: {} });
+const empty = (): Store => ({ count: 0, newTasks: 0, unreadableFollowups: 0, seen: {} });
 
 function read(path: string, now: number): Store {
   if (!existsSync(path)) return empty();
@@ -134,6 +136,7 @@ function read(path: string, now: number): Store {
     return {
       count: Number.isInteger(raw.count) ? raw.count! : 0,
       newTasks: Number.isInteger(raw.newTasks) ? raw.newTasks! : 0,
+      unreadableFollowups: Number.isInteger(raw.unreadableFollowups) ? raw.unreadableFollowups! : 0,
       firstAt: typeof raw.firstAt === "string" ? raw.firstAt : undefined,
       lastAt: typeof raw.lastAt === "string" ? raw.lastAt : undefined,
       lastPagedAt: number(raw.lastPagedAt),
@@ -189,6 +192,7 @@ const hitKey = (item: ResponseInputItem, taskName: string): string => {
 
 /** Every encrypted agent_message in the request, with request.ts's decision for it. */
 function encryptedMessages(request: ResponsesRequest): Seen[] {
+  prepareAgentMessages(request);
   const out: Seen[] = [];
   for (const item of request.input as unknown[]) {
     if (!isEncryptedAgentMessage(item)) continue;
@@ -198,6 +202,7 @@ function encryptedMessages(request: ResponsesRequest): Seen[] {
       key: hitKey(item, payload.taskName),
       taskName: payload.taskName || "unnamed task",
       blocked: payload.kind === "blocked",
+      unreadableFollowup: payload.kind === "unreadable-followup",
       newTask: payload.kind === "task-file" || payload.newTask,
       reason: payload.kind === "blocked" ? blockedReason(payload).trim() : "",
     });
@@ -246,6 +251,7 @@ export async function recordBlockedTasks(request: ResponsesRequest, options: Rec
     if (!fresh.length) return { now, store, hits: [] as Seen[], page: false };
     for (const message of fresh) store.seen[message.key] = now;
     store.seen = prune(store.seen, now, ttl, max);
+    store.unreadableFollowups += fresh.filter((message) => message.unreadableFollowup).length;
     const hits = fresh.filter((message) => message.blocked);
     const newTasks = hits.filter((hit) => hit.newTask).length;
     if (hits.length) {

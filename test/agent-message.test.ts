@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { requestToPrompt, serializeItem } from "../src/request";
+import { deltaRequest, requestToPrompt, serializeItem } from "../src/request";
 import type { ResponseInputItem } from "../src/types";
 
 // The shape Codex 0.163 sends a multi-agent v2 child (from an arch rollout,
@@ -118,6 +118,32 @@ describe("multi-agent v2 agent_message items", () => {
       expect(text).not.toContain("Original task PLUM.");
       expect(text).toContain("BLOCKED");
     }
+  });
+
+  test("an encrypted MESSAGE preserves the task delivered by NEW_TASK, including worker deltas", () => {
+    const name = "p1_claude__123456abcdef";
+    writeFileSync(join(dir, `${name}.md`), "Review PLUM. Return NONCE plum and STATUS: COMPLETE.", { mode: 0o600 });
+    const first = v2Task(`/root/${name}`);
+    const followup = v2Task(`/root/${name}`);
+    (followup.content as { text?: string }[])[0].text = `Message Type: MESSAGE\nTask name: /root/${name}\nSender: /root\nPayload:\n`;
+    const request = { model: "claude-opus-5-5", input: [first, followup] };
+    const text = requestToPrompt(request);
+    expect(text).not.toContain("Reply only: ");
+    expect(text).toContain("Keep working on the task already given");
+    expect(text).toContain("same final answer again");
+    expect(text).toContain("nonce line and STATUS");
+    const delta = requestToPrompt(deltaRequest(request, [followup]));
+    expect(delta).toContain("Keep working on the task already given");
+    expect(delta).not.toContain("Review PLUM");
+    // Evidence belongs to this request, not a global task-name registry.
+    expect(requestToPrompt({ model: request.model, input: [structuredClone(followup)] })).toContain("Reply only: ");
+  });
+
+  test("another recipient's readable task does not unblock a follow-up", () => {
+    writeFileSync(join(dir, "p1_claude__123456abcdef.md"), "Review PLUM.", { mode: 0o600 });
+    const followup = v2Task("/root/p1_claude__fedcba654321");
+    (followup.content as { text?: string }[])[0].text = "Message Type: MESSAGE\nPayload:\n";
+    expect(requestToPrompt({ model: "claude-opus-5-5", input: [v2Task("/root/p1_claude__123456abcdef"), followup] })).toContain("Reply only: ");
   });
 
   test("plaintext parts are joined with a newline so they cannot run together", () => {
