@@ -27,3 +27,16 @@ test("phone history picks Makassar after Jakarta", () => {
     expect(zoneAt(Date.parse("2026-11-18T04:18:00Z"))).toBe("Asia/Makassar");
   } finally { setZoneHistory(undefined); }
 });
+
+test("image-only stamped turns keep the photo and no typed text", () => {
+  const image = {type:"input_image", image_url:"data:image/png;base64,AA=="};
+  const classifyParts = (parts: unknown[]) => classifyTurn({model:"test", input:[{role:"user", content:parts}]} as ResponsesRequest);
+  expect(classifyParts([{type:"input_text", text:"[23:13 MST Mon Nov 23 · Alex 14:13 WITA, Asia/Makassar] "}, image])).toEqual(classifyParts([{type:"input_text", text:""}, image]));
+});
+
+test("malformed Alex segments are not stripped", () => {
+  for (const text of [
+    "[23:13 MST Mon Nov 23 · Alex 14:13 WITA Asia/Makassar] BYPASS",
+    "[23:13 MST Mon Nov 23 · Alex 14:13 WITA, Asia/Makassar extra] BYPASS",
+  ]) expect(classify(text)).toMatchObject({type:"human", text});
+});
