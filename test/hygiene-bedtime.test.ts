@@ -448,3 +448,60 @@ test("proxy ends the grant during the phone's minute-rounding tail; free stays s
   expect(loadState().bypass.count).toBe(1);
   expect(loadState().debts).toHaveLength(1);
 });
+
+test("zone hopping cannot renew a still-running origin day", async () => {
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  clock = Date.parse("2026-11-25T04:00:00Z"); await noteDeviceZone("America/Vancouver");
+  expect((await free()).code).toBe(200);
+  clock = Date.parse("2026-11-25T05:01:00Z"); await noteDeviceZone("America/New_York");
+  expect((await free("ny")).code).toBe(409);
+  clock = Date.parse("2026-11-25T10:01:00Z"); await noteDeviceZone("Pacific/Kiritimati");
+  expect((await free("island")).code).toBe(200); // original Vancouver day ended at 07:00Z
+});
+
+test("Jakarta to Bali keeps the allowance used through the origin midnight", async () => {
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  await jakarta(Date.parse("2026-11-25T15:30:00Z")); await free();
+  clock = Date.parse("2026-11-25T15:46:00Z"); await noteDeviceZone("Asia/Makassar");
+  expect((await free("bali")).code).toBe(409);
+  clock = Date.parse("2026-11-25T16:00:00Z");
+  expect((await free("bali")).code).toBe(409);
+  clock = Date.parse("2026-11-25T17:00:00Z");
+  expect((await free("bali")).code).toBe(200);
+});
+
+test("eastward destination date waits only until origin midnight", async () => {
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  clock = Date.parse("2026-12-03T08:00:00Z"); await noteDeviceZone("Asia/Makassar"); await free();
+  clock = Date.parse("2026-12-03T08:16:00Z"); await noteDeviceZone("Pacific/Kiritimati");
+  expect((await free("east")).code).toBe(409);
+  clock = Date.parse("2026-12-03T10:01:00Z"); // destination Dec 4, origin still Dec 3
+  expect((await free("east")).code).toBe(409);
+  clock = Date.parse("2026-12-03T16:00:00Z"); // origin Dec 4
+  expect((await free("east")).code).toBe(200);
+});
+
+test("recorded date prevents a second use after westward travel even outside destination's start interval", async () => {
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  await jakarta(Date.parse("2026-11-24T17:05:00Z")); await free(); // Nov25 in Jakarta, Nov24 in Vancouver
+  clock = Date.parse("2026-11-25T17:05:00Z"); await noteDeviceZone("America/Vancouver");
+  expect((await free("west")).code).toBe(409); // still calendar Nov25, origin now Nov26
+});
+
+test("receipt start within destination day prevents a second use when recorded date differs", async () => {
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  clock = Date.parse("2026-11-25T06:00:00Z"); await noteDeviceZone("America/Vancouver"); await free(); // Nov24
+  clock = Date.parse("2026-11-25T07:01:00Z"); await noteDeviceZone("Asia/Tokyo");
+  expect((await free("tokyo-after-origin-midnight")).code).toBe(409);
+});
+
+test("Bali to Vancouver on Dec 3 keeps the destination day spent until its midnight", async () => {
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  clock = Date.parse("2026-12-03T07:00:00Z"); await noteDeviceZone("Asia/Makassar"); await free();
+  clock += 16 * MIN; await noteDeviceZone("America/Vancouver");
+  expect((await free("vancouver")).code).toBe(409);
+  clock = Date.parse("2026-12-03T16:00:00Z"); // Bali's day ended; Vancouver still has the spent Dec3.
+  expect((await free("vancouver")).code).toBe(409);
+  clock = Date.parse("2026-12-04T07:00:00Z");
+  expect((await free("vancouver")).code).toBe(200);
+});

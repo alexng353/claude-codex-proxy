@@ -296,8 +296,11 @@ returns 409 without consuming the allowance.
 
 A grant straddling midnight belongs to its start day. After a zone change, a
 receipt consumes the allowance if its recorded calendar date matches today or
-its start falls within today's interval in the new zone. Moving the clock's zone
-therefore cannot restore a free unlock within the same day.
+its start falls within today's interval in the new zone. It also remains spent
+until the day it started has ended in its original zone. Moving the clock's zone
+therefore cannot restore a free unlock within the same day. The additional
+origin-day hold lasts less than 24 hours, bounded by the origin midnight; the
+existing destination-date checks still apply after that.
 
 Cairn installs an independent DeviceActivity expiry before lifting shields. Its
 existing schedule rounds up to the next minute, so actual re-lock can trail the

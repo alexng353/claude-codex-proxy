@@ -86,7 +86,7 @@ export function decideBedtime(state: GateState, input: { id?: unknown; reason?: 
 export function bedtimeFreeStatus(state: GateState, now: number) {
   const zone = zoneAt(now);
   const day = dayKey(now, zone);
-  const used = state.bedtime?.freeUnlocks?.find(r => r.day === day || dayKey(Date.parse(r.at), zone) === day);
+  const used = state.bedtime?.freeUnlocks?.find(r => r.day === day || dayKey(Date.parse(r.at), zone) === day || dayKey(now, r.zone) === r.day);
   return { available: !used, day, zone, ...(used ? { used_at: used.at } : {}) };
 }
 
