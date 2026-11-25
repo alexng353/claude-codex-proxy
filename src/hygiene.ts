@@ -1404,11 +1404,12 @@ function typedText(part: string): string {
     .replace(SENT_AT_STAMP, "");
 }
 
-/** Both old daemon-local stamps and device-local stamps with a daemon clock. */
+/** Old, device-local and coordinator phone-zone stamps coexist during rollout. */
 const STAMP_ZONE = String.raw`(?:[A-Z]{2,5}|UTC[+-]\d{1,2}(?::\d{2})?)`;
 const STAMP_CLOCK = String.raw`\d{1,2}:\d{2} ${STAMP_ZONE}`;
 const STAMP_DATE = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}`;
-const SENT_AT_STAMP = new RegExp(String.raw`^\[${STAMP_CLOCK} ${STAMP_DATE}(?: \(${STAMP_CLOCK}(?: ${STAMP_DATE})?\))?(?: · [\w.-]{1,32})?\]\s*`);
+const STAMP_ALEX = String.raw`(?: · Alex ${STAMP_CLOCK}, [A-Za-z0-9_+/-]{1,128})?`;
+const SENT_AT_STAMP = new RegExp(String.raw`^\[${STAMP_CLOCK} ${STAMP_DATE}(?: \(${STAMP_CLOCK}(?: ${STAMP_DATE})?\))?(?: · [\w.-]{1,32})?${STAMP_ALEX}\]\s*`);
 
 /**
  * Decides whether this request starts a turn Alex typed.
