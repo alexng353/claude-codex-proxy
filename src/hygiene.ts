@@ -1412,16 +1412,21 @@ function typedText(part: string): string {
 }
 
 /**
- * The part of a text part Alex wrote himself: nothing when the part is a
- * wrapper, else his text with every wrapped block in it removed (with the
- * stamp Today put before it). Today batched a worker's delegation into the
- * turn that carried his exact BYPASS phrase, and the whole text didn't match
- * (Bubble seq 201741, 2026-11-24).
+ * The part of a text part Alex wrote himself: his text up to the first
+ * wrapper opener (and the stamp Today put before it). Today batched a
+ * worker's delegation into the turn that carried his exact BYPASS phrase,
+ * and the whole text didn't match (Bubble seq 201741, 2026-11-24).
+ * Batched content always follows his text, so everything from the opener on
+ * is dropped: closing tags are never trusted, since a worker's JSON status
+ * can carry an unescaped one. An opener mid-line is not a batch: the part
+ * then has no text of his, so it fires no command.
  */
 function ownText(part: string): string {
   const typed = typedText(part);
-  if (SYNTHETIC_PREFIXES.some((prefix) => typed.startsWith(prefix))) return "";
-  return typed.replace(WRAPPED_BLOCK, "").trim();
+  const opener = typed.search(WRAPPER_OPENER);
+  if (opener < 0) return typed;
+  const before = typed.slice(0, opener).replace(TRAILING_STAMP, "");
+  return /(^|\n)[ \t]*$/.test(before) ? before.trim() : "";
 }
 
 /** Old, device-local and coordinator phone-zone stamps coexist during rollout. */
@@ -1431,10 +1436,15 @@ const STAMP_DATE = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}`;
 const STAMP_ALEX = String.raw`(?: · Alex ${STAMP_CLOCK}, [A-Za-z0-9_+/-]{1,128})?`;
 const STAMP = String.raw`\[${STAMP_CLOCK} ${STAMP_DATE}(?: \(${STAMP_CLOCK}(?: ${STAMP_DATE})?\))?(?: · [\w.-]{1,32})?${STAMP_ALEX}\]\s*`;
 const SENT_AT_STAMP = new RegExp(`^${STAMP}`);
-/** A wrapper an agent, script or Codex writes, as a block inside a text part; unclosed runs to the end. */
-const WRAPPED_BLOCK = new RegExp(
-  String.raw`(?:${STAMP})?<(codex_delegation|dthread_message|hook_prompt|subagent_notification|heartbeat|skill|codex_internal_context|turn_aborted|user_shell_command)(?=[\s/>])[\s\S]*?(?:<\/\1>|$)`,
-  "g",
+const TRAILING_STAMP = new RegExp(`${STAMP}$`);
+/** Where any synthetic wrapper (or relay markup) opens, with or without attributes or a self-close. */
+const WRAPPER_OPENER = new RegExp(
+  [...SYNTHETIC_PREFIXES, "<dthread_message>"]
+    .map((prefix) => {
+      const name = prefix.replace(/>$/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return prefix.startsWith("<") ? String.raw`${name}(?=[\s/>])` : name;
+    })
+    .join("|"),
 );
 
 /**

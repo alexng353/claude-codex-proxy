@@ -1311,15 +1311,24 @@ async function decideHumanTurn(
   // before; looser shapes only while the gate is armed, so a clear or open gate never
   // swallows ordinary text.
   const locked = outstanding(state, now).length > 0 && !bypassActive(state, now);
+  // A gate command batched with an agent's report: hold the turn, so the release
+  // after the reply wakes the chat for the report instead of dropping it.
+  const holdBatched = () => {
+    if (turn.own === turn.text) return;
+    const key = keys.get(turn.newest) ?? "";
+    holdMessage(statePath(), { thread, machine: origin.machine, key, at: new Date(now).toISOString(), text: turn.text, attachments: 0 });
+  };
   if (!turn.images.length && (isBareBypass(turn.own) || (locked && isBypassAttempt(turn.own)))) {
     const text = bypassReply(state, now, turn.own);
     saveState(state);
+    holdBatched();
     release(state, now, "BYPASS");
     return { action: "respond", text };
   }
   if (isDelayText(turn.own) && !turn.images.length) {
     const text = delayReply(state, now);
     saveState(state);
+    holdBatched();
     release(state, now, "DELAY");
     return { action: "respond", text };
   }
@@ -1329,6 +1338,7 @@ async function decideHumanTurn(
   if (move && (move.items !== null || move.gym || locked)) {
     const text = moveReply(state, now, move, `chat:${thread || "unknown"}`);
     saveState(state);
+    holdBatched();
     release(state, now, "MOVE");
     return { action: "respond", text };
   }
