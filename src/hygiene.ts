@@ -1392,6 +1392,12 @@ export type TurnClass =
       newest: number;
       /** What Alex typed, with Codex's attachment wrappers removed. */
       text: string;
+      /**
+       * Only Alex's own segment: `text` without any part or block an agent or
+       * script wrote (a delegation Today batched into his turn). Gate commands
+       * (BYPASS, DELAY, LATER) are matched against this.
+       */
+      own: string;
       images: TurnImage[];
     };
 
@@ -1405,12 +1411,31 @@ function typedText(part: string): string {
     .replace(SENT_AT_STAMP, "");
 }
 
+/**
+ * The part of a text part Alex wrote himself: nothing when the part is a
+ * wrapper, else his text with every wrapped block in it removed (with the
+ * stamp Today put before it). Today batched a worker's delegation into the
+ * turn that carried his exact BYPASS phrase, and the whole text didn't match
+ * (Bubble seq 201741, 2026-11-24).
+ */
+function ownText(part: string): string {
+  const typed = typedText(part);
+  if (SYNTHETIC_PREFIXES.some((prefix) => typed.startsWith(prefix))) return "";
+  return typed.replace(WRAPPED_BLOCK, "").trim();
+}
+
 /** Old, device-local and coordinator phone-zone stamps coexist during rollout. */
 const STAMP_ZONE = String.raw`(?:[A-Z]{2,5}|UTC[+-]\d{1,2}(?::\d{2})?)`;
 const STAMP_CLOCK = String.raw`\d{1,2}:\d{2} ${STAMP_ZONE}`;
 const STAMP_DATE = String.raw`[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}`;
 const STAMP_ALEX = String.raw`(?: · Alex ${STAMP_CLOCK}, [A-Za-z0-9_+/-]{1,128})?`;
-const SENT_AT_STAMP = new RegExp(String.raw`^\[${STAMP_CLOCK} ${STAMP_DATE}(?: \(${STAMP_CLOCK}(?: ${STAMP_DATE})?\))?(?: · [\w.-]{1,32})?${STAMP_ALEX}\]\s*`);
+const STAMP = String.raw`\[${STAMP_CLOCK} ${STAMP_DATE}(?: \(${STAMP_CLOCK}(?: ${STAMP_DATE})?\))?(?: · [\w.-]{1,32})?${STAMP_ALEX}\]\s*`;
+const SENT_AT_STAMP = new RegExp(`^${STAMP}`);
+/** A wrapper an agent, script or Codex writes, as a block inside a text part; unclosed runs to the end. */
+const WRAPPED_BLOCK = new RegExp(
+  String.raw`(?:${STAMP})?<(codex_delegation|dthread_message|hook_prompt|subagent_notification|heartbeat|skill|codex_internal_context|turn_aborted|user_shell_command)(?=[\s/>])[\s\S]*?(?:<\/\1>|$)`,
+  "g",
+);
 
 /**
  * Decides whether this request starts a turn Alex typed.
@@ -1471,11 +1496,15 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
   if (!human.length)
     return turnUsers.length ? { type: "exempt", reason: "no human-written message" } : { type: "continuation" };
   const texts: string[] = [];
+  const own: string[] = [];
   const images: TurnImage[] = [];
   for (const index of human) {
     const typed = dthread.get(index);
     if (typed !== undefined) {
-      if (typed) texts.push(typed);
+      if (typed) {
+        texts.push(typed);
+        own.push(typed);
+      }
       continue;
     }
     partsOf(input[index]).forEach((part, partIndex) => {
@@ -1484,10 +1513,12 @@ export function classifyTurn(request: ResponsesRequest, extraGatedTriggers: stri
       else if (typeof part.text === "string") {
         const typed = typedText(part.text);
         if (typed) texts.push(typed);
+        const mine = ownText(part.text);
+        if (mine) own.push(mine);
       }
     });
   }
-  return { type: "human", newest: human.at(-1)!, text: texts.join("\n").trim(), images };
+  return { type: "human", newest: human.at(-1)!, text: texts.join("\n").trim(), own: own.join("\n").trim(), images };
 }
 
 // ---- Message keys (byte-stable note placement) ----

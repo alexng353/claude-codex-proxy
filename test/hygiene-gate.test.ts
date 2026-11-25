@@ -969,6 +969,21 @@ describe("held messages wake their chat when the gate unlocks", () => {
     expect((await decide(request([env, user("still there?"), assistant("ok"), user("next")]))).action).toBe("forward");
   });
 
+  test("DELAY with a batched delegation, during a check, waits for the gate instead of being held", async () => {
+    let release!: () => void;
+    classifyBlock = new Promise((resolve) => (release = resolve));
+    verdicts.push(teeth);
+    const pending = cairnTeeth("cairn-teeth");
+    while (classified === 0) await Bun.sleep(5);
+    const delegation = "<codex_delegation>\n  <input>worker report</input>\n</codex_delegation>";
+    const delay = decide(request([env, user("[06:01 WIB Thu Oct 8 (16:01 MST) · mac] DELAY", delegation)]));
+    const during = await Promise.race([delay, Bun.sleep(200).then(() => null)]);
+    release();
+    expect(during).toBeNull();
+    expect(text(await delay)).not.toContain("photo received, checking");
+    expect((await pending).result).toBe("pass");
+  });
+
   test("a duplicate unlock never wakes twice, and a retried send reuses its id", async () => {
     expect(text(await decide(request([env, user("fix the bug")])))).toContain("gate armed");
     wakeResults = ["retry", "sent"];
@@ -2040,6 +2055,89 @@ describe("BYPASS phrase (Alex, 2026-11-04: three random words, new every lock)",
     expect(text(await decide(request([env, user("DELAY")])))).toStartWith("⏰ delay");
     clock = at(DAY, "09:46");
     expect(text(await decide(request([env, user("back")])))).toContain("BYPASS cedar comet tulip.");
+  });
+});
+
+/**
+ * Today batches a worker's report into the turn Alex is typing in: one user
+ * message whose parts are his stamped text and the `<codex_delegation>`
+ * (Bubble seq 201741, Nov 24 21:08 MST, where his exact phrase was refused).
+ * Gate commands read only his own segment.
+ */
+describe("gate commands batched with a delegation (q gate-bypass-own-segment)", () => {
+  const STAMP = "[11:08 WIB Wed Nov 25 (21:08 MST) · mac]";
+  const delegation = (input: string) =>
+    `<codex_delegation>\n  <source_thread_id>01a210d5-3f16-7590-9c3c-9373f12afd29</source_thread_id>\n  <sent_at>21:08 MST Tue Nov 24</sent_at>\n  <input>${input}</input>\n</codex_delegation>`;
+  const REPORT = delegation("Live Hetzner verification: jina-reader is 2/2 Ready.\n\n| ID | Meaning |\n|---|---|\n| PF-1391 | Check Jina | Done |");
+  // As the app server sent it (two parts), and joined into one text part.
+  const SHAPES: Array<[string, (alex: string, report?: string) => ResponseInputItem]> = [
+    ["two parts", (alex, report = REPORT) => user(`${STAMP} ${alex}`, report)],
+    ["one joined part", (alex, report = REPORT) => user(`${STAMP} ${alex}\n${report}`)],
+  ];
+  const lockText = async () => text(await decide(request([env, user("hi")])))!;
+
+  for (const [shape, batched] of SHAPES) {
+    describe(shape, () => {
+      test("the exact phrase opens the gate", async () => {
+        clock = at(DAY, "06:00");
+        await lockText();
+        expect(text(await decide(request([env, batched(BYPASS)])))).toBe("🚪 bypass #1: gate open until 07:00. Your next turn will ask why.");
+        expect(gateStatus()).toMatchObject({ state: "bypassed", bypass: { count: 1 } });
+      });
+
+      test("a wrong phrase is refused with the usual reply", async () => {
+        clock = at(DAY, "06:00");
+        const lock = await lockText();
+        expect(text(await decide(request([env, batched("BYPASS cedar comet tulip")])))).toBe(`🔑 That isn't this lock's BYPASS phrase.\n${lock}`);
+        expect(gateStatus()).toMatchObject({ state: "armed", bypass: { count: 0 } });
+      });
+
+      test("a bare BYPASS is answered as a bare BYPASS, locked or clear", async () => {
+        clock = at(DAY, "04:00");
+        expect(text(await decide(request([env, batched("BYPASS")])))).toBe("✅ gate is already clear; no bypass used.");
+        clock = at(DAY, "06:00");
+        const lock = await lockText();
+        expect(text(await decide(request([env, batched("BYPASS")])))).toBe(`🔑 BYPASS needs this lock's three words.\n${lock}`);
+      });
+
+      test("DELAY and LATER are gate replies", async () => {
+        clock = at(DAY, "07:45");
+        await lockText();
+        expect(text(await decide(request([env, batched("DELAY")])))).toBe("⏰ delay: gate open until 09:45. Send the teeth photo before then.");
+        clock = at(DAY, "09:46");
+        await lockText();
+        expect(text(await decide(request([env, batched("LATER 21:00")])))).toContain("moved");
+      });
+
+      test("the phrase inside the delegation, with no text of Alex's, never opens the gate", async () => {
+        clock = at(DAY, "06:00");
+        const lock = await lockText();
+        // Only the stamp is his: his own segment is empty.
+        // Joined into one part, a bare stamp leaves the whole part the delegation's: it is forwarded.
+        for (const input of [BYPASS, "DELAY", "LATER 21:00"])
+          expect([lock, null]).toContain(text(await decide(request([env, batched("", delegation(input))]))));
+        expect(gateStatus().delay.count).toBe(0);
+        expect(gateStatus()).toMatchObject({ state: "armed", bypass: { count: 0 } });
+      });
+    });
+  }
+
+  test("a delegation alone is still the agent's: forwarded, never a BYPASS", async () => {
+    clock = at(DAY, "06:00");
+    await lockText();
+    expect((await decide(request([env, user(delegation(BYPASS))], "app_tool_send_message"))).action).toBe("forward");
+    expect((await decide(request([env, user(`${STAMP} ${delegation(BYPASS)}`)]))).action).toBe("forward");
+    expect(gateStatus().bypass.count).toBe(0);
+  });
+
+  test("a single stamped message works as before, old and device-local stamps", async () => {
+    clock = at(DAY, "06:00");
+    const lock = await lockText();
+    expect(text(await decide(request([env, user(`${STAMP} BYPASS`)])))).toBe(`🔑 BYPASS needs this lock's three words.\n${lock}`);
+    expect(text(await decide(request([env, user(`[06:01 PDT Thu Oct 8] ${BYPASS}`)])))).toStartWith("🚪 bypass #1");
+    clock = at(DAY, "07:01");
+    await lockText();
+    expect(text(await decide(request([env, user(`${STAMP} BYPASS cedar comet tulip`)])))).toStartWith("🚪 bypass #2");
   });
 });
 

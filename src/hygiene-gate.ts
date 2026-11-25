@@ -1271,7 +1271,7 @@ function checkingReply(
   state: GateState,
   origin: GateOrigin,
 ): GateDecision | null {
-  if (turn.images.length || isBypassAttempt(turn.text) || isDelayText(turn.text) || parseMoveText(turn.text)) return null;
+  if (turn.images.length || isBypassAttempt(turn.own) || isDelayText(turn.own) || parseMoveText(turn.own)) return null;
   const now = deps.now();
   if (!armed(state, now) || !photoChecking(statePath())) return null;
   const key = messageKeys(request.input as ResponseInputItem[]).get(turn.newest) ?? "";
@@ -1311,19 +1311,19 @@ async function decideHumanTurn(
   // before; looser shapes only while the gate is armed, so a clear or open gate never
   // swallows ordinary text.
   const locked = outstanding(state, now).length > 0 && !bypassActive(state, now);
-  if (!turn.images.length && (isBareBypass(turn.text) || (locked && isBypassAttempt(turn.text)))) {
-    const text = bypassReply(state, now, turn.text);
+  if (!turn.images.length && (isBareBypass(turn.own) || (locked && isBypassAttempt(turn.own)))) {
+    const text = bypassReply(state, now, turn.own);
     saveState(state);
     release(state, now, "BYPASS");
     return { action: "respond", text };
   }
-  if (isDelayText(turn.text) && !turn.images.length) {
+  if (isDelayText(turn.own) && !turn.images.length) {
     const text = delayReply(state, now);
     saveState(state);
     release(state, now, "DELAY");
     return { action: "respond", text };
   }
-  const move = turn.images.length ? null : parseMoveText(turn.text);
+  const move = turn.images.length ? null : parseMoveText(turn.own);
   // An unnamed LATER is a gate reply only while the gate shows a lock, so a clear or bypassed
   // gate never swallows "later 5pm" meant for the chat. A named item (MOVE teeth 08:00) always is.
   if (move && (move.items !== null || move.gym || locked)) {
