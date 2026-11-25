@@ -2146,26 +2146,30 @@ describe("gate commands batched with a delegation (q gate-bypass-own-segment)", 
     expect(text(await decide(request([env, user(`${STAMP} DELAY\n<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>`)])))).toStartWith("⏰ delay");
   });
 
-  test("a report batched with a command the gate answers wakes the chat, locked or clear", async () => {
+  test("a report batched with a command the gate answers wakes the chat with a pointer, locked or clear", async () => {
+    // The report stays in the chat's history; the wake points at it instead of quoting it
+    // (held text is cut at 1,500 characters, and the held listing reads as Alex's).
+    const long = delegation(`jina-reader report ${"x".repeat(3000)} TAIL-MARKER`);
     const woken = async () => {
       await flushWakes();
       const all = wakes.map((w) => w.text).join("\n");
       wakes = [];
-      return all;
+      expect(all).toContain("(not from Alex) An agent or script report arrived in the same message as Alex's gate command");
+      for (const quoted of ["jina-reader", "TAIL-MARKER", PHRASES[0]]) expect(all).not.toContain(quoted);
     };
     clock = at(DAY, "04:00");
-    expect(text(await decide(request([env, user(`${STAMP} BYPASS`, REPORT)])))).toBe("✅ gate is already clear; no bypass used.");
-    expect(await woken()).toContain("jina-reader is 2/2 Ready");
+    expect(text(await decide(request([env, user(`${STAMP} BYPASS`, long)])))).toBe("✅ gate is already clear; no bypass used.");
+    await woken();
     clock = at(DAY, "04:01");
-    await decide(request([env, user(`${STAMP} DELAY`, REPORT)]));
-    expect(await woken()).toContain("jina-reader is 2/2 Ready");
+    await decide(request([env, user(`${STAMP} DELAY`, long)]));
+    await woken();
     clock = at(DAY, "06:00");
     await lockText();
-    expect(text(await decide(request([env, user(`${STAMP} ${BYPASS}`, REPORT)])))).toStartWith("🚪 bypass #1");
-    expect(await woken()).toContain("jina-reader is 2/2 Ready");
+    expect(text(await decide(request([env, user(`${STAMP} ${BYPASS}`, long)])))).toStartWith("🚪 bypass #1");
+    await woken();
     clock = at(DAY, "06:01");
-    expect(text(await decide(request([env, user(`${STAMP} MOVE teeth 21:00`, REPORT)])))).toContain("moved");
-    expect(await woken()).toContain("jina-reader is 2/2 Ready");
+    expect(text(await decide(request([env, user(`${STAMP} MOVE teeth 21:00`, long)])))).toContain("moved");
+    await woken();
   });
 
   test("a delegation alone is still the agent's: forwarded, never a BYPASS", async () => {
