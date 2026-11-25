@@ -366,3 +366,85 @@ test("missing wake queue marker retries after a failed enqueue and restart", asy
   expect(loadState().bedtime!.requests[0].notificationQueuedAt).toBe(iso(START));
   expect(JSON.parse(readFileSync(path, "utf8")).wakes).toHaveLength(1);
 });
+
+const free = (id = "free-1") => api("/bedtime/free", { id });
+async function jakarta(at = START) {
+  clock = at;
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  await noteDeviceZone("Asia/Jakarta");
+}
+test("free bedtime grants fifteen minutes, audits identity and never charges or touches other filters", async () => {
+  await jakarta();
+  const before = structuredClone(loadState());
+  const signature = shieldSignature();
+  expect((await status()).body.bedtime_free).toMatchObject({ available: true, day: "2026-11-25", zone: "Asia/Jakarta" });
+  const r = await free();
+  expect(r.code).toBe(200);
+  expect(r.body.gate.bedtime_unlock_until).toBe(iso(clock + 15 * MIN));
+  expect(r.body.gate.bedtime_free).toMatchObject({ available: false, used_at: iso(clock) });
+  expect(loadState().bypass).toEqual(before.bypass);
+  expect(loadState().debts).toEqual(before.debts);
+  expect(loadState().adultFilter).toEqual(before.adultFilter);
+  expect(r.body.gate.adult_filter_unlock_until).toBeUndefined();
+  expect(loadState().bedtime?.freeUnlocks).toEqual([{ id: "free-1", by: "cairn:phone", at: iso(clock), until: iso(clock + 15 * MIN), zone: "Asia/Jakarta", day: "2026-11-25" }]);
+  expect(shieldSignature()).not.toBe(signature);
+  await flushWakes();
+  expect(wakes).toHaveLength(0);
+});
+test("free limit survives restart, concurrent taps and expired id replay; bypass still charges", async () => {
+  await jakarta();
+  const results = await Promise.all([free(), free("other")]);
+  expect(results.map(r => r.code).sort()).toEqual([200, 409]);
+  clock += 16 * MIN;
+  resetGateCache();
+  expect((await free()).body.duplicate).toBe(true);
+  expect((await status()).body.bedtime_unlock_until).toBeUndefined();
+  expect((await free("second")).code).toBe(409);
+  await api("/bedtime/bypass", { phrase: "BYPASS" });
+  expect((await api("/bedtime/bypass", { phrase: "BYPASS apple birch cloud" })).body.granted).toBe(true);
+  expect(loadState().bypass.count).toBe(1);
+  expect(loadState().debts).toHaveLength(1);
+});
+test("Jakarta midnight renews free allowance and a straddling grant belongs to its start day", async () => {
+  await jakarta(Date.parse("2026-11-25T16:55:00Z"));
+  expect((await free()).code).toBe(200);
+  clock = Date.parse("2026-11-25T17:00:00Z");
+  expect((await status()).body.bedtime_free).toMatchObject({ available: true, day: "2026-11-26" });
+  expect((await free("next")).code).toBe(409); // Don't consume or extend an active grant.
+  clock += 10 * MIN;
+  expect((await free("next")).code).toBe(200);
+  expect(loadState().bedtime?.freeUnlocks).toHaveLength(2);
+});
+test("zone change within the day does not restore a spent free unlock", async () => {
+  await jakarta(Date.parse("2026-11-25T09:00:00Z"));
+  await free();
+  clock += 16 * MIN;
+  const { noteDeviceZone } = await import("../src/hygiene-gate");
+  await noteDeviceZone("Asia/Tokyo");
+  expect((await status()).body.bedtime_free.available).toBe(false);
+  expect((await free("tokyo")).code).toBe(409);
+});
+test("active paid grant preserves free allowance; invalid or unauthorized requests do nothing", async () => {
+  await jakarta();
+  await request(); await decide();
+  const until = loadState().bedtime?.unlockUntil;
+  expect((await free()).code).toBe(409);
+  expect(loadState().bedtime?.unlockUntil).toBe(until);
+  expect((await status()).body.bedtime_free.available).toBe(true);
+  clock += 15 * MIN;
+  for (const body of [null, {}, { id: "bad/id" }]) expect((await api("/bedtime/free", body)).code).toBe(400);
+  expect((await api("/bedtime/free", { id: "x" }, "agent")).code).toBe(403);
+  expect((await free()).code).toBe(200);
+});
+
+test("proxy ends the grant during the phone's minute-rounding tail; free stays spent and paid bypass still works", async () => {
+  await jakarta(Date.parse("2026-11-25T16:30:37Z"));
+  await free();
+  clock += 15 * MIN + 1;
+  expect((await status()).body.bedtime_unlock_until).toBeUndefined();
+  expect((await free("tail")).code).toBe(409);
+  await api("/bedtime/bypass", { phrase: "BYPASS" });
+  expect((await api("/bedtime/bypass", { phrase: "BYPASS apple birch cloud" })).body.granted).toBe(true);
+  expect(loadState().bypass.count).toBe(1);
+  expect(loadState().debts).toHaveLength(1);
+});

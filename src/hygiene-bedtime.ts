@@ -1,5 +1,6 @@
 /** Phone bedtime exceptions share the debt ledger, but never the hygiene unlock. */
-import { recordBypass, type GateState } from "./hygiene";
+import { recordBypass, zoneAt, type GateState } from "./hygiene";
+import { dayKey } from "./zone";
 import { ensurePhrase, matchesPhrase, retire } from "./bypass-phrase";
 
 export const BEDTIME_OWNER = "0b7c3073-04a4-404f-87d1-50e7f6359ba1";
@@ -79,4 +80,28 @@ export function decideBedtime(state: GateState, input: { id?: unknown; reason?: 
     entry.unlockUntil = state.bedtime!.unlockUntil;
   }
   return { ok: true, id: entry.id, status: decision, duplicate: false, message: approve ? `Bedtime unlocked until ${entry.unlockUntil}.` : "Bedtime request denied." };
+}
+
+/** Travel never renews a receipt for the same date, or one within today's local interval. */
+export function bedtimeFreeStatus(state: GateState, now: number) {
+  const zone = zoneAt(now);
+  const day = dayKey(now, zone);
+  const used = state.bedtime?.freeUnlocks?.find(r => r.day === day || dayKey(Date.parse(r.at), zone) === day);
+  return { available: !used, day, zone, ...(used ? { used_at: used.at } : {}) };
+}
+
+export function freeBedtime(state: GateState, input: { id?: unknown }, by: string, now: number): BedtimeResult {
+  if (typeof input?.id !== "string" || !ID.test(input.id)) return fail(400, "id must be 1-80 letters, digits, . _ : -");
+  const b = bedtimeState(state);
+  const old = b.freeUnlocks?.find(r => r.id === input.id && r.by === by);
+  if (old) return { ok: true, id: old.id, duplicate: true, granted: Date.parse(old.until) > now, message: "Free unlock already recorded." };
+  const today = bedtimeFreeStatus(state, now);
+  if (!today.available) return fail(409, "Today's free unlock is used.");
+  if (bedtimeUnlockUntil(state, now)) return fail(409, "Bedtime is already unlocked. Your free unlock is still available.");
+  const at = new Date(now).toISOString();
+  const until = new Date(now + BEDTIME_MS).toISOString();
+  (b.freeUnlocks ??= []).push({ id: input.id, by, at, until, zone: today.zone, day: today.day });
+  b.unlockUntil = until;
+  retire(b);
+  return { ok: true, id: input.id, granted: true, duplicate: false, message: "Bedtime unlocked for 15 minutes." };
 }

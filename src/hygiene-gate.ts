@@ -10,7 +10,7 @@
  */
 import { adultFilterUnlockUntil, bypassAdultFilter } from "./hygiene-adult-filter";
 import { screenTimeView, storeScreenTime, type ScreenTimeReport } from "./hygiene-screen-time";
-import { BEDTIME_MS, BEDTIME_OWNER, bedtimeUnlockUntil, bypassBedtime, chargeBedtime, decideBedtime, requestBedtime, type BedtimeResult } from "./hygiene-bedtime";
+import { BEDTIME_MS, BEDTIME_OWNER, bedtimeFreeStatus, freeBedtime, bedtimeUnlockUntil, bypassBedtime, chargeBedtime, decideBedtime, requestBedtime, type BedtimeResult } from "./hygiene-bedtime";
 import { createHash } from "node:crypto";
 import { readFixStatus, type FixRef } from "./hygiene-fix";
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -914,11 +914,12 @@ function queueBedtimeRequests(state: GateState): void {
   }
 }
 
-export async function bedtimeAction(action: "request" | "bypass" | "approve" | "deny", input: Record<string, unknown>, by?: string): Promise<BedtimeResult> {
+export async function bedtimeAction(action: "free" | "request" | "bypass" | "approve" | "deny", input: Record<string, unknown>, by?: string): Promise<BedtimeResult> {
   const result = await serialized(async () => {
     const state = structuredClone(loadState());
     const now = deps.now();
-    const result = action === "request" ? requestBedtime(state, input, by!, now)
+    const result = action === "free" ? freeBedtime(state, input, by!, now)
+      : action === "request" ? requestBedtime(state, input, by!, now)
       : action === "bypass" ? bypassBedtime(state, input.phrase, now, deps.bypassWords)
       : decideBedtime(state, input, action === "approve", now);
     if (result.ok) {
@@ -1655,6 +1656,7 @@ export function gateStatus() {
   const gateState = disabled ? "disabled" : due.length === 0 ? "clear" : bypass ? "bypassed" : "armed";
   return {
     screen_time: screenTimeView(state, now),
+    bedtime_free: bedtimeFreeStatus(state, now),
     ...(adultFilterUnlockUntil(state, now) ? { adult_filter_unlock_until: adultFilterUnlockUntil(state, now) } : {}),
     ...(bedtimeUnlockUntil(state, now) ? { bedtime_unlock_until: bedtimeUnlockUntil(state, now) } : {}),
     enabled: !disabled,

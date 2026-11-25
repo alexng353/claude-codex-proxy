@@ -111,6 +111,7 @@ function status() {
   return {
     ...(s.adult_filter_unlock_until ? { adult_filter_unlock_until: s.adult_filter_unlock_until } : {}),
     ...(s.bedtime_unlock_until ? { bedtime_unlock_until: s.bedtime_unlock_until } : {}),
+    bedtime_free: s.bedtime_free,
     enabled: s.enabled,
     state: s.state,
     badge: s.badge,
@@ -198,12 +199,12 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     return json(status());
   }
 
-  if ((path === "/bedtime/request" || path === "/bedtime/bypass") && request.method === "POST") {
+  if ((path === "/bedtime/free" || path === "/bedtime/request" || path === "/bedtime/bypass") && request.method === "POST") {
     if (gateDisabled()) return json({ error: "hygiene gate is disabled" }, 503);
     let body;
     try { body = await request.json(); } catch { return json({ error: "body must be JSON" }, 400); }
     if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "body must be an object" }, 400);
-    const result = await bedtimeAction(path === "/bedtime/request" ? "request" : "bypass", body, `cairn:${who.id}`);
+    const result = await bedtimeAction(path === "/bedtime/free" ? "free" : path === "/bedtime/request" ? "request" : "bypass", body, `cairn:${who.id}`);
     return result.ok ? json({ ...result, gate: status() }) : json({ error: result.error }, result.statusCode);
   }
 

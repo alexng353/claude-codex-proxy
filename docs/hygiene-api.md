@@ -280,6 +280,31 @@ omitted when there is no active grant. During its local bedtime schedule, the
 phone stays shielded unless it has an unexpired grant or its own emergency tap.
 The phone must schedule expiry locally; push delivery is not guaranteed.
 
+### POST /bedtime/free
+
+Phone-authenticated `{ "id": "stable-request-id" }` grants one free 15-minute
+bedtime unlock per local calendar day. The gate uses its phone-zone history and
+system tzdata. `bedtime_free` in status contains `available`, `day`, `zone`, and
+`used_at` when used; `bedtime_unlock_until` carries the existing grant.
+
+This writes a receipt (`id`, authenticated `by`, `at`, `until`, `zone`, `day`) in
+`bedtime.freeUnlocks`, with no debt, bypass count, Bubble ruling, hygiene unlock,
+or adult-filter pause. Retrying the same caller/id returns the original receipt
+without extending it, even after expiry. A different request that day returns
+409; the existing paid BYPASS path is unchanged. An active bedtime grant also
+returns 409 without consuming the allowance.
+
+A grant straddling midnight belongs to its start day. After a zone change, a
+receipt consumes the allowance if its recorded calendar date matches today or
+its start falls within today's interval in the new zone. Moving the clock's zone
+therefore cannot restore a free unlock within the same day.
+
+Cairn installs an independent DeviceActivity expiry before lifting shields. Its
+existing schedule rounds up to the next minute, so actual re-lock can trail the
+proxy expiry by less than a minute plus iOS callback delivery time. The proxy
+already considers the grant expired in that tail, and the free allowance stays
+used. Physical-device delivery while the app is killed requires device testing.
+
 ### POST /bedtime/request
 
 ```json

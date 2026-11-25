@@ -239,6 +239,7 @@ export type GateState = {
   /** Phone-only bedtime grants; never opens the hygiene gate. */
   bedtime?: {
     unlockUntil?: string;
+    freeUnlocks?: Array<{ id: string; by: string; at: string; until: string; zone: string; day: string }>;
     /** Retain receipts so an expired id can never become a new pending request on replay. */
     requests: Array<{
       id: string; reason: string; at: string; by: string;
