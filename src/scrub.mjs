@@ -27,16 +27,6 @@ const CREDENTIAL_KEY =
 
 /** Token shapes that are secrets wherever they appear. */
 const PATTERNS = [
-  [
-    /-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY( BLOCK)?-----[\s\S]*?-----END \1PRIVATE KEY\2-----/g,
-    "private-key",
-  ],
-  // A truncated PEM or PGP armor block still leaks its body. PGP armor may
-  // open with `Comment: ...` style header lines.
-  [
-    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:\s*[A-Za-z][A-Za-z-]*: [^\n]*)*(?:\s*[A-Za-z0-9+/=]{16,})+/g,
-    "private-key",
-  ],
   [/\b(?:gh[pousr]_[A-Za-z0-9]{36,251}|github_pat_[A-Za-z0-9_]{22,251})\b/g, "github-token"],
   [/\bnpm_[A-Za-z0-9]{36}\b/g, "npm-token"],
   [/\bhf_[A-Za-z0-9]{30,}\b/g, "huggingface-token"],
@@ -53,9 +43,139 @@ const PATTERNS = [
  * it covers prefixless tokens such as Cloudflare API tokens and R2/AWS
  * secret keys. The value must mix letters and digits so prose such as
  * `max_tokens: unlimited` is left alone.
+ *
+ * NAME is a whole word (the separator starts with a non-word character) with
+ * a keyword after its first character. The lookahead checks the keyword
+ * before NAME is matched: written as `[A-Za-z0-9_]*(?:TOKEN|...)[A-Za-z0-9_]*`
+ * the regex backtracked through the word once per keyword in it, quadratic on
+ * one long run (200k of `password`: 7.6 s on e55bfb3).
  */
 const ASSIGNMENT =
-  /\b([A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|_PAT|AUTH_KEY)[A-Za-z0-9_]*)(["']?\s*[=:]\s*["']?)([^\s"'`$\\,;)}\]]{12,})/gi;
+  /\b(?=[A-Za-z_][A-Za-z0-9_]*?(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|_PAT|AUTH_KEY))([A-Za-z_][A-Za-z0-9_]*)(["']?\s*[=:]\s*["']?)([^\s"'`$\\,;)}\]]{12,})/gi;
+
+const PRIVATE_KEY_MARKER = "[REDACTED:private-key]";
+const ARMOR_LABEL = /[A-Z0-9 ]*/y;
+
+/**
+ * `-----BEGIN <label>-----` or `-----END <label>-----` at `at`, where the label
+ * is `[A-Z0-9 ]*PRIVATE KEY` with an optional ` BLOCK`. The label runs to the
+ * first character outside `[A-Z0-9 ]`, so it is the only one that can match.
+ */
+function armorLine(text, at, word) {
+  const from = at + word.length;
+  ARMOR_LABEL.lastIndex = from;
+  ARMOR_LABEL.exec(text);
+  const to = ARMOR_LABEL.lastIndex;
+  const label = text.slice(from, to);
+  if (!text.startsWith("-----", to)) return null;
+  if (!label.endsWith("PRIVATE KEY") && !label.endsWith("PRIVATE KEY BLOCK")) return null;
+  return { label, end: to + 5 };
+}
+
+/**
+ * Whole armored private keys: each BEGIN through the first END with the same
+ * label. Same result as
+ * /-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY( BLOCK)?-----[\s\S]*?-----END \1PRIVATE KEY\2-----/g,
+ * whose lazy body re-read the rest of the text for every unclosed BEGIN.
+ */
+function redactArmoredKeys(text) {
+  if (!text.includes("-----BEGIN ")) return text;
+  const ends = new Map();
+  for (let at = text.indexOf("-----END "); at >= 0; at = text.indexOf("-----END ", at + 1)) {
+    const line = armorLine(text, at, "-----END ");
+    if (!line) continue;
+    if (!ends.has(line.label)) ends.set(line.label, { next: 0, at: [] });
+    ends.get(line.label).at.push([at, line.end]);
+  }
+  let out = "", copied = 0;
+  for (let at = text.indexOf("-----BEGIN "); at >= 0;) {
+    const line = armorLine(text, at, "-----BEGIN ");
+    const closing = line && ends.get(line.label);
+    if (closing) {
+      // BEGINs are visited left to right, so the first END at or after each
+      // one only moves forward.
+      while (closing.next < closing.at.length && closing.at[closing.next][0] < line.end) closing.next++;
+      if (closing.next < closing.at.length) {
+        out += text.slice(copied, at) + PRIVATE_KEY_MARKER;
+        copied = closing.at[closing.next][1];
+        at = text.indexOf("-----BEGIN ", copied);
+        continue;
+      }
+    }
+    at = text.indexOf("-----BEGIN ", at + 1);
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
+
+const isSpace = (c) => /\s/.test(c);
+const isLetter = (c) => /[A-Za-z]/.test(c);
+const isLetterOrDash = (c) => /[A-Za-z-]/.test(c);
+const isBase64 = (c) => /[A-Za-z0-9+/=]/.test(c);
+
+/**
+ * A truncated PEM or PGP armor block still leaks its body. PGP armor may open
+ * with `Comment: ...` style header lines. Same result as
+ * /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:\s*[A-Za-z][A-Za-z-]*: [^\n]*)*(?:\s*[A-Za-z0-9+/=]{16,})+/g,
+ * which backtracked exponentially over `a: a: a: ...` after a header.
+ *
+ * That regex, after a header ending at p, tries header lines first: skip
+ * whitespace, `Name: `, then the rest of the line from its longest to its
+ * shortest, recursing at each end r; only when none succeeds does it try the
+ * body at p. So from any position r the outcome is fixed:
+ *   at(r) = the outcome at the rightmost success R in [q, end of q's line],
+ *           where q follows `Name: ` after r, if there is one;
+ *           otherwise body(r): skip whitespace, a run of 16+ base64
+ *           characters, and every following such run (the match end), or none.
+ * One right-to-left pass computes it for every position.
+ */
+function redactTruncatedArmor(text) {
+  if (!text.includes("-----BEGIN ")) return text;
+  const headers = [];
+  for (let at = text.indexOf("-----BEGIN "); at >= 0; at = text.indexOf("-----BEGIN ", at + 1)) {
+    const line = armorLine(text, at, "-----BEGIN ");
+    if (line) headers.push([at, line.end]);
+  }
+  if (headers.length === 0) return text;
+  const n = text.length;
+  const base = headers[0][1];
+  const size = n - base + 1;
+  const body = new Int32Array(size); // match end of body(r), or -1
+  const lineEnd = new Int32Array(size);
+  const outcome = new Map(); // header end -> match end, or -1
+  const wanted = new Set(headers.map(([, end]) => end));
+  const rightmost = new Map(); // line end -> outcome at the rightmost success on that line
+  let eol = n, run = n, word = n, next = n, nextRun = n, nextWord = n;
+  for (let r = n; r >= base; r--) {
+    const c = r < n ? text[r] : "";
+    if (r === n || c === "\n") eol = r;
+    run = r < n && isBase64(c) ? run : r;
+    word = r < n && isLetterOrDash(c) ? word : r;
+    if (r === n || !isSpace(c)) {
+      next = r;
+      nextRun = run;
+      nextWord = word;
+    }
+    lineEnd[r - base] = eol;
+    body[r - base] = nextRun - next >= 16 ? (nextRun < n && body[nextRun - base] >= 0 ? body[nextRun - base] : nextRun) : -1;
+    let result = body[r - base];
+    if (next < n && isLetter(text[next]) && text[nextWord] === ":" && text[nextWord + 1] === " ") {
+      const q = nextWord + 2;
+      const hit = rightmost.get(q <= n ? lineEnd[q - base] : -1);
+      if (hit && hit.at >= q) result = hit.end;
+    }
+    if (result >= 0 && !rightmost.has(eol)) rightmost.set(eol, { at: r, end: result });
+    if (wanted.has(r)) outcome.set(r, result);
+  }
+  let out = "", copied = 0;
+  for (const [at, end] of headers) {
+    if (at < copied) continue;
+    const stop = outcome.get(end);
+    if (stop < 0) continue;
+    out += text.slice(copied, at) + PRIVATE_KEY_MARKER;
+    copied = stop;
+  }
+  return copied === 0 ? text : out + text.slice(copied);
+}
 
 // OAuth assignments occur in shell traces, JSON and JSON serialized inside JSON.
 // Parse the value as one word so redaction cannot consume code or leave a tail.
@@ -444,6 +564,7 @@ export function createScrubber(options = {}) {
     refresh();
     let out = scrubOAuthAssignments(text);
     if (literal) out = out.replace(literal, (value) => `[REDACTED:${labels.get(value)}]`);
+    out = redactTruncatedArmor(redactArmoredKeys(out));
     for (const [pattern, label] of PATTERNS)
       out = out.replace(pattern, `[REDACTED:${label}]`);
     out = out.replace(ASSIGNMENT, (whole, name, separator, value) =>
