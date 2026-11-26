@@ -134,6 +134,9 @@ const corpus = [
   `${PEM} PRIVATE KEY-----\nA: x\r!${repeat("QUJDREVGR0hJSktM", 16)}\n!`,
   `${PEM} PRIVATE KEY----- ${B64.slice(0, 40)}`,
   `${PEM} PRIVATE KEY-----　${B64.slice(0, 40)}`,
+  // Digits are part of a label: `[A-Z0-9 ]`.
+  `${PEM} PKCS8 PRIVATE KEY-----\n${B64.slice(0, 64)}\n${PEM_END} PKCS8 PRIVATE KEY-----\nafter`,
+  `${PEM} X509 2 PRIVATE KEY-----\n${B64.slice(0, 64)}\n(cut)`,
 ];
 
 // Near misses e55bfb3 leaves alone, each one edit away from a redaction.
@@ -144,6 +147,9 @@ const nearMisses = [
   // The label must end in PRIVATE KEY or PRIVATE KEY BLOCK.
   `${PEM} PRIVATE KEY BLOCK X-----\n${B64.slice(0, 64)}\n${PEM_END} PRIVATE KEY BLOCK X-----`,
   `${PEM} PUBLIC KEY-----\n${B64.slice(0, 64)}`,
+  // Lower case is not part of a label, whole or truncated.
+  `${PEM} rsa PRIVATE KEY-----\n${B64.slice(0, 64)}\n${PEM_END} rsa PRIVATE KEY-----`,
+  `${PEM} rsa PRIVATE KEY-----\n${B64.slice(0, 64)}`,
   // A header value ends at its own line; a body on the next line is not its.
   `${PEM} PRIVATE KEY-----A: \n_${repeat("ABCDEFGHIJKLMNOP", 16)}`,
   // 15 base64 characters are not a body.
@@ -191,6 +197,7 @@ describe("redaction is byte-identical to the e55bfb3 scrubber", () => {
       `${PEM} PRIVATE KEY-----`, `${PEM_END} PRIVATE KEY-----`, `${PEM} RSA PRIVATE KEY-----`, `${PEM_END} RSA PRIVATE KEY-----`,
       "Comment: ", "A: ", "a-b: ", "\nVersion: 1\n", "ABCDEFGHIJKLMNOP", "0123456789abcdef", "QRSTUVWX", "abc123def456ghi7",
       "\r", "\r\n", " ", "　", " ", "\v", "\f", "a-bcdefghijklmnopq: ", "PRIVATE KEY BLOCK X-----", "PUBLIC KEY-----",
+      "9 ", "x ", "PKCS8 ",
     ];
     let seed = 0x5eed;
     const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32;
