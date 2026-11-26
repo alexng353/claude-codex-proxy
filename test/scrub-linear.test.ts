@@ -77,6 +77,26 @@ const corpus = [
   `CLAUDE_CODE_OAUTH_TOKEN=${"sk" + "-ant-oat01-" + repeat("Oa7_", 30)}`,
   `{"CLAUDE_CODE_OAUTH_TOKEN":"${repeat("Oa7-Z9+/", 40)}"}`,
   `known ${KNOWN[0][1]} and ${KNOWN[1][1]}; ${KNOWN[2][1]}`,
+  // CRLF and Unicode whitespace: `\s` skips them, and only \n ends a header line.
+  `${PEM} PRIVATE KEY-----\r\n${B64.slice(0, 64)}\r\n(cut)`,
+  `${PEM} RSA PRIVATE KEY-----\r\n${B64.slice(0, 64)}\r\n${PEM_END} RSA PRIVATE KEY-----\r\nafter`,
+  `${PEM} PGP PRIVATE KEY BLOCK-----\r\nComment: exported\r\nVersion: 1\r\n\r\n${B64.slice(0, 64)}\r\n${B64.slice(0, 40)}`,
+  `${PEM} PRIVATE KEY-----\nA: x\r!${repeat("QUJDREVGR0hJSktM", 16)}\n!`,
+  `${PEM} PRIVATE KEY----- ${B64.slice(0, 40)}`,
+  `${PEM} PRIVATE KEY-----　${B64.slice(0, 40)}`,
+];
+
+// Near misses e55bfb3 leaves alone, each one edit away from a redaction.
+const nearMisses = [
+  // A dashed header name with a 16+ letter tail: the tail is not a body.
+  `${PEM} PRIVATE KEY-----\nab-${repeat("Q", 16)}: !`,
+  `${PEM} PRIVATE KEY-----\na-bcdefghijklmnopq: !`,
+  // The label must end in PRIVATE KEY or PRIVATE KEY BLOCK.
+  `${PEM} PRIVATE KEY BLOCK X-----\n${B64.slice(0, 64)}\n${PEM_END} PRIVATE KEY BLOCK X-----`,
+  `${PEM} PUBLIC KEY-----\n${B64.slice(0, 64)}`,
+  "max_tokens: unlimited",
+  "const tokenCount = 12345678901234;",
+  "TOKEN_URL=https://example.com/oauth/token",
 ];
 
 describe("redaction is byte-identical to the e55bfb3 scrubber", () => {
@@ -86,10 +106,23 @@ describe("redaction is byte-identical to the e55bfb3 scrubber", () => {
     expect(out).toBe(baseScrub(text as string));
   });
 
-  test("prose and code are left alone the same way", () => {
-    for (const text of ["max_tokens: unlimited", "const tokenCount = 12345678901234;", "TOKEN_URL=https://example.com/oauth/token", `${PEM} PUBLIC KEY-----\n${B64.slice(0, 64)}`])
-      expect(scrub(text)).toBe(baseScrub(text));
+  test.each(nearMisses.map((text, index) => [index, text]))("near miss %d is left alone, as before", (_, text) => {
+    expect(baseScrub(text as string)).toBe(text as string);
+    expect(scrub(text as string)).toBe(text as string);
   });
+
+  // Every UTF-16 code unit between a header and a body, and inside a header
+  // line: whitespace and line ends are no longer the regex engine's, so check
+  // the hand-written classes against it.
+  test("every code unit after a header is skipped or not as before", () => {
+    const diffs: string[] = [];
+    for (let unit = 0; unit < 0x10000; unit++) {
+      const c = String.fromCharCode(unit);
+      for (const text of [`${PEM} PRIVATE KEY-----${c}${B64.slice(0, 20)}`, `${PEM} PRIVATE KEY-----\nA: x${c}${B64.slice(0, 20)}\n!`])
+        if (scrub(text) !== baseScrub(text)) diffs.push(unit.toString(16));
+    }
+    expect(diffs).toEqual([]);
+  }, 120_000);
 
   // Random strings over the pieces every rewritten pattern keys on: credential
   // names, separators, quotes, PEM armor and header lines, base64 runs.
@@ -100,6 +133,7 @@ describe("redaction is byte-identical to the e55bfb3 scrubber", () => {
       PEM + " ", PEM_END + " ", "PRIVATE KEY", "RSA ", " BLOCK", "-----", "PRIVATE KEY-----",
       `${PEM} PRIVATE KEY-----`, `${PEM_END} PRIVATE KEY-----`, `${PEM} RSA PRIVATE KEY-----`, `${PEM_END} RSA PRIVATE KEY-----`,
       "Comment: ", "A: ", "a-b: ", "\nVersion: 1\n", "ABCDEFGHIJKLMNOP", "0123456789abcdef", "QRSTUVWX", "abc123def456ghi7",
+      "\r", "\r\n", " ", "　", " ", "\v", "\f", "a-bcdefghijklmnopq: ", "PRIVATE KEY BLOCK X-----", "PUBLIC KEY-----",
     ];
     let seed = 0x5eed;
     const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 2 ** 32;
