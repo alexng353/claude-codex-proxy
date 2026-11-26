@@ -1,6 +1,10 @@
 // FROZEN reference: src/scrub.mjs as of e55bfb3, before the linear-time rewrite.
 // test/scrub-linear.test.ts checks the current scrubber redacts byte-for-byte
 // like this one. Do not edit it; it is the old behaviour, not a second implementation.
+// End of life: delete this file, its .d.mts and the "byte-identical" block of
+// scrub-linear.test.ts once q proxy-scrubber-oauth-linear has landed and soaked.
+// If scrub.mjs is meant to redact differently before then, delete them rather
+// than re-freeze: a re-frozen copy would quietly move the reference.
 /**
  * Redact credentials from model-bound requests.
  *

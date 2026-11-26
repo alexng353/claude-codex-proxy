@@ -29,6 +29,8 @@ describe("the scrubber is linear on one long run", () => {
     "password", "token", "TOKEN", "secret", "_pat", "auth_key", "github_pat_", "my_api_key",
     `${PEM} PRIVATE KEY-----`, `${PEM} PRIVATE KEY-----C: x`, `${PEM} RSA PRIVATE KEY-----${PEM_END} DSA PRIVATE KEY-----`,
   ];
+  // Wall-clock bounds, as scrub.test.ts already uses for 1 MB of history. Idle
+  // Forge takes 1-35 ms here; the regressions they catch took 0.4-15 s.
   test.each(units)("200k of %j scrubs in under 200 ms", (unit) => {
     const text = fill(unit, 200_000);
     scrub(text.slice(0, 1000)); // warm up the JIT on this shape
@@ -49,6 +51,54 @@ describe("the scrubber is linear on one long run", () => {
     scrub(long);
     expect(Math.round(performance.now() - t1)).toBeLessThan(200);
   }, 120_000);
+
+  // After one valid header the truncated-armor pass reads the rest of the text.
+  // On 6d1e4d77 that cost a Map entry per line and four regex tests per
+  // character: 1M newlines took 214 ms and +146 MiB, 1 MB of prose 60 ms
+  // (18x the same prose without a header; e55bfb3 1.3x, now about 3x).
+  const H = `${PEM} PRIVATE KEY-----`;
+  // No known values, so the literal pass does not dilute the ratio below.
+  const plain = createScrubber({ files: [] }).scrub;
+  test("a header, 1M newlines and a body scrub in under 100 ms", () => {
+    const text = `${H}${"\n".repeat(1_000_000)}${repeat("Ab3+/=", 16)}`;
+    plain(text.slice(0, 2000));
+    const t0 = performance.now();
+    expect(plain(text)).toBe("[REDACTED:private-key]");
+    expect(Math.round(performance.now() - t0)).toBeLessThan(100);
+  });
+
+  test("a header before 1 MB of prose costs under 8x the prose alone", () => {
+    const prose = "The quick brown fox jumps over the lazy dog; see RFC 7468 for armor.\n".repeat(15_000);
+    const timed = (text: string) => {
+      let best = Infinity;
+      for (let round = 0; round < 5; round++) {
+        const t0 = performance.now();
+        expect(plain(text)).toBe(text);
+        best = Math.min(best, performance.now() - t0);
+      }
+      return best;
+    };
+    const alone = timed(`see the docs\n${prose}`);
+    const after = timed(`see ${H} in the docs\n${prose}`);
+    expect(Math.round(after / Math.max(alone, 1))).toBeLessThan(8);
+  });
+
+  // Peak RSS of a child that scrubs one header, 4M newlines and a body: the
+  // 6d1e4d77 pass added 548 MiB; e55bfb3 and this one stay under 1 MiB.
+  test("a header and 4M newlines add under 64 MiB of peak memory", () => {
+    const script = `
+      const { createScrubber } = await import(${JSON.stringify(new URL("../src/scrub.mjs", import.meta.url).pathname)});
+      const scrub = createScrubber({ files: [] }).scrub;
+      const text = "-----" + "BEGIN PRIVATE KEY-----" + "\\n".repeat(4_000_000) + "Ab3+/=Ab3+/=Ab3+";
+      scrub(text.slice(0, 2000));
+      Bun.gc(true);
+      const before = process.resourceUsage().maxRSS;
+      if (scrub(text) !== "[REDACTED:private-key]") throw new Error("not redacted");
+      console.log(Math.round((process.resourceUsage().maxRSS - before) / 1024));`;
+    const child = Bun.spawnSync([process.execPath, "-e", script], { env: { ...process.env, SECRET_SCRUB_FILES: "" } });
+    expect(child.exitCode).toBe(0);
+    expect(Number(child.stdout.toString().trim())).toBeLessThan(64);
+  }, 60_000);
 });
 
 // Real secret shapes the scrubber already catches, as fakes.
@@ -94,6 +144,13 @@ const nearMisses = [
   // The label must end in PRIVATE KEY or PRIVATE KEY BLOCK.
   `${PEM} PRIVATE KEY BLOCK X-----\n${B64.slice(0, 64)}\n${PEM_END} PRIVATE KEY BLOCK X-----`,
   `${PEM} PUBLIC KEY-----\n${B64.slice(0, 64)}`,
+  // A header value ends at its own line; a body on the next line is not its.
+  `${PEM} PRIVATE KEY-----A: \n_${repeat("ABCDEFGHIJKLMNOP", 16)}`,
+  // 15 base64 characters are not a body.
+  `${PEM} PRIVATE KEY-----${repeat("ABCDEFGHIJKLMNOP", 15)}`,
+  // A header name starts with a letter, so neither `-: ` nor `-a: ` is one.
+  `${PEM} PRIVATE KEY------: ${repeat("ABCDEFGHIJKLMNOP", 16)}`,
+  `${PEM} PRIVATE KEY------a: ${repeat("ABCDEFGHIJKLMNOP", 16)}`,
   "max_tokens: unlimited",
   "const tokenCount = 12345678901234;",
   "TOKEN_URL=https://example.com/oauth/token",

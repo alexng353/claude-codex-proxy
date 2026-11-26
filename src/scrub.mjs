@@ -54,29 +54,24 @@ const ASSIGNMENT =
   /\b(?=[A-Za-z_][A-Za-z0-9_]*?(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY|_PAT|AUTH_KEY))([A-Za-z_][A-Za-z0-9_]*)(["']?\s*[=:]\s*["']?)([^\s"'`$\\,;)}\]]{12,})/gi;
 
 const PRIVATE_KEY_MARKER = "[REDACTED:private-key]";
-const ARMOR_LABEL = /[A-Z0-9 ]*/y;
+// The old patterns' header, anchored. "-----" can't be part of a label, so the
+// label it matches is the whole `[A-Z0-9 ]` run and END labels compare exactly.
+const ARMOR_HEADER = /[A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/y;
 
-/**
- * `-----BEGIN <label>-----` or `-----END <label>-----` at `at`, where the label
- * is `[A-Z0-9 ]*PRIVATE KEY` with an optional ` BLOCK`. The label runs to the
- * first character outside `[A-Z0-9 ]`, so it is the only one that can match.
- */
+/** `-----BEGIN <label>-----` or `-----END <label>-----` at `at`, or null. */
 function armorLine(text, at, word) {
-  const from = at + word.length;
-  ARMOR_LABEL.lastIndex = from;
-  ARMOR_LABEL.exec(text);
-  const to = ARMOR_LABEL.lastIndex;
-  const label = text.slice(from, to);
-  if (!text.startsWith("-----", to)) return null;
-  if (!label.endsWith("PRIVATE KEY") && !label.endsWith("PRIVATE KEY BLOCK")) return null;
-  return { label, end: to + 5 };
+  ARMOR_HEADER.lastIndex = at + word.length;
+  const match = ARMOR_HEADER.exec(text);
+  return match && { label: match[0].slice(0, -5), end: ARMOR_HEADER.lastIndex };
 }
 
 /**
  * Whole armored private keys: each BEGIN through the first END with the same
- * label. Same result as
+ * label. The contract is the semantics of the e55bfb3 regex
  * /-----BEGIN ([A-Z0-9 ]*)PRIVATE KEY( BLOCK)?-----[\s\S]*?-----END \1PRIVATE KEY\2-----/g,
- * whose lazy body re-read the rest of the text for every unclosed BEGIN.
+ * whose lazy body re-read the rest of the text for every unclosed BEGIN. Where
+ * that engine gave up on huge input (Bun: no match, Node: RangeError), this
+ * redacts.
  */
 function redactArmoredKeys(text) {
   if (!text.includes("-----BEGIN ")) return text;
@@ -84,8 +79,9 @@ function redactArmoredKeys(text) {
   for (let at = text.indexOf("-----END "); at >= 0; at = text.indexOf("-----END ", at + 1)) {
     const line = armorLine(text, at, "-----END ");
     if (!line) continue;
-    if (!ends.has(line.label)) ends.set(line.label, { next: 0, at: [] });
-    ends.get(line.label).at.push([at, line.end]);
+    let closing = ends.get(line.label);
+    if (!closing) ends.set(line.label, (closing = { next: 0, spans: [] }));
+    closing.spans.push([at, line.end]);
   }
   let out = "", copied = 0;
   for (let at = text.indexOf("-----BEGIN "); at >= 0;) {
@@ -94,10 +90,10 @@ function redactArmoredKeys(text) {
     if (closing) {
       // BEGINs are visited left to right, so the first END at or after each
       // one only moves forward.
-      while (closing.next < closing.at.length && closing.at[closing.next][0] < line.end) closing.next++;
-      if (closing.next < closing.at.length) {
+      while (closing.next < closing.spans.length && closing.spans[closing.next][0] < line.end) closing.next++;
+      if (closing.next < closing.spans.length) {
         out += text.slice(copied, at) + PRIVATE_KEY_MARKER;
-        copied = closing.at[closing.next][1];
+        copied = closing.spans[closing.next][1];
         at = text.indexOf("-----BEGIN ", copied);
         continue;
       }
@@ -107,26 +103,39 @@ function redactArmoredKeys(text) {
   return copied === 0 ? text : out + text.slice(copied);
 }
 
-const isSpace = (c) => /\s/.test(c);
-const isLetter = (c) => /[A-Za-z]/.test(c);
-const isLetterOrDash = (c) => /[A-Za-z-]/.test(c);
-const isBase64 = (c) => /[A-Za-z0-9+/=]/.test(c);
+// Character classes of the truncated-armor regex, by UTF-16 code unit.
+const SPACE = 1, LETTER = 2, NAME = 4, BASE64 = 8;
+const ASCII_CLASS = new Uint8Array(128);
+for (let code = 0; code < 128; code++) {
+  const c = String.fromCharCode(code);
+  ASCII_CLASS[code] = (/\s/.test(c) ? SPACE : 0) | (/[A-Za-z]/.test(c) ? LETTER : 0) |
+    (/[A-Za-z-]/.test(c) ? NAME : 0) | (/[A-Za-z0-9+/=]/.test(c) ? BASE64 : 0);
+}
+/** `\s` outside ASCII: Unicode Zs, U+FEFF and the line and paragraph separators. */
+function isWideSpace(code) {
+  return code === 0xa0 || code === 0x1680 || (code >= 0x2000 && code <= 0x200a) || code === 0x2028 ||
+    code === 0x2029 || code === 0x202f || code === 0x205f || code === 0x3000 || code === 0xfeff;
+}
+function charClass(text, r) {
+  if (r >= text.length) return 0;
+  const code = text.charCodeAt(r);
+  return code < 128 ? ASCII_CLASS[code] : isWideSpace(code) ? SPACE : 0;
+}
 
 /**
- * A truncated PEM or PGP armor block still leaks its body. PGP armor may open
- * with `Comment: ...` style header lines. Same result as
+ * A truncated PEM or PGP armor block still leaks its body; PGP armor may open
+ * with `Comment: ...` header lines. The contract is the semantics of the
+ * e55bfb3 regex
  * /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----(?:\s*[A-Za-z][A-Za-z-]*: [^\n]*)*(?:\s*[A-Za-z0-9+/=]{16,})+/g,
- * which backtracked exponentially over `a: a: a: ...` after a header.
+ * which backtracked exponentially on `a: a: a: ...`. Where that engine gave up
+ * on huge input (Bun: no match, Node: RangeError), this redacts.
  *
- * That regex, after a header ending at p, tries header lines first: skip
- * whitespace, `Name: `, then the rest of the line from its longest to its
- * shortest, recursing at each end r; only when none succeeds does it try the
- * body at p. So from any position r the outcome is fixed:
- *   at(r) = the outcome at the rightmost success R in [q, end of q's line],
- *           where q follows `Name: ` after r, if there is one;
- *           otherwise body(r): skip whitespace, a run of 16+ base64
- *           characters, and every following such run (the match end), or none.
- * One right-to-left pass computes it for every position.
+ * In that regex the whitespace and the header name can only match whole, so its
+ * one real choice is where a header value ends, tried longest first. The match
+ * from r therefore ends where the match from the rightmost successful value end
+ * on that line does; with no header line at r, or none succeeding, it is the
+ * body: the chain of whitespace-separated 16+ base64 runs from r. One
+ * right-to-left pass computes this for every r.
  */
 function redactTruncatedArmor(text) {
   if (!text.includes("-----BEGIN ")) return text;
@@ -138,39 +147,43 @@ function redactTruncatedArmor(text) {
   if (headers.length === 0) return text;
   const n = text.length;
   const base = headers[0][1];
-  const size = n - base + 1;
-  const body = new Int32Array(size); // match end of body(r), or -1
-  const lineEnd = new Int32Array(size);
-  const outcome = new Map(); // header end -> match end, or -1
-  const wanted = new Set(headers.map(([, end]) => end));
-  const rightmost = new Map(); // line end -> outcome at the rightmost success on that line
-  let eol = n, run = n, word = n, next = n, nextRun = n, nextWord = n;
+  const body = new Int32Array(n - base + 1); // match end of the body from r, or -1
+  // Header ends rise left to right, so the pass meets them last to first.
+  const stops = new Int32Array(headers.length); // match end from each header, or -1
+  let pending = headers.length - 1;
+  let run = n, word = n, next = n, nextRun = n;
+  let lineHitAt = -1, lineHitEnd = -1; // rightmost success so far on r's line
+  let headerEnd = -1; // match end through a header line at `next`, or -1
   for (let r = n; r >= base; r--) {
-    const c = r < n ? text[r] : "";
-    if (r === n || c === "\n") eol = r;
-    run = r < n && isBase64(c) ? run : r;
-    word = r < n && isLetterOrDash(c) ? word : r;
-    if (r === n || !isSpace(c)) {
+    const cls = charClass(text, r);
+    if (r < n && text.charCodeAt(r) === 10) lineHitAt = lineHitEnd = -1;
+    if (!(cls & BASE64)) run = r;
+    if (!(cls & NAME)) word = r;
+    if (!(cls & SPACE)) {
       next = r;
       nextRun = run;
-      nextWord = word;
+      // `Name: ` holds no "\n", so the header value is on this line, right of r.
+      headerEnd = -1;
+      if (cls & LETTER && text.charCodeAt(word) === 58 && text.charCodeAt(word + 1) === 32 && lineHitAt >= word + 2)
+        headerEnd = lineHitEnd;
     }
-    lineEnd[r - base] = eol;
-    body[r - base] = nextRun - next >= 16 ? (nextRun < n && body[nextRun - base] >= 0 ? body[nextRun - base] : nextRun) : -1;
-    let result = body[r - base];
-    if (next < n && isLetter(text[next]) && text[nextWord] === ":" && text[nextWord + 1] === " ") {
-      const q = nextWord + 2;
-      const hit = rightmost.get(q <= n ? lineEnd[q - base] : -1);
-      if (hit && hit.at >= q) result = hit.end;
+    let bodyEnd = -1;
+    if (nextRun - next >= 16) {
+      const more = nextRun < n ? body[nextRun - base] : -1;
+      bodyEnd = more >= 0 ? more : nextRun;
     }
-    if (result >= 0 && !rightmost.has(eol)) rightmost.set(eol, { at: r, end: result });
-    if (wanted.has(r)) outcome.set(r, result);
+    body[r - base] = bodyEnd;
+    const result = headerEnd >= 0 ? headerEnd : bodyEnd;
+    if (result >= 0 && lineHitAt < 0) {
+      lineHitAt = r;
+      lineHitEnd = result;
+    }
+    if (pending >= 0 && headers[pending][1] === r) stops[pending--] = result;
   }
   let out = "", copied = 0;
-  for (const [at, end] of headers) {
-    if (at < copied) continue;
-    const stop = outcome.get(end);
-    if (stop < 0) continue;
+  for (let index = 0; index < headers.length; index++) {
+    const at = headers[index][0], stop = stops[index];
+    if (at < copied || stop < 0) continue;
     out += text.slice(copied, at) + PRIVATE_KEY_MARKER;
     copied = stop;
   }
