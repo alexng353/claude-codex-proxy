@@ -329,6 +329,59 @@ describe("a zone change between an overdue move and its deadline", () => {
   });
 });
 
+describe("the newest move record wins", () => {
+  test("a capped move after a legacy one: its 04:00 deadline and moved-to time count, charged once", async () => {
+    await writeState({
+      filled: { [`${DAY}/night-teeth`]: iso(at(DAY, "22:00")) },
+      // Made before the cap: no recorded deadline.
+      moves: [{ slot: `${DAY}/shower`, from: iso(at(NIGHT, "00:00")), to: iso(at(NIGHT, "01:30")), by: "old-version-chat", at: iso(at(NIGHT, "00:04")) }],
+    });
+    clock = at(NIGHT, "01:40");
+    expect(await say("LATER 02:30")).toStartWith("⏩ moved shower (Nov 5) to 02:30.");
+    const moves = (await state()).moves;
+    expect(moves).toHaveLength(2);
+    expect(moves[0].deadline).toBeUndefined();
+    expect(moves[1]).toMatchObject({ to: iso(at(NIGHT, "02:30")), deadline: iso(at(NIGHT, "04:00")) });
+    clock = at(NIGHT, "02:00");
+    expect(await say("hi")).toBeNull();
+    clock = at(NIGHT, "03:59");
+    expect((await getStatus()).open_debts).toEqual([]);
+    clock = at(NIGHT, "04:00");
+    expect((await getStatus()).open_debts).toMatchObject([
+      { source: "move", at: iso(at(NIGHT, "04:00")), skipped: ["shower (Nov 5) (moved to 02:30, not done by 04:00)"] },
+    ]);
+    clock = at("2026-11-07", "00:00");
+    await getStatus();
+    expect((await state()).debts.filter((d: any) => d.source === "move")).toHaveLength(1);
+  });
+
+  test("with a zone change between the two moves, the newest move's recorded deadline wins", () => {
+    const jakarta = [{ zone: "Asia/Jakarta", from: "2026-10-01T00:00:00Z", seenAt: "2026-11-05T17:00:00Z" }];
+    try {
+      setZoneHistory(jakarta);
+      const s = emptyState("2026-10-01T00:00:00Z");
+      s.filled["2026-11-05/night-teeth"] = "2026-11-05T15:00:00.000Z";
+      // Legacy: 00:04 WIB Nov 6 to 01:30 WIB (18:30Z), no deadline; its midnight would be Nov 6 17:00Z.
+      s.moves = [{ slot: "2026-11-05/shower", from: "2026-11-05T17:00:00.000Z", to: "2026-11-05T18:30:00.000Z", by: "old-version-chat", at: "2026-11-05T17:04:00.000Z" }];
+      // 01:40 WIB, moved again to 03:30 WIB (20:30Z): deadline 04:00 WIB, 21:00Z.
+      expect(moveSlots(s, ["2026-11-05/shower"], Date.parse("2026-11-05T20:30:00Z"), Date.parse("2026-11-05T18:40:00Z"), "fake").ok).toBe(true);
+      expect(s.moves.at(-1)!.deadline).toBe("2026-11-05T21:00:00.000Z");
+      // Makassar (WITA, an hour ahead) from 03:00 WIB.
+      setZoneHistory([...jakarta, { zone: "Asia/Makassar", from: "2026-11-05T20:00:00Z", seenAt: "2026-11-05T20:00:00Z" }]);
+      expect(outstanding(s, Date.parse("2026-11-05T20:10:00Z")).map((r) => r.slot)).not.toContain("2026-11-05/shower");
+      expect(chargeBrokenMoves(s, Date.parse("2026-11-05T20:59:00Z"))).toEqual([]);
+      expect(chargeBrokenMoves(s, Date.parse("2026-11-05T21:00:00Z"))).toMatchObject([
+        { source: "move", at: "2026-11-05T21:00:00.000Z", moveTo: "2026-11-05T20:30:00.000Z" },
+      ]);
+      expect(chargeBrokenMoves(s, Date.parse("2026-11-06T16:00:00Z"))).toEqual([]);
+      expect(chargeBrokenMoves(s, Date.parse("2026-11-06T17:00:00Z"))).toEqual([]);
+      expect(s.debts.filter((d) => d.source === "move")).toHaveLength(1);
+    } finally {
+      setZoneHistory(undefined);
+    }
+  });
+});
+
 describe("LATER before midnight is unchanged", () => {
   test("a morning lock at noon still offers a time before midnight and takes LATER 23:00", async () => {
     await writeState({ startsAt: iso(at(DAY, "05:00")) });
