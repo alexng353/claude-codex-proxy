@@ -718,8 +718,8 @@ export function outstanding(state: GateState, now: number): Requirement[] {
       description: debt.penance!.description,
     });
   result.push(...gymOutstanding(state.gym, now));
-  // A slot moved to later today locks from its new time instead.
-  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !slotSkipped(state, r.slot) && !movedAway(state, r.slot, now));
+  // A slot moved to later today locks from its new time instead, until the move lapses into a charged skip.
+  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !slotSkipped(state, r.slot) && !movedAway(state, r.slot, now) && !moveLapsed(state, r.slot, now));
 }
 
 /** Requirements due later today that do not lock yet. */
@@ -764,11 +764,54 @@ export function dueToday(state: GateState, now: number): Requirement[] {
  * around now." A move shifts when a photo requirement locks, to later the same
  * local day, without a BYPASS or a debt. Bounded: MAX_MOVES_PER_DAY per item
  * per day, every move logged (from, to, by, at). A move is a promise: if the
- * day ends with the photo missing, it is charged as an open debt
+ * day ends with the photo missing (04:00 for last night's overdue photos,
+ * OVERDUE_MOVE_LIMIT_MINUTE), it is charged as an open debt
  * (chargeBrokenMoves), so moving to 23:59 is never a free skip. Penances and
  * gym misses never move; gym plans move through gym.ts reschedulePlan.
  */
 export const MAX_MOVES_PER_DAY = 2;
+
+/**
+ * Last night's overdue shower and night teeth move only to a time before 04:00
+ * device-local (Alex, Nov 27 00:06 WIB: "the gate is there to remind me to
+ * shower and brush my teeth realistically"): a move buys the small hours, never
+ * a whole day. A move not kept by then counts as a skip at 04:00. Below
+ * MORNING_MINUTE, so the charge lands before this morning's photos lock.
+ */
+export const OVERDUE_MOVE_LIMIT_MINUTE = 4 * 60;
+
+const hhmm = (minutes: number) => `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+
+/** Shower and night teeth only lock, and so only move, once overdue: after their own day's midnight. */
+export const isOverdueItem = (name: string) => itemKey(name) === "shower" || itemKey(name) === "night-teeth";
+
+/** 04:00 the morning after an overdue slot's own day: its moves must land before it. */
+function overdueLimit(name: string): number {
+  return zonedTime(addDays(name.split("/")[0], 1), OVERDUE_MOVE_LIMIT_MINUTE);
+}
+
+/**
+ * When a move of `name` to `to` must be kept by, or it counts as a skip: 04:00
+ * for last night's photos, midnight after the moved-to time otherwise. A move
+ * recorded before the cap existed (to 04:00 or later) keeps its midnight.
+ */
+function moveDeadline(name: string, to: number): number {
+  if (isOverdueItem(name) && to < overdueLimit(name)) return overdueLimit(name);
+  return zonedTime(addDays(localTime(to).day, 1), 0);
+}
+
+/** A moved slot past its deadline unfilled: its skip is charged (chargeBrokenMoves), so it no longer locks. */
+function moveLapsed(state: GateState, name: string, now: number): boolean {
+  const to = movedTo(state, name, now);
+  return to !== null && !state.filled[name] && now >= moveDeadline(name, to);
+}
+
+/** Why overdue slots can't move: to a time past the cap, or (`late`) at all once it has passed. */
+export function overdueMoveError(state: GateState, names: string[], late: boolean): string {
+  const what = `last night's ${names.map((n) => slotLabel(n, state)).join(", ")}`;
+  const limit = hhmm(OVERDUE_MOVE_LIMIT_MINUTE);
+  return `${what} ${late ? `could move only until ${limit}` : `can move only to a time before ${limit}`}; send the photo, or reply BYPASS`;
+}
 
 export type SlotMove = { slot: string; from: string; to: string; by: string; at: string };
 
@@ -800,12 +843,12 @@ function slotKind(name: string): ProofKind {
   return "teeth";
 }
 
-/** Slots a move can shift now: today's morning requirements and yesterday's overdue night ones, unfilled and enforced. */
+/** Slots a move can shift now: today's morning requirements and, before 04:00, yesterday's overdue night ones, unfilled and enforced. */
 export function movableSlots(state: GateState, now: number): string[] {
   const { day } = localTime(now);
   const yesterday = addDays(day, -1);
   return [slot.shower(yesterday), slot.night(yesterday), slot.morning(day), slot.weight(day), slot.creatine(day), slot.walk(day)].filter(
-    (name) => !state.filled[name] && enforced(state, name, now),
+    (name) => !state.filled[name] && enforced(state, name, now) && !(isOverdueItem(name) && now >= overdueLimit(name)),
   );
 }
 
@@ -921,6 +964,8 @@ export type MoveResult = { ok: true; moved: SlotMove[] } | { ok: false; error: s
 export function moveSlots(state: GateState, names: string[], to: number, now: number, by: string): MoveResult {
   if (!(to > now) || localTime(to).day !== localTime(now).day) return { ok: false, error: `${SAME_DAY}.` };
   const movable = movableSlots(state, now);
+  const capped = names.filter((n) => movable.includes(n) && isOverdueItem(n) && to >= overdueLimit(n));
+  if (capped.length) return { ok: false, error: overdueMoveError(state, capped, false) };
   const problems: string[] = [];
   for (const name of names) {
     const what = slotLabel(name, state);
@@ -947,7 +992,8 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
 }
 
 /**
- * Charges each move whose day ended with its photo missing as an open debt,
+ * Charges each move whose deadline (moveDeadline: midnight, or 04:00 for last
+ * night's photos) passed with its photo missing as an open debt,
  * once, unless a BYPASS of that item from the moved time on already charged
  * the same skip. A BYPASS before the move is a different skip and doesn't
  * count. A shield report that arrives after this charge supersedes it
@@ -960,7 +1006,7 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
     const to = movedTo(state, name, now);
     if (to === null) continue;
     const day = localTime(to).day;
-    const end = zonedTime(addDays(day, 1), 0);
+    const end = moveDeadline(name, to);
     if (now < end || state.filled[name]) continue;
     if (itemStopped(state, itemKey(name), end) || !enforced(state, name, to)) continue;
     if (state.debts.some((d) => d.source === "move" && d.moveSlot === name)) continue;
@@ -973,7 +1019,7 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
     const debt: Debt = {
       id: `${prefix}${state.debts.filter((d) => d.id.startsWith(prefix)).length + 1}`,
       at: new Date(end).toISOString(),
-      skipped: [`${slotLabel(name, state)} (moved to ${clockLabel(to)}, not done by midnight)`],
+      skipped: [`${slotLabel(name, state)} (moved to ${clockLabel(to)}, not done by ${localTime(end).minutes ? clockLabel(end) : "midnight"})`],
       items: [item],
       source: "move",
       moveSlot: name,
@@ -988,9 +1034,9 @@ export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
 }
 
 /**
- * A BYPASS charged late (a shield tap reported after midnight) for a skip a
+ * A BYPASS charged late (a shield tap reported after the deadline) for a skip a
  * move debt already charged: one skip, one charge. Each open move debt whose
- * window (moved time to midnight) holds `at` and whose item the bypass names
+ * window (moved time to its deadline, the debt's `at`) holds `at` and whose item the bypass names
  * is closed as justified, with the reason naming the debt that replaces it.
  */
 export function supersedeMoveDebts(state: GateState, items: string[], at: number, byDebtId: string, now: number): void {
@@ -1574,12 +1620,11 @@ const EMOJI: Record<Requirement["kind"], string> = {
   gym: "💪",
 };
 
-/** `phrase`: this lock's three BYPASS words; the gate always passes them. */
-export function lockedText(requirements: Requirement[], results: string[] = [], phrase?: string): string {
+/** `phrase`: this lock's three BYPASS words; the gate always passes them, and `now` for the LATER hint. */
+export function lockedText(requirements: Requirement[], results: string[] = [], phrase?: string, now?: number): string {
   const photos = requirements.some((r) => r.kind !== "gym");
   const gym = requirements.some((r) => r.kind === "gym");
-  // MOVE/LATER only shifts photo requirements; a penance or a gym miss never moves.
-  const movable = requirements.some((r) => r.kind !== "gym" && r.kind !== "penance");
+  const hint = laterHint(requirements, now);
   const unlock = [
     ...(photos ? ["send a fresh photo"] : []),
     ...(gym ? ["log a gym session in Uplifting (Start and Finish at the gym, or send a photo taken at the gym with location on)"] : []),
@@ -1588,11 +1633,30 @@ export function lockedText(requirements: Requirement[], results: string[] = [], 
     ...results,
     `${EMOJI[requirements[0].kind]} gate armed: ${requirements.map((r) => r.label).join(", ")}`,
     `${unlock[0].toUpperCase()}${unlock.slice(1)} to unlock, or reply BYPASS${phrase ? ` ${phrase}` : ""}.`,
-    ...(movable ? [LATER_HINT] : []),
+    ...(hint ? [hint] : []),
   ].join("\n");
 }
 
 const LATER_HINT = "Doing it later today? Reply LATER and a time before midnight, e.g. LATER 21:00 (not a bypass).";
+
+/**
+ * The lock's LATER line, or null when nothing in it can move. MOVE/LATER only
+ * shifts photo requirements (a penance or a gym miss never moves). Last night's
+ * overdue photos move only before 04:00, so when they are all that can move the
+ * line offers the small hours, with an example that is still ahead of `now`.
+ */
+function laterHint(requirements: Requirement[], now?: number): string | null {
+  const photos = requirements.filter((r) => r.kind !== "gym" && r.kind !== "penance");
+  if (!photos.length) return null;
+  if (!photos.every((r) => isOverdueItem(r.slot))) return LATER_HINT;
+  if (now === undefined) return null;
+  const { minutes } = localTime(now);
+  const limit = OVERDUE_MOVE_LIMIT_MINUTE;
+  // About an hour out on the half hour, else 03:45, else 03:59: the first one later than this minute.
+  const example = [Math.min(Math.ceil((minutes + 60) / 30) * 30, limit - 15), limit - 1].find((m) => m > minutes);
+  if (example === undefined) return null;
+  return `Still up? Reply LATER and a time before ${hhmm(limit)}, e.g. LATER ${hhmm(example)} (not a bypass).`;
+}
 
 export function imageMarker(record: ImageRecord, state?: GateState): string {
   const what =
@@ -1623,7 +1687,7 @@ export function noteText(debt: Debt, baseUrl: string): string {
       : debt.bedtime
       ? `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex unlocked his phone at bedtime.`
       : debt.source === "move"
-      ? `Alex had moved a photo with MOVE/LATER and the day ended without it, which counts as a skip (charged at ${clockLabel(at)} on ${dayLabel(localTime(at).day)}): ${debt.skipped.join(", ")}.`
+      ? `Alex had moved a photo with MOVE/LATER and did not send it by ${clockLabel(at)} on ${dayLabel(localTime(at).day)}, which counts as a skip: ${debt.skipped.join(", ")}.`
       : `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex replied BYPASS to skip: ${debt.skipped.join(", ")}.`;
   return [
     `<${NOTE_TAG}>`,

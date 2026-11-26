@@ -77,9 +77,12 @@ import {
   MAX_MOVES_PER_DAY,
   allMoves,
   chargeBrokenMoves,
+  isOverdueItem,
   movableSlots,
   moveSlots,
   movesToday,
+  overdueMoveError,
+  OVERDUE_MOVE_LIMIT_MINUTE,
   parseMoveText,
   resolveMoveTime,
   supersedeMoveDebts,
@@ -878,7 +881,7 @@ function bypassReply(state: GateState, now: number, text: string): string {
     const why = /^bypass$/i.test(text.trim().replace(/[.!?,]+$/, ""))
       ? "🔑 BYPASS needs this lock's three words."
       : "🔑 That isn't this lock's BYPASS phrase.";
-    return lockedText(due, [why], words);
+    return lockedText(due, [why], words, now);
   }
   retire(state.bypass);
   const at = new Date(now).toISOString();
@@ -1136,9 +1139,12 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
   }
   const locking = outstanding(state, now).map((r) => r.slot);
   const movable = movableSlots(state, now);
+  // Last night's photos that still lock but are past 04:00, when moves for them end.
+  const lapsed = locking.filter((s) => isOverdueItem(s) && !movable.includes(s));
   let names: string[];
   if (cmd.items === null) {
     names = locking.filter((s) => movable.includes(s));
+    if (!names.length && lapsed.length) return { ok: false, error: overdueMoveError(state, lapsed, true) };
     if (!names.length)
       return {
         ok: false,
@@ -1150,14 +1156,21 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
     const named = movable.filter((s) => cmd.items!.includes(itemKey(s)));
     const lockingNamed = named.filter((s) => locking.includes(s));
     names = lockingNamed.length ? lockingNamed : named;
+    const lapsedNamed = lapsed.filter((s) => cmd.items!.includes(itemKey(s)));
+    if (!names.length && lapsedNamed.length) return { ok: false, error: overdueMoveError(state, lapsedNamed, true) };
     if (!names.length) return { ok: false, error: "nothing by that name is due today that can move (tonight's photos are due by midnight already)" };
   }
   const r = moveSlots(state, names, time.at, now, by);
   if (!r.ok) return { ok: false, error: r.error };
   const left = Math.min(...names.map((n) => MAX_MOVES_PER_DAY - movesToday(state, n, now).length));
+  const limit = zonedTime(localTime(now).day, OVERDUE_MOVE_LIMIT_MINUTE);
+  // Last night's photos lock again at the new time and lapse into a skip at 04:00 (hygiene.ts moveDeadline).
+  const promise = names.every(isOverdueItem)
+    ? `it locks again at ${clockLabel(time.at)}, and if it isn't done by ${clockLabel(limit)} it counts as a skip`
+    : "if it isn't done by midnight it counts as a skip";
   return {
     ok: true,
-    message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); if it isn't done by midnight it counts as a skip.`,
+    message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); ${promise}.`,
     moved: r.moved,
   };
 }
@@ -1171,7 +1184,7 @@ function moveReply(state: GateState, now: number, cmd: MoveCommand, by: string):
     return line;
   }
   if (bypassActive(state, now)) return line;
-  return lockedText(due, [line], lockPhrase(state, due, now).words);
+  return lockedText(due, [line], lockPhrase(state, due, now).words, now);
 }
 
 /** Cairn's Move button (POST /hygiene/api/v1/move): the same move as the chat reply. */
@@ -1374,7 +1387,7 @@ async function decideHumanTurn(
       text: turn.text,
       attachments,
     });
-    return { action: "respond", text: lockedText(due, lines, words) };
+    return { action: "respond", text: lockedText(due, lines, words, now) };
   }
   // The gate is open: this lock's phrase is spent, and the next lock gets new words.
   if (!due.length && retire(state.bypass)) dirty = true;
