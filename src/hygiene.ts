@@ -24,7 +24,9 @@
  *   penance photo requirement.
  * - "LATER 18:30" or "MOVE teeth 21:00" reschedules a photo requirement to
  *   later the same day: no bypass, no debt, at most twice per item per day.
- *   A move not kept by midnight becomes an open debt, like a BYPASS.
+ *   A move not kept by its deadline (midnight; 04:00 for last night's overdue
+ *   shower and night teeth, which move only to before 04:00) becomes an open
+ *   debt, like a BYPASS.
  * - Planned gym sessions (gym.ts): a plan with no Start at the gym in
  *   Uplifting by its start plus a grace locks until a qualifying session.
  */
@@ -718,8 +720,24 @@ export function outstanding(state: GateState, now: number): Requirement[] {
       description: debt.penance!.description,
     });
   result.push(...gymOutstanding(state.gym, now));
-  // A slot moved to later today locks from its new time instead, until the move lapses into a charged skip.
-  return result.filter(r => !itemStopped(state, itemKey(r.slot), now) && !armedDuringSuspension(state, r.slot) && !slotSkipped(state, r.slot) && !movedAway(state, r.slot, now) && !moveLapsed(state, r.slot, now));
+  // A slot moved to later today locks from its new time instead.
+  return result.filter((r) => slotOpen(state, r.slot, now) && !movedAway(state, r.slot, now));
+}
+
+/**
+ * Whether a slot can still lock or take a photo: unfilled, and not stopped,
+ * suspended, skipped, or lapsed into a charged move skip (moveLapsed). The one
+ * rule outstanding and candidateSlots share, so a slot that no longer locks
+ * never takes the photo meant for the one that does.
+ */
+function slotOpen(state: GateState, name: string, now: number): boolean {
+  return (
+    !state.filled[name] &&
+    !itemStopped(state, itemKey(name), now) &&
+    !armedDuringSuspension(state, name) &&
+    !slotSkipped(state, name) &&
+    !moveLapsed(state, name, now)
+  );
 }
 
 /** Requirements due later today that do not lock yet. */
@@ -791,19 +809,21 @@ function overdueLimit(name: string): number {
 }
 
 /**
- * When a move of `name` to `to` must be kept by, or it counts as a skip: 04:00
- * for last night's photos, midnight after the moved-to time otherwise. A move
- * recorded before the cap existed (to 04:00 or later) keeps its midnight.
+ * When a move must be kept by, or it counts as a skip: the deadline it
+ * promised, recorded when it was made (04:00 for last night's photos), so a
+ * later zone change can't move it. A record without one (morning photos, and
+ * every move made before the cap) keeps midnight after its moved-to time.
  */
-function moveDeadline(name: string, to: number): number {
-  if (isOverdueItem(name) && to < overdueLimit(name)) return overdueLimit(name);
-  return zonedTime(addDays(localTime(to).day, 1), 0);
+function moveDeadline(move: SlotMove): number {
+  const deadline = move.deadline ? Date.parse(move.deadline) : Number.NaN;
+  if (Number.isFinite(deadline)) return deadline;
+  return zonedTime(addDays(localTime(Date.parse(move.to)).day, 1), 0);
 }
 
 /** A moved slot past its deadline unfilled: its skip is charged (chargeBrokenMoves), so it no longer locks. */
 function moveLapsed(state: GateState, name: string, now: number): boolean {
-  const to = movedTo(state, name, now);
-  return to !== null && !state.filled[name] && now >= moveDeadline(name, to);
+  const move = lastMove(state, name, now);
+  return !!move && !state.filled[name] && now >= moveDeadline(move);
 }
 
 /** Why overdue slots can't move: to a time past the cap, or (`late`) at all once it has passed. */
@@ -813,11 +833,17 @@ export function overdueMoveError(state: GateState, names: string[], late: boolea
   return `${what} ${late ? `could move only until ${limit}` : `can move only to a time before ${limit}`}; send the photo, or reply BYPASS`;
 }
 
-export type SlotMove = { slot: string; from: string; to: string; by: string; at: string };
+/** `deadline`: when the move must be kept by (ISO); set on overdue night moves since the 04:00 cap, else midnight. */
+export type SlotMove = { slot: string; from: string; to: string; by: string; at: string; deadline?: string };
 
-/** When a moved slot locks from, as of `asOf` (moves made later don't count yet), or null if not moved by then. */
+/** A slot's newest move as of `asOf` (moves made later don't count yet). */
+function lastMove(state: GateState, slotName: string, asOf: number): SlotMove | undefined {
+  return state.moves?.filter((m) => m.slot === slotName && Date.parse(m.at) <= asOf).at(-1);
+}
+
+/** When a moved slot locks from, as of `asOf`, or null if not moved by then. */
 function movedTo(state: GateState, slotName: string, asOf: number): number | null {
-  const last = state.moves?.filter((m) => m.slot === slotName && Date.parse(m.at) <= asOf).at(-1);
+  const last = lastMove(state, slotName, asOf);
   return last ? Date.parse(last.to) : null;
 }
 
@@ -986,6 +1012,7 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
     to: new Date(to).toISOString(),
     by: by.slice(0, 120),
     at,
+    ...(isOverdueItem(name) ? { deadline: new Date(overdueLimit(name)).toISOString() } : {}),
   }));
   (state.moves ??= []).push(...moved);
   return { ok: true, moved };
@@ -1003,10 +1030,11 @@ export function moveSlots(state: GateState, names: string[], to: number, now: nu
 export function chargeBrokenMoves(state: GateState, now: number): Debt[] {
   const charged: Debt[] = [];
   for (const name of new Set((state.moves ?? []).map((m) => m.slot))) {
-    const to = movedTo(state, name, now);
-    if (to === null) continue;
+    const move = lastMove(state, name, now);
+    if (!move) continue;
+    const to = Date.parse(move.to);
     const day = localTime(to).day;
-    const end = moveDeadline(name, to);
+    const end = moveDeadline(move);
     if (now < end || state.filled[name]) continue;
     if (itemStopped(state, itemKey(name), end) || !enforced(state, name, to)) continue;
     if (state.debts.some((d) => d.source === "move" && d.moveSlot === name)) continue;
@@ -1060,7 +1088,7 @@ export function openPenance(state: GateState): Debt[] {
 export function candidateSlots(state: GateState, kind: ProofKind, now: number): string[] {
   const { day, minutes } = localTime(now);
   const yesterday = addDays(day, -1);
-  const open = (name: string) => !state.filled[name] && !itemStopped(state, itemKey(name), now) && !armedDuringSuspension(state, name) && !slotSkipped(state, name);
+  const open = (name: string) => slotOpen(state, name, now);
   if (kind === "penance") return openPenance(state).map((d) => slot.penance(d.id)).filter(open);
   if (kind === "weight")
     return minutes >= MORNING_MINUTE && open(slot.weight(day)) && enforced(state, slot.weight(day), now)
@@ -1643,7 +1671,8 @@ const LATER_HINT = "Doing it later today? Reply LATER and a time before midnight
  * The lock's LATER line, or null when nothing in it can move. MOVE/LATER only
  * shifts photo requirements (a penance or a gym miss never moves). Last night's
  * overdue photos move only before 04:00, so when they are all that can move the
- * line offers the small hours, with an example that is still ahead of `now`.
+ * line offers the small hours, with an example at least LATER_LEAD_MINUTES
+ * ahead of `now` (time to type it), and no line once no such time is left.
  */
 function laterHint(requirements: Requirement[], now?: number): string | null {
   const photos = requirements.filter((r) => r.kind !== "gym" && r.kind !== "penance");
@@ -1652,11 +1681,14 @@ function laterHint(requirements: Requirement[], now?: number): string | null {
   if (now === undefined) return null;
   const { minutes } = localTime(now);
   const limit = OVERDUE_MOVE_LIMIT_MINUTE;
-  // About an hour out on the half hour, else 03:45, else 03:59: the first one later than this minute.
-  const example = [Math.min(Math.ceil((minutes + 60) / 30) * 30, limit - 15), limit - 1].find((m) => m > minutes);
+  // About an hour out on the half hour, else 03:45, else 03:59: the first one far enough ahead.
+  const example = [Math.min(Math.ceil((minutes + 60) / 30) * 30, limit - 15), limit - 1].find((m) => m >= minutes + LATER_LEAD_MINUTES);
   if (example === undefined) return null;
   return `Still up? Reply LATER and a time before ${hhmm(limit)}, e.g. LATER ${hhmm(example)} (not a bypass).`;
 }
+
+/** How far ahead the small-hours example is, at least: a time a minute away is past by the time it is typed. */
+const LATER_LEAD_MINUTES = 10;
 
 export function imageMarker(record: ImageRecord, state?: GateState): string {
   const what =
