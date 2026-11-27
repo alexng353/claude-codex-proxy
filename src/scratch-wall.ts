@@ -27,17 +27,21 @@
  * reader prompt (comb skill) names the root and its tmp folder instead. Commands
  * that pass the wall go out byte for byte; the refusal itself is plain words.
  *
- * The switch is a line `Scratch root: /abs/path` in the chat's own task only: the
- * first item after Codex's injected context, which is the v1 spawn message (not a
+ * The switch is a line `Scratch root: /abs/path` in the chat's own task, seen on
+ * the thread's first request: the task is the last input item after Codex's
+ * injected context and nothing has run yet. The task is the v1 spawn message (not a
  * relayed <codex_delegation> or a <subagent_notification>, and not inside a fenced
- * block), or a v2 NEW_TASK served from its validated task file. Later messages,
- * child replies and tool output declare nothing, and the path must lie strictly
- * inside ~/.cache/agent-tmp. A chat without a declaration is untouched, byte for
- * byte.
+ * block of 3+ backticks or tildes), or a v2 NEW_TASK served from its validated task
+ * file. The decision is recorded with the run start (runs); a thread first seen on
+ * a later request (a proxy restart, a compacted history, a brief mid-history) is
+ * undeclared. Later messages, child replies and tool output declare nothing, and
+ * the path must lie strictly inside ~/.cache/agent-tmp. A chat without a
+ * declaration is untouched, byte for byte.
  *
- * The text match is a tripwire, not a sandbox: cp, mv, tar, language-level writes,
- * `cd /tmp` then a relative path, variables, write_stdin and apply_patch get
- * through (b); (c) still counts them when the command named the /tmp path.
+ * The text match is a tripwire, not a sandbox (a quote-aware tokenizer is ticket
+ * scratch-wall-tokenizer): cp, mv, tar, language-level writes, `cd /tmp` then a
+ * relative path, variables, double-quoted shell text, write_stdin and apply_patch
+ * get through (b); (c) still counts them when the command named the /tmp path.
  */
 import { lstatSync, realpathSync, type Stats } from "node:fs";
 import { readdir, readlink } from "node:fs/promises";
@@ -69,8 +73,27 @@ const tmpDir = () => normalize(process.env.SCRATCH_WALL_TMP || "/tmp");
 // and a placeholder like `<scratch>/r/<name>` must not count.
 const ROOT_CHARS = /^[A-Za-z0-9._/@+-]+$/;
 const DECLARATION = /^Scratch root: (\S+)[ \t]*$/gm;
-const RELAY = /<codex_delegation>|<subagent_notification>/;
-const FENCED = /^(```|~~~)[^\n]*\n[\s\S]*?^\1[ \t]*$/gm;
+const RELAY = /<codex_delegation[\s>]|<subagent_notification[\s>]/;
+
+/** Drop fenced blocks: 3+ backticks or tildes, closed by the same character at least as long. */
+function stripFences(text: string): string {
+  const out: string[] = [];
+  let open: { char: string; length: number } | undefined;
+  for (const line of text.split("\n")) {
+    const fence = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (open) {
+      if (fence && fence[1][0] === open.char && fence[1].length >= open.length && fence[2].trim() === "") open = undefined;
+      continue;
+    }
+    // A backtick fence's info string may not contain a backtick (CommonMark).
+    if (fence && !(fence[1][0] === "`" && fence[2].includes("`"))) {
+      open = { char: fence[1][0], length: fence[1].length };
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
 
 function validRoot(path: string): boolean {
   if (!isAbsolute(path) || !ROOT_CHARS.test(path)) return false;
@@ -86,12 +109,16 @@ const partsText = (content: ResponseInputItem["content"]): string =>
         .map((part) => part.text ?? "")
         .join("\n");
 
-/** The text of the chat's own task, or undefined when its first item is not one. */
-function taskText(request: ResponsesRequest): string | undefined {
+/**
+ * The text of the chat's own task on its first request, or undefined: the task must
+ * be the last input item after Codex's context, so nothing has run yet.
+ */
+function firstTaskText(request: ResponsesRequest): string | undefined {
   const input: ResponseInputItem[] =
     typeof request.input === "string" ? [{ type: "message", role: "user", content: request.input }] : request.input;
   let index = leadingContextCount(input);
   while (index < input.length && (input[index].role === "developer" || input[index].role === "system")) index++;
+  if (index !== input.length - 1) return undefined;
   const item = input[index];
   if (!item) return undefined;
   if (item.type === "agent_message") {
@@ -105,28 +132,106 @@ function taskText(request: ResponsesRequest): string | undefined {
   return undefined;
 }
 
-function declaredScratchRoot(request: ResponsesRequest): string | undefined {
-  const text = taskText(request);
+function taskDeclaration(request: ResponsesRequest): string | undefined {
+  const text = firstTaskText(request);
   if (text === undefined) return undefined;
-  for (const match of text.replace(FENCED, "").matchAll(DECLARATION)) if (validRoot(match[1])) return match[1];
+  for (const match of stripFences(text).matchAll(DECLARATION)) if (validRoot(match[1])) return match[1];
   return undefined;
+}
+
+type Run = { start: number; root: string; reported: Set<string> };
+/** Per thread, decided on first sight: a declared reader's run, or null (undeclared). */
+const runs = new Map<string, Run | null>();
+const MAX_RUNS = 2000;
+
+const threadOf = (request: ResponsesRequest): string | undefined =>
+  typeof request.prompt_cache_key === "string" && request.prompt_cache_key ? request.prompt_cache_key : undefined;
+
+/** Decide a thread on its first sight; call on every request, before wallToolCalls. */
+export function noteReaderRun(request: ResponsesRequest, now = Date.now()): void {
+  const thread = threadOf(request);
+  if (!thread || runs.has(thread)) return;
+  const root = taskDeclaration(request);
+  if (runs.size >= MAX_RUNS) runs.delete(runs.keys().next().value!);
+  runs.set(thread, root ? { start: now, root, reported: new Set() } : null);
+}
+
+function declaredScratchRoot(request: ResponsesRequest): string | undefined {
+  const thread = threadOf(request);
+  return thread ? runs.get(thread)?.root : undefined;
 }
 
 // ---- (b) write targets under /tmp ----
 
-/** Drop heredoc bodies and their delimiter lines; the operator line stays. */
+/** The heredoc delimiter word at `start`: quotes and backslashes removed, as the shell does. */
+function delimiterAt(line: string, start: number): { word: string; end: number } {
+  let word = "";
+  let k = start;
+  while (k < line.length && !/[\s;|&<>()]/.test(line[k])) {
+    const char = line[k];
+    if (char === "'" || char === '"') {
+      const close = line.indexOf(char, k + 1);
+      if (close < 0) return { word: "", end: line.length };
+      word += line.slice(k + 1, close);
+      k = close + 1;
+    } else if (char === "\\") {
+      word += line[k + 1] ?? "";
+      k += 2;
+    } else {
+      word += char;
+      k++;
+    }
+  }
+  return { word, end: k };
+}
+
+/**
+ * Drop heredoc bodies and their delimiter lines; the operator line stays. A `<<`
+ * counts only outside quotes and comments; `<<-` strips leading tabs, and the
+ * delimiter may be quoted or backslashed (`<<'EOF'`, `<<"EOF"`, `<<\EOF`).
+ */
 function stripHeredocs(cmd: string): string {
   const out: string[] = [];
   const pending: Array<{ delimiter: string; dash: boolean }> = [];
+  let quote: "'" | '"' | undefined;
   for (const line of cmd.split("\n")) {
     const open = pending[0];
-    if (open) {
+    if (open && quote === undefined) {
       if ((open.dash ? line.replace(/^\t+/, "") : line) === open.delimiter) pending.shift();
       continue;
     }
     out.push(line);
-    for (const match of line.matchAll(/(?<!<)<<(-?)[ \t]*(['"]?)([A-Za-z_][\w.-]*)\2/g))
-      pending.push({ delimiter: match[3], dash: match[1] === "-" });
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i];
+      if (quote === "'") {
+        if (char === "'") quote = undefined;
+        continue;
+      }
+      if (quote === '"') {
+        if (char === "\\") i++;
+        else if (char === '"') quote = undefined;
+        continue;
+      }
+      if (char === "\\") {
+        i++;
+        continue;
+      }
+      if (char === "'" || char === '"') {
+        quote = char;
+        continue;
+      }
+      // A comment starts a word and runs to the end of the line.
+      if (char === "#" && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) break;
+      if (char === "<" && line[i + 1] === "<" && line[i + 2] !== "<" && line[i - 1] !== "<") {
+        let j = i + 2;
+        const dash = line[j] === "-";
+        if (dash) j++;
+        while (line[j] === " " || line[j] === "\t") j++;
+        const { word, end } = delimiterAt(line, j);
+        if (word) pending.push({ delimiter: word, dash });
+        i = end - 1;
+      }
+    }
   }
   return out.join("\n");
 }
@@ -140,21 +245,58 @@ const stripQuotes = (cmd: string) =>
 
 const TMP_WORD = /^\/tmp(?:\/|$)/;
 const REDIRECT = /(?:^|[^<>&0-9])(?:[0-9]+|&)?>{1,2}\|?[ \t]*(\/tmp(?:\/[^\s'"`;|&<>()]*)?)(?=[\s'"`;|&<>()]|$)/;
-const WRAPPERS = new Set(["sudo", "env", "command", "exec", "time", "nice", "nohup", "builtin"]);
-const SHORT_O: Record<string, string[]> = {
-  curl: ["-o", "-O"], wget: ["-o", "-O"],
-  cc: ["-o"], gcc: ["-o"], clang: ["-o"], "g++": ["-o"], "c++": ["-o"], "clang++": ["-o"],
+/** Wrappers that run the next command, with the options of theirs that take a value. */
+const WRAPPERS: Record<string, string[]> = {
+  sudo: ["-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "--user", "--group", "--chdir"],
+  env: ["-u", "-C", "-S", "--unset", "--chdir", "--split-string"],
+  timeout: ["-s", "-k", "--signal", "--kill-after"],
+  nice: ["-n", "--adjustment"],
+  command: [],
+  exec: ["-a"],
+  time: ["-f", "-o", "--format", "--output"],
+  nohup: [],
+  builtin: [],
 };
-const LONG_OUTPUT = /^--(?:output(?:-[a-z]+)?|log-file)(?:=(.*))?$/;
+/** Commands whose short -o/-O takes the output path; curl and wget may cluster it (-sSo). */
+const CLUSTERED_O = new Set(["curl", "wget"]);
+const COMPILERS = new Set(["cc", "gcc", "clang", "g++", "c++", "clang++"]);
+const LONG_OUTPUT = /^--(?:output(?:-[a-z]+)?|log-file|outdir|outfile|target-dir)(?:=(.*))?$/;
+/** Options that take a value, per command, so the value is not an operand. */
+const VALUE_OPTIONS: Record<string, string[]> = {
+  touch: ["-r", "-d", "-t", "--reference", "--date"],
+  mkdir: ["-m", "--mode", "--context"],
+  tee: [],
+  mktemp: ["-p", "--tmpdir", "--suffix"],
+};
+
+const operandsOf = (args: string[], valueOptions: string[]): string[] => {
+  const operands: string[] = [];
+  for (let k = 0; k < args.length; k++) {
+    if (valueOptions.includes(args[k])) k++;
+    else if (!args[k].startsWith("-")) operands.push(args[k]);
+  }
+  return operands;
+};
 
 function commandTarget(words: string[]): string | undefined {
   let i = 0;
-  let wrapped = false;
-  while (i < words.length && (WRAPPERS.has(words[i]) || /^[A-Za-z_]\w*=/.test(words[i]) || (wrapped && words[i].startsWith("-")))) {
-    wrapped ||= WRAPPERS.has(words[i]);
+  for (;;) {
+    const word = words[i];
+    if (word === undefined) return undefined;
+    const assignment = /^([A-Za-z_]\w*)=(.*)$/.exec(word);
+    if (assignment) {
+      // CARGO_TARGET_DIR=/tmp/t cargo build: a *_DIR pointed into /tmp is a write target.
+      if (assignment[1].endsWith("_DIR") && TMP_WORD.test(assignment[2])) return assignment[2];
+      i++;
+      continue;
+    }
+    const valueOptions = Object.hasOwn(WRAPPERS, word) ? WRAPPERS[word] : undefined;
+    if (!valueOptions) break;
     i++;
+    while (words[i]?.startsWith("-")) i += valueOptions.includes(words[i]) ? 2 : 1;
+    // timeout's first operand is its duration, not the command.
+    if (word === "timeout") i++;
   }
-  if (i >= words.length) return undefined;
   const name = basename(words[i]);
   const args = words.slice(i + 1);
   for (const [index, arg] of args.entries()) {
@@ -164,7 +306,7 @@ function commandTarget(words: string[]): string | undefined {
       if (value !== undefined && TMP_WORD.test(value)) return value;
     }
   }
-  const operands = args.filter((arg) => !arg.startsWith("-"));
+  const operands = operandsOf(args, VALUE_OPTIONS[name] ?? []);
   switch (name) {
     case "mkdir":
     case "touch":
@@ -181,13 +323,13 @@ function commandTarget(words: string[]): string | undefined {
       for (const arg of args) if (arg.startsWith("of=") && TMP_WORD.test(arg.slice(3))) return arg.slice(3);
       return undefined;
   }
-  const flags = SHORT_O[name];
-  if (flags)
-    for (const [index, arg] of args.entries())
-      for (const flag of flags) {
-        if (arg === flag && TMP_WORD.test(args[index + 1] ?? "")) return args[index + 1];
-        if (arg.startsWith(flag) && TMP_WORD.test(arg.slice(flag.length))) return arg.slice(flag.length);
-      }
+  for (const [index, arg] of args.entries()) {
+    // -o PATH, -oPATH, and for curl and wget also a cluster ending in o/O: -sSo PATH, -sSoPATH.
+    const short = CLUSTERED_O.has(name) ? /^-[A-Za-z]*?[oO](.*)$/.exec(arg) : COMPILERS.has(name) ? /^-o(.*)$/.exec(arg) : null;
+    if (!short) continue;
+    const value = short[1] === "" ? args[index + 1] : short[1];
+    if (value !== undefined && TMP_WORD.test(value)) return value;
+  }
   return undefined;
 }
 
@@ -227,8 +369,9 @@ export function wallToolCalls(request: ResponsesRequest, output: ProxyOutput): P
   let changed = false;
   const toolCalls = output.toolCalls.map((call) => {
     if (!isExecCommand(request, call.name)) return call;
-    // The same repair responses.ts applies, so the wall sees what Codex will run.
-    const repaired = repairToolArguments(call.arguments, { tool: call.name, threadId });
+    // The same repair responses.ts applies, so the wall sees what Codex will run;
+    // silent, because responses.ts logs it for the call it emits.
+    const repaired = repairToolArguments(call.arguments, { tool: call.name, threadId, silent: true });
     let args: unknown;
     try {
       args = JSON.parse(repaired);
@@ -246,20 +389,8 @@ export function wallToolCalls(request: ResponsesRequest, output: ProxyOutput): P
 
 // ---- (c) the exit report ----
 
-const runStarts = new Map<string, number>();
-const MAX_RUNS = 2000;
-
-/** Remember when a declared reader was first seen; call on every request. */
-export function noteReaderRun(request: ResponsesRequest, now = Date.now()): void {
-  const thread = request.prompt_cache_key;
-  if (typeof thread !== "string" || !thread || runStarts.has(thread)) return;
-  if (!declaredScratchRoot(request)) return;
-  if (runStarts.size >= MAX_RUNS) runStarts.delete(runStarts.keys().next().value!);
-  runStarts.set(thread, now);
-}
-
 function defaultRunStart(thread: string, _request: ResponsesRequest): number | undefined {
-  return runStarts.get(thread);
+  return runs.get(thread)?.start;
 }
 
 // Entries that belong to the session or other daemons, never to a reader.
@@ -272,20 +403,25 @@ const START_SLACK_MS = 1000;
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** The reader's own commands: exec_command cmd strings, decoded, and apply_patch input. */
+/**
+ * The reader's own commands: exec_command cmd strings with heredoc bodies stripped,
+ * and from apply_patch only the paths of its Add File, Update File and Move to
+ * headers. Other tools' arguments (a message naming /tmp/x) are not commands.
+ */
 function ownCommands(request: ResponsesRequest): string[] {
   if (!Array.isArray(request.input)) return [];
   const texts: string[] = [];
   for (const item of request.input) {
-    if (item.type === "function_call" && typeof item.arguments === "string") {
+    if (item.type === "function_call" && item.name === "exec_command" && typeof item.arguments === "string") {
+      let args: { cmd?: unknown } | undefined;
       try {
-        const args = JSON.parse(repairToolArguments(item.arguments, { tool: item.name ?? "" }));
-        texts.push(typeof args?.cmd === "string" ? args.cmd : JSON.stringify(args));
+        args = JSON.parse(repairToolArguments(item.arguments, { tool: item.name, silent: true }));
       } catch {
-        texts.push(item.arguments);
+        continue;
       }
-    } else if (item.type === "custom_tool_call" && typeof item.input === "string") {
-      texts.push(item.input);
+      if (typeof args?.cmd === "string") texts.push(stripHeredocs(args.cmd));
+    } else if (item.type === "custom_tool_call" && item.name === "apply_patch" && typeof item.input === "string") {
+      for (const header of item.input.matchAll(/^\*\*\* (?:Add File|Update File|Move to): (.+)$/gm)) texts.push(header[1].trim());
     }
   }
   return texts;
@@ -366,9 +502,12 @@ async function sweepReaderTmp(
     if (!(stat.birthtimeMs > 0) || stat.birthtimeMs < start - START_SLACK_MS) continue;
     fresh.push(path);
   }
-  if (fresh.length === 0) return undefined;
+  // Each leftover is reported once per thread.
+  const run = runs.get(thread);
+  const unreported = fresh.filter((path) => !run?.reported.has(path));
+  if (unreported.length === 0) return undefined;
   const busy = await busyPaths();
-  const left = fresh.filter((path) => {
+  const left = unreported.filter((path) => {
     let real = path;
     try {
       real = realpathSync(path);
@@ -394,6 +533,8 @@ async function sweepReaderTmp(
     console.error("scratch-wall: logging the violation failed:", (cause as Error).message);
     return false;
   });
+  // Only a report that reached the ledger counts; a failed one is tried again next time.
+  if (logged) for (const path of left) run?.reported.add(path);
   return { root, left, logged };
 }
 
@@ -416,7 +557,7 @@ export function scheduleSweep(request: ResponsesRequest, output: ProxyOutput): v
   }, 0);
 }
 
-type LogOptions = { bin?: string; socket?: string; allowInTest?: boolean };
+type LogOptions = { bin?: string; socket?: string; allowInTest?: boolean; deadlineMs?: number };
 
 /** log_rule_violation through Today's own stdio MCP server; never from a test unless asked. */
 async function logViolation(violation: ScratchViolation, options: LogOptions = {}): Promise<boolean> {
@@ -434,9 +575,25 @@ async function logViolation(violation: ScratchViolation, options: LogOptions = {
   const { CODEX_THREAD_ID: _thread, ...env } = process.env;
   for (const key of STRIPPED_ENV) delete env[key];
   const child = Bun.spawn([bin, "mcp", "--socket", socket], { env, stdin: new TextEncoder().encode(lines), stdout: "pipe", stderr: "ignore" });
-  const timer = setTimeout(() => child.kill("SIGKILL"), 15_000);
-  try {
-    const [, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+  const reader = child.stdout.getReader();
+  // One deadline for the whole call: it kills the child and cancels the read, which
+  // a descendant holding stdout open would otherwise keep waiting on.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<false>((resolve) => {
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reader.cancel().catch(() => {});
+      resolve(false);
+    }, options.deadlineMs ?? 15_000);
+  });
+  const work = (async () => {
+    const decoder = new TextDecoder();
+    let stdout = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      stdout += decoder.decode(value, { stream: true });
+    }
     for (const line of stdout.split("\n")) {
       try {
         const reply = JSON.parse(line);
@@ -444,6 +601,9 @@ async function logViolation(violation: ScratchViolation, options: LogOptions = {
       } catch {}
     }
     return false;
+  })().catch(() => false);
+  try {
+    return await Promise.race([work, deadline]);
   } finally {
     clearTimeout(timer);
   }
@@ -454,9 +614,8 @@ export const __test = {
   declaredScratchRoot,
   tmpWriteTarget,
   sweepReaderTmp,
-  noteReaderRun,
+  runs,
   defaultRunStart,
-  runStarts,
   MAX_RUNS,
   logViolation,
   sweeps,

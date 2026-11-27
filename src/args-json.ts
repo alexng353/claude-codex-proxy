@@ -88,7 +88,7 @@ export function repairJsonStrings(text: string): { text: string; escapes: number
  * The arguments to send Codex: unchanged when they parse or when no repair yields a
  * JSON object; otherwise the repaired text, logged as one line with no argument text.
  */
-export function repairToolArguments(args: string, context: { tool: string; threadId?: string }): string {
+export function repairToolArguments(args: string, context: { tool: string; threadId?: string; silent?: boolean }): string {
   try {
     JSON.parse(args);
     return args;
@@ -103,6 +103,8 @@ export function repairToolArguments(args: string, context: { tool: string; threa
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return args;
   const kind: ArgsRepairKind = repair.escapes && repair.controls ? "escape+control" : repair.escapes ? "escape" : "control";
-  console.log(JSON.stringify({ argsRepaired: repair.escapes + repair.controls, kind, tool: context.tool, threadId: context.threadId }));
+  // silent: a second reader of the same arguments (the scratch wall) logs nothing.
+  if (!context.silent)
+    console.log(JSON.stringify({ argsRepaired: repair.escapes + repair.controls, kind, tool: context.tool, threadId: context.threadId }));
   return repair.text;
 }
