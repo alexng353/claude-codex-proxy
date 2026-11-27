@@ -417,10 +417,35 @@ describe("photo notice tail", () => {
     expect(tail).not.toContain("nothing outstanding");
     expect(tail).toMatch(/^later: night teeth[^,]*: moved to 02:00/);
     expect(tail).not.toMatch(/shower[^,]*: moved to/);
+    // Tonight's photos carry their date, so they can't read as the shower just credited or a second Nov 5 teeth.
+    expect(tail).toBe(
+      "later: night teeth (Nov 5): moved to 02:00, shower photo (Nov 6, before midnight), night teeth photo (Nov 6, 17:00 to midnight), morning teeth photo (from 05:00)",
+    );
   });
 
   test("what locks now comes first, then what is owed later", async () => {
     const s = await state();
     expect(noticeTail(s, clock)).toMatch(/^still due: shower photo \(overdue from Nov 5\), night teeth photo \(overdue from Nov 5\); later: /);
+  });
+
+  test("'nothing outstanding' when the day's photos are all in", () => {
+    const s = emptyState(iso(at(DAY, "05:00")));
+    Object.assign(s.filled, { [`${DAY}/morning-teeth`]: "a", [`${DAY}/shower`]: "b", [`${DAY}/night-teeth`]: "c" });
+    expect(noticeTail(s, at(DAY, "23:16"))).toBe("nothing outstanding");
+  });
+
+  test("a travel day's shower and night teeth are not listed as owed", () => {
+    const now = Date.parse("2026-11-05T12:00:00Z"); // 19:00 WIB, six hours after landing in Jakarta
+    try {
+      setZoneHistory([
+        { zone: "America/Vancouver", from: "2026-10-01T00:00:00Z", seenAt: "2026-10-01T00:00:00Z" },
+        { zone: "Asia/Jakarta", from: "2026-11-05T06:00:00Z", seenAt: "2026-11-05T06:00:00Z" },
+      ]);
+      const tail = noticeTail(emptyState("2026-10-01T00:00:00Z"), now);
+      expect(tail).not.toContain("shower photo");
+      expect(tail).not.toContain("night teeth photo");
+    } finally {
+      setZoneHistory(undefined);
+    }
   });
 });

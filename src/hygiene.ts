@@ -744,16 +744,19 @@ function slotOpen(state: GateState, name: string, now: number): boolean {
 export function dueToday(state: GateState, now: number): Requirement[] {
   const { day, minutes } = localTime(now);
   const result: Requirement[] = [];
-  if (!state.filled[slot.shower(day)])
-    result.push({ slot: slot.shower(day), kind: "shower", label: "shower photo (before midnight)" });
-  if (!state.filled[slot.night(day)])
+  // Before 05:00 "today" is already the new day, so tonight's photos are ~a day off; undated they read
+  // as last night's (a shower credited at 00:24 was followed by "shower photo (before midnight)").
+  const tonight = minutes < MORNING_MINUTE ? `${dayLabel(day)}, ` : "";
+  if (!state.filled[slot.shower(day)] && enforced(state, slot.shower(day), now))
+    result.push({ slot: slot.shower(day), kind: "shower", label: `shower photo (${tonight}before midnight)` });
+  if (!state.filled[slot.night(day)] && enforced(state, slot.night(day), now))
     result.push({
       slot: slot.night(day),
       kind: "teeth",
       label:
         minutes >= NIGHT_TEETH_MINUTE
           ? "night teeth photo (before midnight)"
-          : "night teeth photo (17:00 to midnight)",
+          : `night teeth photo (${tonight}17:00 to midnight)`,
     });
   const morningPending = minutes < MORNING_MINUTE || delayActive(state, now);
   if (morningPending && !state.filled[slot.morning(day)] && enforced(state, slot.morning(day), now))

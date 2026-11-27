@@ -2236,7 +2236,7 @@ export function proofFile(hash: string): string | null {
 
 /**
  * The last part of Bubble's photo notice: what locks now, then what is still owed but does not lock
- * yet, moved photos first ("night teeth photo (Nov 27): moved to 02:00"). "nothing outstanding" only
+ * yet, moved photos first ("night teeth (Nov 27): moved to 02:00"). "nothing outstanding" only
  * when neither is left: on Nov 28 00:24 WIB a shower credit said it while LATER-moved night teeth was
  * still owed, and Alex read the teeth as dropped.
  */
