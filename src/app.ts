@@ -14,7 +14,7 @@ import { preparePlateActivity } from "./plate-activity";
 import { validateRequest } from "./request";
 import { responseObject, streamResponse } from "./responses";
 import { scrubRequest } from "./scrub.mjs";
-import { noteReaderRun, sweepReaderTmp, wallToolCalls } from "./scratch-wall";
+import { noteReaderRun, scheduleSweep, wallToolCalls } from "./scratch-wall";
 import { preloadSkills } from "./skill-preload";
 import type { ProxyOutput, ResponsesRequest } from "./types";
 import { lastZoneCheck } from "./zone-check";
@@ -175,12 +175,11 @@ export async function handleRequest(request: Request, peer?: string): Promise<Re
     const prepared = preloadSkills(activity.request);
     const perpetual = await preparePerpetualWaiting(prepared, { signal: request.signal });
     const claude = perpetual ? await perpetual.run(runClaude, request.signal) : await runClaude(prepared);
-    // Scratch wall: TMPDIR in the root, /tmp writes refused, and on a final answer
-    // its /tmp leftovers moved and counted. Chats without a declared root: unchanged.
+    // Scratch wall: a declared reader's /tmp writes are refused, and after its final
+    // answer its /tmp leftovers are reported (never moved), off the request path.
+    // Chats without a declared root: unchanged.
     const output = wallToolCalls(gate.request, claude);
-    void sweepReaderTmp(gate.request, output).catch((cause) =>
-      console.error("scratch-wall: sweep failed:", (cause as Error).message),
-    );
+    scheduleSweep(gate.request, output);
     activity.commit();
     const response = responseObject(body, output);
     const reply = body.stream ? streamResponse(response) : json(response);
