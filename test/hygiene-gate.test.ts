@@ -2207,7 +2207,7 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     expect(notices).toHaveLength(1);
     expect(notices[0].thread).toBe(BUBBLE);
     expect(notices[0].id).toMatch(/^hygiene-notice-\d+-[0-9a-f]{12}$/);
-    expect(notices[0].text).toBe("credited: morning teeth 06:00; nothing outstanding");
+    expect(notices[0].text).toBe("credited: morning teeth 06:00; later: shower photo (before midnight), night teeth photo (17:00 to midnight)");
     // Sent is recorded on disk, so a later flush (or a restarted proxy reading the store) sends nothing.
     clock += minutes(60);
     await flushWakes();
@@ -2227,7 +2227,7 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     clock += 30_000;
     await flushWakes();
     expect(notices).toHaveLength(1);
-    expect(notices[0].text).toBe("credited: morning teeth 06:01; rejected: photo (no person); nothing outstanding");
+    expect(notices[0].text).toBe("credited: morning teeth 06:01; rejected: photo (no person); later: shower photo (before midnight), night teeth photo (17:00 to midnight)");
   });
 
   test("a reject posts its reason and what is still due", async () => {
@@ -2240,7 +2240,7 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     await flushWakes();
     expect(notices).toHaveLength(1);
     expect(notices[0].text).toBe(
-      "rejected: photo (no person), photo (photo too old); still due: morning teeth photo",
+      "rejected: photo (no person), photo (photo too old); still due: morning teeth photo; later: shower photo (before midnight), night teeth photo (17:00 to midnight)",
     );
   });
 
@@ -2263,12 +2263,12 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     expect(notices).toHaveLength(2);
     expect(notices[1].id).toBe(notices[0].id);
     expect(notices[1].text).toBe(notices[0].text);
-    expect(notices[1].text).toBe("credited: morning teeth 06:00; nothing outstanding");
+    expect(notices[1].text).toBe("credited: morning teeth 06:00; later: shower photo (before midnight), night teeth photo (17:00 to midnight)");
     clock += minutes(1);
     await flushWakes();
     expect(notices).toHaveLength(3);
     expect(notices[2].id).not.toBe(notices[0].id);
-    expect(notices[2].text).toBe("rejected: shower (photo too old); nothing outstanding");
+    expect(notices[2].text).toBe("rejected: shower (photo too old); later: shower photo (before midnight), night teeth photo (17:00 to midnight)");
     clock += minutes(60);
     await flushWakes();
     expect(notices).toHaveLength(3);
@@ -2292,7 +2292,7 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     expect(notices).toHaveLength(0);
     clock += minutes(2);
     await flushWakes();
-    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; nothing outstanding"]);
+    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; later: shower photo (before midnight), night teeth photo (17:00 to midnight)"]);
   });
 
   test("photos nobody asked about post nothing", async () => {
@@ -2323,7 +2323,7 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     await flushWakes();
     clock += minutes(5);
     await flushWakes();
-    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; rejected: shower (photo too old); nothing outstanding"]);
+    expect(notices.map((n) => n.text)).toEqual(["credited: morning teeth 06:00; rejected: shower (photo too old); later: shower photo (before midnight), night teeth photo (17:00 to midnight)"]);
   });
 
   test("a Cairn credit and an outage replay each notify; a replay of a credited photo is not a reject", async () => {
@@ -2336,7 +2336,7 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     expect(cairn.result).toBe("pass");
     clock += minutes(2);
     await flushWakes();
-    expect(notices.map((n) => n.text)).toEqual(["credited: shower 06:00; still due: morning teeth photo"]);
+    expect(notices.map((n) => n.text)).toEqual(["credited: shower 06:00; still due: morning teeth photo; later: night teeth photo (17:00 to midnight)"]);
     // The same photo replayed from a follower's outage queue (it lost the reply): a copy, told as credited.
     clock += minutes(1);
     expect((await replay("cairn-shower")).ok).toBe(true);
@@ -2348,8 +2348,8 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     clock += minutes(2);
     await flushWakes();
     expect(notices.map((n) => n.text)).toEqual([
-      "credited: shower 06:00; still due: morning teeth photo",
-      "credited: morning teeth 06:03; nothing outstanding",
+      "credited: shower 06:00; still due: morning teeth photo; later: night teeth photo (17:00 to midnight)",
+      "credited: morning teeth 06:03; later: night teeth photo (17:00 to midnight)",
     ]);
   });
 
@@ -2363,14 +2363,14 @@ describe("photo notices to Bubble (Alex, 2026-11-05)", () => {
     await stale("s2");
     clock += 1_000;
     await flushWakes();
-    expect(notices.map((n) => n.text)).toEqual(["rejected: shower (photo too old), shower (photo too old); still due: morning teeth photo"]);
+    expect(notices.map((n) => n.text)).toEqual(["rejected: shower (photo too old), shower (photo too old); still due: morning teeth photo; later: shower photo (before midnight), night teeth photo (17:00 to midnight)"]);
     clock += 1_000;
     await stale("s3");
     clock += minutes(2);
     await flushWakes();
     expect(notices).toHaveLength(2);
     expect(notices[1].id).not.toBe(notices[0].id);
-    expect(notices[1].text).toBe("rejected: shower (photo too old); still due: morning teeth photo");
+    expect(notices[1].text).toBe("rejected: shower (photo too old); still due: morning teeth photo; later: shower photo (before midnight), night teeth photo (17:00 to midnight)");
   });
 
   test("a proxy from before notices never sees one as a wake to send (deploy handoff)", async () => {

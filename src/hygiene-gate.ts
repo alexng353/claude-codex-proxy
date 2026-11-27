@@ -315,9 +315,7 @@ function sendNotices(state: GateState): void {
   if (!events?.length) return;
   pendingNotices.delete(state);
   const now = deps.now();
-  const due = outstanding(state, now);
-  const open = bypassActive(state, now) ? ` (bypass open until ${clockLabel(Date.parse(state.bypass.until!))})` : "";
-  const tail = due.length ? `still due: ${due.map((r) => r.label).join(", ")}${open}` : "nothing outstanding";
+  const tail = noticeTail(state, now);
   unqueued.push({ events, tail });
   if (unqueued.length > UNQUEUED_MAX) unqueued = unqueued.slice(-UNQUEUED_MAX);
   try {
@@ -2234,4 +2232,24 @@ export function proofDays(from: string, to: string) {
 export function proofFile(hash: string): string | null {
   const record = loadState().images.find((r) => r.sha256 === hash && r.verdict === "accepted" && r.file);
   return record?.file ?? null;
+}
+
+/**
+ * The last part of Bubble's photo notice: what locks now, then what is still owed but does not lock
+ * yet, moved photos first ("night teeth photo (Nov 27): moved to 02:00"). "nothing outstanding" only
+ * when neither is left: on Nov 28 00:24 WIB a shower credit said it while LATER-moved night teeth was
+ * still owed, and Alex read the teeth as dropped.
+ */
+export function noticeTail(state: GateState, now: number): string {
+  const due = outstanding(state, now);
+  const open = bypassActive(state, now) ? ` (bypass open until ${clockLabel(Date.parse(state.bypass.until!))})` : "";
+  const locking = new Set(due.map((r) => r.slot));
+  const isMoved = (r: { label: string }) => r.label.includes(": moved to ");
+  const later = dueToday(state, now)
+    .filter((r) => !locking.has(r.slot))
+    .sort((a, b) => Number(isMoved(b)) - Number(isMoved(a)));
+  const parts: string[] = [];
+  if (due.length) parts.push(`still due: ${due.map((r) => r.label).join(", ")}${open}`);
+  if (later.length) parts.push(`later: ${later.map((r) => r.label).join(", ")}`);
+  return parts.length ? parts.join("; ") : "nothing outstanding";
 }

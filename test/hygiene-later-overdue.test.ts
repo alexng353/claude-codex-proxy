@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chargeBrokenMoves, emptyState, lockedText, moveSlots, outstanding, setZoneHistory, zonedTime } from "../src/hygiene";
 import { handleHygieneApi, setAuthenticator } from "../src/hygiene-api";
-import { gateRequest, resetGateCache, setGateDeps } from "../src/hygiene-gate";
+import { gateRequest, noticeTail, resetGateCache, setGateDeps } from "../src/hygiene-gate";
 import type { ResponseInputItem, ResponsesRequest } from "../src/types";
 
 // Same fakes as hygiene-move.test.ts, armed from Nov 4 so Nov 5's night photos are overdue after midnight.
@@ -398,5 +398,29 @@ describe("LATER before midnight is unchanged", () => {
     expect(lockedText([{ slot: `${DAY}/morning-teeth`, kind: "teeth", label: "morning teeth photo" }])).toEndWith(
       "before midnight, e.g. LATER 21:00 (not a bypass).",
     );
+  });
+});
+
+/**
+ * Bubble, Nov 27 10:31 MST: at 00:24 WIB Nov 28 a shower credit said "nothing outstanding" while night
+ * teeth, moved by LATER 02:00, was still owed, and Alex read it as dropped.
+ */
+describe("photo notice tail", () => {
+  test("a credit after LATER lists the moved photo still owed, never 'nothing outstanding'", async () => {
+    clock = at(NIGHT, "00:20");
+    expect(await say("LATER 02:00")).toStartWith("⏩ moved shower (Nov 5), night teeth (Nov 5) to 02:00.");
+    clock = at(NIGHT, "00:24");
+    await sendPhoto("shower");
+    const s = await state();
+    expect(outstanding(s, clock)).toEqual([]);
+    const tail = noticeTail(s, clock);
+    expect(tail).not.toContain("nothing outstanding");
+    expect(tail).toMatch(/^later: night teeth[^,]*: moved to 02:00/);
+    expect(tail).not.toMatch(/shower[^,]*: moved to/);
+  });
+
+  test("what locks now comes first, then what is owed later", async () => {
+    const s = await state();
+    expect(noticeTail(s, clock)).toMatch(/^still due: shower photo \(overdue from Nov 5\), night teeth photo \(overdue from Nov 5\); later: /);
   });
 });
