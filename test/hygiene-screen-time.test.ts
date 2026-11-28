@@ -118,6 +118,12 @@ test("unknown fields and client identity are rejected without being persisted", 
 });
 
 test("telemetry validates the complete bounded v1 schema", async () => {
+  // cairn-later-moves-lock F2: a Cairn that keeps bedtime_full_from says so; older ones omit it.
+  expect((await telemetry(report({ bedtime_full_from: true }))).code).toBe(200);
+  expect(JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8")).screenTime.at(-1).bedtime_full_from).toBe(true);
+  expect((await telemetry(report())).code).toBe(200);
+  expect(JSON.parse(readFileSync(process.env.HYGIENE_GATE_STATE!, "utf8")).screenTime.at(-1)).not.toHaveProperty("bedtime_full_from");
+  for (const bad of ["yes", 1, null]) expect((await telemetry(report({ bedtime_full_from: bad }))).code).toBe(400);
   for (const body of [null, [], {}, report({ version: 2 }), report({ version: "1" }), report({ authorization: "authorized" }),
     report({ build: "x".repeat(65) }), report({ time_zone: "x".repeat(65) }), report({ time_zone: "not/a-zone" }),
     report({ reported_at: "tomorrow" }), report({ reported_at: "2026-11-24T10:00:00" }), report({ scheduled_at: 0 }),

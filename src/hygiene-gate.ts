@@ -79,6 +79,7 @@ import {
   chargeBrokenMoves,
   isOverdueItem,
   bedtimeFullFrom,
+  bedtimeHold,
   movableSlots,
   moveSlots,
   movesToday,
@@ -1109,6 +1110,16 @@ export type MoveOutcome =
  * to later today. Never a BYPASS: the bypass count and debts are untouched.
  * Mutates `state` only on success (the caller saves it).
  */
+/**
+ * The phone keeps a LATER's whole-phone hold: its latest report is fresh, its bedtime lock is on,
+ * and its Cairn says it reads bedtime_full_from. An older Cairn ignores the field, so promising it
+ * the hold would send Alex to Emergency (cairn-later-moves-lock F2).
+ */
+function phoneKeepsBedtimeHold(state: GateState, now: number): boolean {
+  const view = screenTimeView(state, now);
+  return !!view && !view.stale && view.bedtime_enabled && view.bedtime_full_from === true;
+}
+
 function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string): MoveOutcome {
   const time = resolveMoveTime(cmd.time, now, cmd.otherDay);
   if ("error" in time) return { ok: false, error: time.error };
@@ -1169,11 +1180,15 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
   const promise = names.every(isOverdueItem)
     ? `it locks again at ${clockLabel(time.at)}, and if it isn't done by ${clockLabel(limit)} it counts as a skip`
     : "if it isn't done by midnight it counts as a skip";
-  // Last night's photos also hold back the phone's whole-phone lock (bedtimeFullFrom).
-  const phone =
-    names.some(isOverdueItem) && screenTimeView(state, now)?.bedtime_enabled
-      ? ` Your phone's whole-phone lock waits until ${clockLabel(time.at)} too; the late-night apps stay locked.`
-      : "";
+  // Last night's photos also hold back the phone's whole-phone lock. The sentence names the hold
+  // as it now stands (the earliest, capped at 01:00), and only to a Cairn that keeps it.
+  const hold = names.some(isOverdueItem) && phoneKeepsBedtimeHold(state, now) ? bedtimeHold(state, now) : undefined;
+  const latest = hold?.capped ? " (the latest it waits)" : "";
+  const phone = !hold
+    ? ""
+    : outstanding(state, now).length
+      ? ` Your phone's whole-phone lock waits until ${clockLabel(hold.at)}${latest} once your other photos are in; the late-night apps stay locked.`
+      : ` Your phone's whole-phone lock waits until ${clockLabel(hold.at)} too${latest}; the late-night apps stay locked.`;
   return {
     ok: true,
     message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); ${promise}.${phone}`,

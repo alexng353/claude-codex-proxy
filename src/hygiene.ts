@@ -934,23 +934,36 @@ export function movesToday(state: GateState, slotName: string, now: number): Slo
   return (state.moves ?? []).filter((m) => m.slot === slotName && localTime(Date.parse(m.at)).day === today);
 }
 
+/** The whole-phone hold never runs past 01:00 local, 60 minutes after it would start (Bubble, Nov 28). */
+export const BEDTIME_HOLD_LIMIT_MINUTE = 60;
+
 /**
- * When tonight's whole-phone Screen Time lock starts, if a LATER moved it (Alex, Nov 28: "can I
- * have it so a LATER pushes my screen time lock too, but not for x and aidoku"): the earliest
- * moved-to time of last night's shower and night teeth that are still owed, never past their
- * 04:00 cap. Undefined once they are done, once that time arrives, or with no such move, so the
- * phone keeps its own midnight start. The late-app lock (X, Aidoku) is the phone's and never moves.
+ * How long a LATER holds tonight's whole-phone Screen Time lock (Alex, Nov 28: "can I have it so
+ * a LATER pushes my screen time lock too, but not for x and aidoku"): until the earliest moved-to
+ * time still ahead of last night's shower and night teeth, never past 01:00. Done photos keep
+ * the hold (Bubble, Nov 28: sending them late must not pay). `capped` when a moved time ran past
+ * 01:00. Undefined with no such move or once the time arrives, so the phone keeps its own
+ * midnight start. The late-app lock (X, Aidoku) is the phone's and never moves.
  */
-export function bedtimeFullFrom(state: GateState, now: number): string | undefined {
-  const yesterday = addDays(localTime(now).day, -1);
-  let from = Number.POSITIVE_INFINITY;
+export function bedtimeHold(state: GateState, now: number): { at: number; capped: boolean } | undefined {
+  const { day } = localTime(now);
+  const yesterday = addDays(day, -1);
+  let to = Number.POSITIVE_INFINITY;
   for (const name of [slot.shower(yesterday), slot.night(yesterday)]) {
-    const to = movedTo(state, name, now);
-    if (to === null || state.filled[name] || !enforced(state, name, now)) continue;
-    if (itemStopped(state, itemKey(name), now) || armedDuringSuspension(state, name) || slotSkipped(state, name)) continue;
-    from = Math.min(from, to, overdueLimit(name));
+    const moved = movedTo(state, name, now);
+    if (moved === null || moved <= now || !enforced(state, name, now)) continue;
+    to = Math.min(to, moved);
   }
-  return from > now && Number.isFinite(from) ? new Date(from).toISOString() : undefined;
+  if (!Number.isFinite(to)) return undefined;
+  const limit = zonedTime(day, BEDTIME_HOLD_LIMIT_MINUTE);
+  const at = Math.min(to, limit);
+  return at > now ? { at, capped: to > limit } : undefined;
+}
+
+/** bedtimeHold's end as the status field the phone reads. */
+export function bedtimeFullFrom(state: GateState, now: number): string | undefined {
+  const hold = bedtimeHold(state, now);
+  return hold ? new Date(hold.at).toISOString() : undefined;
 }
 
 /** Every move, photo and gym, oldest first. Gym moves live on their plan's log; here they read as slot `gym/<plan id>`. */

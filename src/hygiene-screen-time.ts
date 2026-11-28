@@ -21,12 +21,16 @@ export type ScreenTimeReport = {
   adult_filter_enabled: boolean;
   adult_filter_applied: boolean;
   adult_filter_unlock_until: string | null;
+  /** Optional capability: this Cairn keeps the status's bedtime_full_from hold. Older builds omit it. */
+  bedtime_full_from?: boolean;
 };
 export type ScreenTimeSnapshot = ScreenTimeReport & { device_id: string; received_at: string };
 const MINUTES = ["late_start_minute", "full_start_minute", "wake_minute"] as const;
 const COUNTS = ["late_app_count", "late_category_count", "late_web_count", "allowlist_app_count", "allowlist_category_count", "allowlist_web_count"] as const;
 const FLAGS = ["bedtime_enabled", "adult_filter_enabled", "adult_filter_applied"] as const;
 const KEYS = ["version", "build", "reported_at", "authorization", "time_zone", ...MINUTES, ...COUNTS, ...FLAGS, "scheduled_at", "adult_filter_unlock_until"] as const;
+const OPTIONAL = ["bedtime_full_from"] as const;
+const ALLOWED: readonly string[] = [...KEYS, ...OPTIONAL];
 const ISO = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})$/;
 function iso(v: unknown): v is string {
   if (typeof v !== "string" || v.length > 40) return false;
@@ -43,14 +47,15 @@ const boundedInt = (v: unknown, max: number) => typeof v === "number" && Number.
 export function parseScreenTime(body: unknown): ScreenTimeReport | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const b = body as Record<string, unknown>;
-  if (Object.keys(b).some(k => !(KEYS as readonly string[]).includes(k)) || KEYS.some(k => !Object.hasOwn(b, k))) return null;
+  if (Object.keys(b).some(k => !ALLOWED.includes(k)) || KEYS.some(k => !Object.hasOwn(b, k))) return null;
   if (b.version !== 1 || typeof b.build !== "string" || b.build.length > 64 || !iso(b.reported_at) ||
     !["approved", "denied", "notDetermined"].includes(b.authorization as string) ||
     typeof b.time_zone !== "string" || !knownZone(b.time_zone) ||
     MINUTES.some(k => !boundedInt(b[k], 1439)) || COUNTS.some(k => !boundedInt(b[k], 10000)) ||
     FLAGS.some(k => typeof b[k] !== "boolean") ||
+    OPTIONAL.some(k => Object.hasOwn(b, k) && typeof b[k] !== "boolean") ||
     (b.scheduled_at !== null && !iso(b.scheduled_at)) || (b.adult_filter_unlock_until !== null && !iso(b.adult_filter_unlock_until))) return null;
-  return Object.fromEntries(KEYS.map(k => [k, b[k]])) as ScreenTimeReport;
+  return Object.fromEntries(ALLOWED.filter(k => Object.hasOwn(b, k)).map(k => [k, b[k]])) as ScreenTimeReport;
 }
 
 export function storeScreenTime(state: GateState, report: ScreenTimeReport, deviceId: string, now: number): void {
@@ -67,7 +72,9 @@ export function screenTimeView(state: GateState, now: number) {
 export function summarizeScreenTime(input: unknown) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
   const s = input as Record<string, unknown>;
-  const report = parseScreenTime(Object.fromEntries(KEYS.map(k => [k, s[k]])));
+  const fields: Record<string, unknown> = Object.fromEntries(KEYS.map(k => [k, s[k]]));
+  for (const k of OPTIONAL) if (s[k] !== undefined) fields[k] = s[k];
+  const report = parseScreenTime(fields);
   if (!report || typeof s.device_id !== "string" || !iso(s.received_at) || typeof s.stale !== "boolean") return null;
   return { ...report, device_id: s.device_id, received_at: s.received_at, stale: s.stale };
 }
