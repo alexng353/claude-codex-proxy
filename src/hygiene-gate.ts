@@ -85,6 +85,8 @@ import {
   OVERDUE_MOVE_LIMIT_MINUTE,
   parseMoveText,
   resolveMoveTime,
+  penanceChoice,
+  retirePenances,
   supersedeMoveDebts,
   type MoveCommand,
   type SlotMove,
@@ -1803,7 +1805,7 @@ export async function resolveDebt(
   return serialized(async () => {
     const state = structuredClone(loadState());
     const debt = state.debts.find((d) => d.id === id);
-    if (!debt) return { status: 404, body: { error: "no such debt" } };
+    if (!debt) return { status: 404, body: { error: noSuchDebt(id) } };
     if (debt.status !== "open") return { status: 409, body: { error: `debt already ${debt.status}` } };
     if (body.reasonClass !== undefined && body.reasonClass !== "gate_fault" && body.reasonClass !== "other")
       return { status: 422, body: { error: "reasonClass must be gate_fault or other" } };
@@ -1887,6 +1889,11 @@ export async function resolveDebt(
       const settled = skipRuledItems(state, debt, skipItems, `ruling on ${id}`, reason ?? "", deps.now());
       if (settled.skipped.length) debt.skippedItems = settled.skipped;
       notSkipped = settled.notSkipped;
+      const retired = retirePenances(state, penanceChoice(debt, body.skip), `justified ruling on ${id}`, reason ?? "", deps.now());
+      if (retired.length) {
+        debt.retiredPenances = retired;
+        console.error(`hygiene-gate: ruling ${id} retired ${retired.join(", ")}`);
+      }
     } else if (body.verdict === "unjustified") {
       const penance = typeof body.penance === "string" ? body.penance.trim() : "";
       if (!penance || penance.length > 200)
@@ -1970,6 +1977,15 @@ function queueFaults(state: GateState): void {
 export const REVISE_WINDOW_MS = 12 * 3_600_000;
 
 /**
+ * A penance slot `penance/<debt id>` names its debt: the id is everything after `penance/`
+ * (e.g. penance/bedtime-1795801383756-52 is debt bedtime-1795801383756-52), not the bypass
+ * number. Nov 28: Bubble guessed 2026-11-28-52 for that slot and got a bare "no such debt".
+ */
+function noSuchDebt(id: string): string {
+  return `no such debt ${id}: a penance slot penance/<id> is debt <id> (the part after "penance/"); /hygiene/status open_debts lists the ids`;
+}
+
+/**
  * Revise a ruling toward leniency only: an unpaid penance becomes justified, within 12 h of
  * the ruling, with a reason. The old verdict is kept in `history`, and the gate opens if the
  * penance was what held it. Nov 3: a ruling was withdrawn after new facts (sunrise 08:03, a
@@ -1982,7 +1998,7 @@ export async function reviseDebt(
   return serialized(async () => {
     const state = structuredClone(loadState());
     const debt = state.debts.find((d) => d.id === id);
-    if (!debt) return { status: 404, body: { error: "no such debt" } };
+    if (!debt) return { status: 404, body: { error: noSuchDebt(id) } };
     if (body.verdict !== "justified")
       return { status: 400, body: { error: 'a revision can only be toward leniency: verdict must be "justified"' } };
     const reason = typeof body.reason === "string" ? body.reason.trim() : "";
@@ -2012,6 +2028,11 @@ export async function reviseDebt(
     delete debt.penance;
     const settled = skipRuledItems(state, debt, skipItems, `revision of ${id}`, reason, now);
     if (settled.skipped.length) debt.skippedItems = [...new Set([...(debt.skippedItems ?? []), ...settled.skipped])];
+    const retired = retirePenances(state, penanceChoice(debt, body.skip), `revision of ${id}`, reason, now);
+    if (retired.length) {
+      debt.retiredPenances = [...new Set([...(debt.retiredPenances ?? []), ...retired])];
+      console.error(`hygiene-gate: revision of ${id} retired ${retired.join(", ")}`);
+    }
     saveState(state);
     console.error(`hygiene-gate: debt ${id} revised to justified: ${reason.slice(0, 120)}`);
     release(state, now, "ruling revised");

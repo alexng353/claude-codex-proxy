@@ -165,6 +165,8 @@ export type Debt = {
   status: "open" | "justified" | "penance" | "paid";
   /** What a justified ruling skipped (gym/<plan> or <day>/<item>), so it can't re-arm. */
   skippedItems?: string[];
+  /** Penances (penance/<debt id>) a justified ruling with skip retired, so they can't re-arm. */
+  retiredPenances?: string[];
   reason?: string;
   ruledAt?: string;
   penance?: { description: string; setAt: string; paidAt?: string };
@@ -589,9 +591,54 @@ export function skipChoice(debt: Debt, skip: unknown, faultItem?: string): strin
       : items.filter((i) => i.startsWith("gym/"));
   if (skip === false) return [];
   if (skip === true) return items.filter((i) => !i.startsWith("penance/"));
-  if (Array.isArray(skip) && skip.every((i) => typeof i === "string" && items.includes(i) && !i.startsWith("penance/")))
-    return skip as string[];
+  // A listed penance is retired, not skipped (penanceChoice, retirePenances).
+  if (Array.isArray(skip) && skip.every((i) => typeof i === "string" && items.includes(i)))
+    return (skip as string[]).filter((i) => !i.startsWith("penance/"));
   return { error: `skip must be true, false, or a list of this debt's items (${items.join(", ") || "none"})` };
+}
+
+/**
+ * The penances (penance/<debt id>) a justified ruling's skip covers: with `"skip":true` every
+ * penance the BYPASS captured as locking, or the ones a skip list names. Like ruledSlot, never
+ * a shield debt's inferred items or a move debt's. Nov 28: bypasses #53 and #54 over the walk
+ * penance of debt bedtime-1795801383756-52 were ruled justified with skip, the penance stayed
+ * unpaid, and the gate re-armed on it when each bypass ended.
+ */
+export function penanceChoice(debt: Debt, skip: unknown): string[] {
+  if (debt.source === "move" || debt.itemsComplete === false) return [];
+  const items = (debt.items ?? []).filter((i) => i.startsWith("penance/"));
+  if (skip === true) return items;
+  if (Array.isArray(skip)) return items.filter((i) => skip.includes(i));
+  return [];
+}
+
+/**
+ * Retires unpaid penances a justified ruling covered, as POST /hygiene/debt/:id/revise would:
+ * the penance debt becomes justified and keeps its old verdict in `history`. No 12 h window:
+ * this is a new ruling on the bypass, not a revision of the old one. Returns what it retired.
+ */
+export function retirePenances(state: GateState, items: string[], by: string, reason: string, now: number): string[] {
+  const retired: string[] = [];
+  for (const item of items) {
+    const debt = state.debts.find((d) => `penance/${d.id}` === item);
+    if (!debt || debt.status !== "penance" || !debt.penance || debt.penance.paidAt) continue;
+    const revisedAt = new Date(now).toISOString();
+    (debt.history ??= []).push({
+      status: debt.status,
+      reasonClass: debt.reasonClass,
+      reason: debt.reason,
+      ruledAt: debt.ruledAt,
+      penance: debt.penance,
+      revisedAt,
+    });
+    debt.status = "justified";
+    debt.reasonClass = "other";
+    debt.reason = `retired by ${by}${reason ? `: ${reason}` : ""}`.slice(0, 300);
+    debt.ruledAt = revisedAt;
+    delete debt.penance;
+    retired.push(item);
+  }
+  return retired;
 }
 
 /**
@@ -1716,6 +1763,7 @@ export function noteText(debt: Debt, baseUrl: string): string {
   const at = Date.parse(debt.at);
   const endpoint = `${baseUrl}/hygiene/debt/${debt.id}/resolve`;
   const phoneBypass = debt.bedtime || debt.kind === "adult-filter";
+  const penances = penanceChoice(debt, true);
   const what =
     debt.kind === "adult-filter"
       ? `At ${clockLabel(at)} on ${dayLabel(localTime(at).day)} Alex used a 15-minute phone filter bypass.`
@@ -1735,6 +1783,11 @@ export function noteText(debt: Debt, baseUrl: string): string {
     phoneBypass ? `Use reasonClass:"other" for this phone bypass. This debt covers no hygiene item, so do not supply item, fixRef or gate_fault. Report a phone shield fault separately.` : `Use reasonClass:"gate_fault" for a broken gate, or "other" otherwise. A justified gate_fault requires item (one of the bypassed item keys: ${(debt.items ?? []).join(", ") || "legacy debt: identify the faulty item"}) and fixRef: {"kind":"q","id":"<existing open queue item>"} or {"kind":"chat","id":"<chat UUID with an open task-ledger record>","eta":"<future ISO time with offset>","task":<ledger record number if the chat has multiple open tasks>}. Create or identify the repair first; do not merely repeat a gate-fault justification. A second fault for the same item within 24 h suspends it until the repair closes.`,
     "An unjustified ruling locks the gate until Alex sends the penance photo.",
     phoneBypass ? "A justified phone bypass ruling excuses no hygiene requirement." : `A justified ruling also excuses the gym plans the bypass covered: they never lock again, so judge the session too. Excuse it for a sound reason not to train (sick, injured, an emergency); if the bypass was needed but the session should still be made up, add "skip":false. Bypassed photos stay due later today unless you add "skip":true (every bypassed item) or a list of item keys. A gate_fault ruling excuses only its faulty item by default.`,
+    ...(penances.length
+      ? [
+          `This bypass covered ${penances.join(", ")}: each is the unpaid penance of debt ${penances.map((p) => p.slice("penance/".length)).join(", ")}. A justified ruling with "skip":true (or a list naming it) retires that penance too; without skip it stays due and locks again when the bypass ends.`,
+        ]
+      : []),
     `</${NOTE_TAG}>`,
   ].join("\n");
 }

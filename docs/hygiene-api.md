@@ -234,6 +234,15 @@ judgement, never from a keyword Alex types to the gate.
   skips nothing. Only what the BYPASS captured as locking is skipped (a move debt: its
   `moveSlot`); an Emergency-tap debt, whose items are inferred, skips nothing by ruling
   (use `/hygiene/skip`). The debt records `skippedItems`; the response lists `notSkipped`.
+- A penance slot `penance/<debt id>` names its debt: the id is everything after
+  `penance/` (`penance/bedtime-1795801383756-52` is debt `bedtime-1795801383756-52`,
+  not the bypass number). To lift a penance, revise that debt
+  (`POST /hygiene/debt/<debt id>/revise` `{"verdict":"justified","reason"}`, within 12 h of
+  its ruling). Since Nov 28, a justified ruling (`resolve` or `revise`) on a BYPASS that
+  covered the penance also retires it when it adds `"skip":true` or lists `penance/<debt id>`:
+  the penance debt becomes `justified`, its old verdict goes to `history`, and the ruled
+  debt records `retiredPenances`. Without skip the penance stays due and locks again when
+  the bypass ends. A shield (Emergency-tap) or move debt retires none.
 - `POST /hygiene/skip` `{target, by, reason}` skips ahead of time or after the fact.
   `target` is `gym/<plan id>` or `YYYY-MM-DD/<item>` (the keys above, from yesterday
   to 31 days ahead). `POST /hygiene/unskip` `{target, by}` undoes it. Penances never
