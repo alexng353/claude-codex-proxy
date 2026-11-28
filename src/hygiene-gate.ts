@@ -80,6 +80,7 @@ import {
   isOverdueItem,
   bedtimeFullFrom,
   bedtimeHold,
+  BEDTIME_HOLD_LIMIT_MINUTE,
   movableSlots,
   moveSlots,
   movesToday,
@@ -1181,14 +1182,21 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
     ? `it locks again at ${clockLabel(time.at)}, and if it isn't done by ${clockLabel(limit)} it counts as a skip`
     : "if it isn't done by midnight it counts as a skip";
   // Last night's photos also hold back the phone's whole-phone lock. The sentence names the hold
-  // as it now stands (the earliest, capped at 01:00), and only to a Cairn that keeps it.
+  // as it now stands (the earliest, capped at 01:00), and only to a Cairn that keeps it. "too"
+  // only when this move set it; "once your other photos are in" only while another owed photo
+  // still locks the gate (not a penance or gym, and not under an open bypass).
   const hold = names.some(isOverdueItem) && phoneKeepsBedtimeHold(state, now) ? bedtimeHold(state, now) : undefined;
-  const latest = hold?.capped ? " (the latest it waits)" : "";
-  const phone = !hold
-    ? ""
-    : outstanding(state, now).length
-      ? ` Your phone's whole-phone lock waits until ${clockLabel(hold.at)}${latest} once your other photos are in; the late-night apps stay locked.`
-      : ` Your phone's whole-phone lock waits until ${clockLabel(hold.at)} too${latest}; the late-night apps stay locked.`;
+  let phone = "";
+  if (hold) {
+    const latest = hold.capped ? " (the latest it waits)" : "";
+    const setByThisMove = hold.at === Math.min(time.at, zonedTime(localTime(now).day, BEDTIME_HOLD_LIMIT_MINUTE));
+    const otherPhotos =
+      !bypassActive(state, now) && outstanding(state, now).some((r) => r.kind !== "penance" && r.kind !== "gym");
+    const until = setByThisMove
+      ? `waits until ${clockLabel(hold.at)}${otherPhotos ? latest : ` too${latest}`}`
+      : `still waits only until ${clockLabel(hold.at)}`;
+    phone = ` Your phone's whole-phone lock ${until}${otherPhotos ? " once your other photos are in" : ""}; the late-night apps stay locked.`;
+  }
   return {
     ok: true,
     message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); ${promise}.${phone}`,

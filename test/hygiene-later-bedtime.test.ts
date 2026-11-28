@@ -121,6 +121,8 @@ async function getStatus() {
 const state = async () => JSON.parse(await readFile(process.env.HYGIENE_GATE_STATE!, "utf8"));
 
 const phone = (time: string) => `Your phone's whole-phone lock waits until ${time} too; the late-night apps stay locked.`;
+// R2-L1: after a move that doesn't set the hold, the reply says the hold is unchanged.
+const still = (time: string) => `Your phone's whole-phone lock still waits only until ${time}; the late-night apps stay locked.`;
 
 describe("a LATER for last night's photos moves tonight's whole-phone lock", () => {
   test("no move: the phone keeps its own midnight start", async () => {
@@ -195,8 +197,53 @@ describe("a LATER for last night's photos moves tonight's whole-phone lock", () 
     expect(await say("MOVE shower 00:30")).toContain(
       "it counts as a skip. Your phone's whole-phone lock waits until 00:30 once your other photos are in; the late-night apps stay locked.\n",
     );
-    expect(await say("MOVE night 00:50")).toEndWith(phone("00:30"));
+    expect(await say("MOVE night 00:50")).toEndWith(still("00:30"));
     expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:30")));
+  });
+
+  // R2-M1: every recorded move counts, not each photo's newest, so a second LATER can't revive an
+  // ended hold or stretch a running one. The photo itself still moves.
+  test("a second LATER on the same photos never revives an ended hold", async () => {
+    await say("LATER 00:30");
+    clock = at(NIGHT, "00:31");
+    expect((await getStatus()).bedtime_full_from).toBeUndefined();
+    const reply = (await say("LATER 00:55"))!;
+    expect(reply).toStartWith("⏩ moved shower (Nov 5), night teeth (Nov 5) to 00:55.");
+    expect(reply).not.toContain("whole-phone");
+    expect((await getStatus()).bedtime_full_from).toBeUndefined();
+    // The gate still follows the newest move.
+    expect((await getStatus()).outstanding).toEqual([]);
+  });
+
+  test("moving a photo again before the hold ends keeps the first time", async () => {
+    await say("LATER 00:30");
+    clock = at(NIGHT, "00:10");
+    // The gate is open now, so LATER isn't offered; MOVE still is.
+    expect(await say("MOVE shower 00:55")).toEndWith(still("00:30"));
+    expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:30")));
+    clock = at(NIGHT, "00:30");
+    expect((await getStatus()).bedtime_full_from).toBeUndefined();
+  });
+
+  test("another photo's moves, even to an earlier time, never set the hold", async () => {
+    await writeState({
+      moves: [
+        { slot: "2026-11-05/morning-teeth", from: iso(at("2026-11-05", "09:00")), to: iso(at("2026-11-05", "10:00")), by: "test", at: iso(at("2026-11-05", "08:00")) },
+      ],
+    });
+    expect(await say("LATER 00:45")).toContain(phone("00:45"));
+    expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:45")));
+  });
+
+  // R2-L2: "once your other photos are in" only for photos still owed, not a penance, and not while
+  // a bypass has the gate open.
+  test("the other-photos wording counts only owed photos, and not while a bypass is open", async () => {
+    await writeState({
+      debts: [{ id: "d0", at: iso(at(NIGHT, "00:01")), skipped: [], status: "penance", penance: { description: "ten pushups", setAt: iso(at(NIGHT, "00:02")) } }],
+    });
+    expect(await say("LATER 00:45")).toContain(`${phone("00:45")}\n`);
+    await writeState({ bypass: { count: 1, until: iso(at(NIGHT, "00:40")), history: [] } });
+    expect(await say("MOVE shower 00:30")).toContain(phone("00:30"));
   });
 
   // F3 (build lane, 12:23): the hold ends at the earliest moved time and never comes back, so the
