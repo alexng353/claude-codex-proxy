@@ -119,6 +119,17 @@ async function getStatus() {
   return (await reply!.json()) as any;
 }
 const state = async () => JSON.parse(await readFile(process.env.HYGIENE_GATE_STATE!, "utf8"));
+// Changes the stored state in place (keeping its moves), as an agent's skip or cancel would.
+const patchState = async (change: (s: any) => void) => {
+  const s = await state();
+  change(s);
+  await writeFile(process.env.HYGIENE_GATE_STATE!, JSON.stringify(s));
+  resetGateCache();
+};
+const skipShower = (time: string) =>
+  patchState((s) => (s.skips ??= []).push({ day: "2026-11-05", item: "shower", at: iso(at(NIGHT, time)), by: "test", reason: "justified BYPASS" }));
+const cancelShower = (time: string) =>
+  patchState((s) => ((s.cancellations ??= {}).shower = { at: iso(at(NIGHT, time)), reason: "test" }));
 
 const phone = (time: string) => `Your phone's whole-phone lock waits until ${time} too; the late-night apps stay locked.`;
 // R2-L1: after a move that doesn't set the hold, the reply says the hold is unchanged.
@@ -259,6 +270,57 @@ describe("a LATER for last night's photos moves tonight's whole-phone lock", () 
       clock = at(NIGHT, time);
       expect((await getStatus()).bedtime_full_from).toBeUndefined();
     }
+  });
+
+  // R3-M1: a skip or cancel of a moved photo (Bubble's justified BYPASS, an agent relaying Alex)
+  // never revives an ended hold or stretches a running one; it is decided by the moves alone.
+  for (const [what, stop] of [
+    ["skip", skipShower],
+    ["cancel", cancelShower],
+  ] as const) {
+    test(`a ${what} of a moved photo after the hold ended never brings it back`, async () => {
+      await say("MOVE shower 00:30");
+      await say("MOVE night 00:50");
+      clock = at(NIGHT, "00:35");
+      await stop("00:35");
+      clock = at(NIGHT, "00:36");
+      expect((await getStatus()).bedtime_full_from).toBeUndefined();
+    });
+
+    test(`a ${what} of a moved photo before the hold ends keeps the earliest time`, async () => {
+      await say("MOVE shower 00:30");
+      await say("MOVE night 00:50");
+      clock = at(NIGHT, "00:20");
+      await stop("00:20");
+      expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:30")));
+      clock = at(NIGHT, "00:30");
+      expect((await getStatus()).bedtime_full_from).toBeUndefined();
+    });
+  }
+
+  // R3-L1: "too" only when this move changed the hold, so a later move under an earlier capped hold
+  // says the hold still stands.
+  test("a move past 01:00 after another capped move says the hold still waits only until 01:00", async () => {
+    expect(await say("MOVE shower 02:00")).toContain("Your phone's whole-phone lock waits until 01:00 (the latest it waits) once your other photos are in;");
+    expect(await say("MOVE night 03:00")).toEndWith(still("01:00"));
+    expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "01:00")));
+  });
+
+  test("moving the same photos again past 01:00 says the hold still waits only until 01:00", async () => {
+    expect(await say("LATER 02:00")).toEndWith(
+      "Your phone's whole-phone lock waits until 01:00 too (the latest it waits); the late-night apps stay locked.",
+    );
+    clock = at(NIGHT, "00:10");
+    expect(await say("MOVE shower 03:00")).toEndWith(still("01:00"));
+  });
+
+  // R3-L2: a bypass that closes before the hold ends doesn't excuse the other photo, so the reply
+  // still says the phone waits for it.
+  test("a bypass that ends before the hold keeps the other-photos wording", async () => {
+    await writeState({ bypass: { count: 1, until: iso(at(NIGHT, "00:20")), history: [] } });
+    expect(await say("MOVE shower 00:30")).toContain(
+      "Your phone's whole-phone lock waits until 00:30 once your other photos are in; the late-night apps stay locked.",
+    );
   });
 
   test("a LATER after the first moved time has passed holds nothing and says nothing about the phone", async () => {

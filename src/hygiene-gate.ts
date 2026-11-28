@@ -80,7 +80,6 @@ import {
   isOverdueItem,
   bedtimeFullFrom,
   bedtimeHold,
-  BEDTIME_HOLD_LIMIT_MINUTE,
   movableSlots,
   moveSlots,
   movesToday,
@@ -1173,6 +1172,8 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
     if (!names.length && lapsedNamed.length) return { ok: false, error: overdueMoveError(state, lapsedNamed, true) };
     if (!names.length) return { ok: false, error: "nothing by that name is due today that can move (tonight's photos are due by midnight already)" };
   }
+  // The hold before this move, so the reply can tell whether this move set it (R3-L1).
+  const holdBefore = bedtimeHold(state, now);
   const r = moveSlots(state, names, time.at, now, by);
   if (!r.ok) return { ok: false, error: r.error };
   const left = Math.min(...names.map((n) => MAX_MOVES_PER_DAY - movesToday(state, n, now).length));
@@ -1183,15 +1184,15 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
     : "if it isn't done by midnight it counts as a skip";
   // Last night's photos also hold back the phone's whole-phone lock. The sentence names the hold
   // as it now stands (the earliest, capped at 01:00), and only to a Cairn that keeps it. "too"
-  // only when this move set it; "once your other photos are in" only while another owed photo
-  // still locks the gate (not a penance or gym, and not under an open bypass).
+  // only when this move changed it; "once your other photos are in" only while another owed photo
+  // still locks the gate (not a penance or gym, and not under a bypass still open at the hold).
   const hold = names.some(isOverdueItem) && phoneKeepsBedtimeHold(state, now) ? bedtimeHold(state, now) : undefined;
   let phone = "";
   if (hold) {
     const latest = hold.capped ? " (the latest it waits)" : "";
-    const setByThisMove = hold.at === Math.min(time.at, zonedTime(localTime(now).day, BEDTIME_HOLD_LIMIT_MINUTE));
-    const otherPhotos =
-      !bypassActive(state, now) && outstanding(state, now).some((r) => r.kind !== "penance" && r.kind !== "gym");
+    const setByThisMove = holdBefore?.at !== hold.at;
+    const bypassCoversHold = bypassActive(state, now) && Date.parse(state.bypass.until!) >= hold.at;
+    const otherPhotos = !bypassCoversHold && outstanding(state, now).some((r) => r.kind !== "penance" && r.kind !== "gym");
     const until = setByThisMove
       ? `waits until ${clockLabel(hold.at)}${otherPhotos ? latest : ` too${latest}`}`
       : `still waits only until ${clockLabel(hold.at)}`;

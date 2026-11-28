@@ -943,14 +943,16 @@ export const BEDTIME_HOLD_LIMIT_MINUTE = 60;
  * time over every move of last night's shower and night teeth, passed ones included, never past
  * 01:00. Done photos keep the hold (Bubble, Nov 28: sending them late must not pay). Every move
  * counts, not each photo's newest, so the hold ends once: moving a photo again moves the photo,
- * never the hold. `capped` when that time ran past 01:00. Undefined with no such move or once
- * the time arrives, so the phone keeps its own midnight start. The late-app lock (X, Aidoku) is
- * the phone's and never moves.
+ * never the hold. A later skip, cancel or suspension of a moved photo doesn't touch it either
+ * (moves record only enforced slots, movableSlots), so none can revive or stretch it. `capped`
+ * when that time ran past 01:00. Undefined with no such move or once the time arrives, so the
+ * phone keeps its own midnight start. The late-app lock (X, Aidoku) is the phone's and never
+ * moves.
  */
 export function bedtimeHold(state: GateState, now: number): { at: number; capped: boolean } | undefined {
   const { day } = localTime(now);
   const yesterday = addDays(day, -1);
-  const held = [slot.shower(yesterday), slot.night(yesterday)].filter((name) => enforced(state, name, now));
+  const held = [slot.shower(yesterday), slot.night(yesterday)];
   let to = Number.POSITIVE_INFINITY;
   for (const move of state.moves ?? [])
     if (held.includes(move.slot) && Date.parse(move.at) <= now) to = Math.min(to, Date.parse(move.to));
