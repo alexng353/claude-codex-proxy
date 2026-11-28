@@ -921,7 +921,7 @@ export async function bedtimeAction(action: "free" | "request" | "bypass" | "app
   const result = await serialized(async () => {
     const state = structuredClone(loadState());
     const now = deps.now();
-    const result = action === "free" ? freeBedtime(state, input, by!, now)
+    const result = action === "free" ? freeBedtime(state, input, by!, now, armed(state, now))
       : action === "request" ? requestBedtime(state, input, by!, now)
       : action === "bypass" ? bypassBedtime(state, input.phrase, now, deps.bypassWords)
       : decideBedtime(state, input, action === "approve", now);

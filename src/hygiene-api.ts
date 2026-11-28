@@ -204,6 +204,9 @@ export async function handleHygieneApi(request: Request, url: URL): Promise<Resp
     let body;
     try { body = await request.json(); } catch { return json({ error: "body must be JSON" }, 400); }
     if (!body || typeof body !== "object" || Array.isArray(body)) return json({ error: "body must be an object" }, 400);
+    // The free unlock's day follows the phone's zone, as a status read does.
+    const zone = path === "/bedtime/free" ? request.headers.get("x-device-time-zone") : null;
+    if (zone) await noteDeviceZone(zone);
     const result = await bedtimeAction(path === "/bedtime/free" ? "free" : path === "/bedtime/request" ? "request" : "bypass", body, `cairn:${who.id}`);
     return result.ok ? json({ ...result, gate: status() }) : json({ error: result.error }, result.statusCode);
   }

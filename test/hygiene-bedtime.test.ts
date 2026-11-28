@@ -459,6 +459,69 @@ test("zone hopping cannot renew a still-running origin day", async () => {
   expect((await free("island")).code).toBe(200); // original Vancouver day ended at 07:00Z
 });
 
+// cairn-free15-shield R1-M2: a free unlock lifts only the bedtime lock. While the hygiene gate is
+// armed the phone stays shielded, so the free 15 would be spent for nothing; refuse it instead.
+const JAKARTA_SINCE = [{ zone: "Asia/Jakarta", from: "2026-11-14T00:00:00.000Z", seenAt: "2026-11-24T00:00:00.000Z" }];
+const NIGHT_DONE = { "2026-11-24/shower": "x", "2026-11-24/night-teeth": "x" };
+function gateState(extra: Record<string, unknown>, startsAt = "2026-11-20T00:00:00.000Z") {
+  writeFileSync(process.env.HYGIENE_GATE_STATE!, JSON.stringify({ ...emptyState(startsAt), zones: JAKARTA_SINCE, ...extra }));
+  resetGateCache();
+}
+async function refusedWithoutSpending(id: string) {
+  const before = structuredClone(loadState());
+  const r = await free(id);
+  expect(r.code).toBe(409);
+  expect(r.body.error).toBe("The hygiene gate is locked, so a free unlock would open nothing. Send the photo first; your free unlock is still available.");
+  expect(loadState().bedtime?.freeUnlocks ?? []).toEqual([]);
+  expect(loadState().bedtime?.unlockUntil).toBeUndefined();
+  expect(loadState().bypass).toEqual(before.bypass);
+  expect(loadState().debts).toEqual(before.debts);
+  const s = (await status()).body;
+  expect(s.state).toBe("armed");
+  expect(s.bedtime_free.available).toBe(true);
+}
+
+test("free unlock is refused, unspent, while last night's photos lock the gate", async () => {
+  gateState({});
+  clock = START; // 00:05 WIB Nov 25: Nov 24's shower and night teeth are owed
+  await refusedWithoutSpending("owed-night");
+  gateState({ filled: NIGHT_DONE });
+  expect((await free("after-photos")).code).toBe(200);
+});
+
+test("free unlock is refused at the 05:00 arm while the morning photos are owed", async () => {
+  gateState({ filled: NIGHT_DONE });
+  clock = Date.parse("2026-11-24T22:30:00Z"); // 05:30 WIB Nov 25, before a 07:00 wake
+  await refusedWithoutSpending("morning");
+});
+
+test("free unlock is refused while an owed penance locks the gate, even before the gate's start", async () => {
+  gateState({
+    debts: [{ id: "d0", at: iso(START - 60 * MIN), skipped: [], status: "penance", penance: { description: "ten pushups", setAt: iso(START - 30 * MIN) } }],
+  }, iso(START + 86400_000));
+  await refusedWithoutSpending("penance");
+});
+
+test("a retried free id that was already granted still answers after the gate re-arms", async () => {
+  gateState({ filled: NIGHT_DONE });
+  clock = Date.parse("2026-11-24T21:50:00Z"); // 04:50 WIB, nothing owed
+  expect((await free("early")).code).toBe(200);
+  clock = Date.parse("2026-11-24T22:01:00Z"); // 05:01 WIB, the morning photos arm
+  const retry = await free("early");
+  expect(retry.code).toBe(200);
+  expect(retry.body.duplicate).toBe(true);
+});
+
+test("the free command records the phone's zone like a status read does", async () => {
+  const r = await handleRequest(new Request("http://localhost/hygiene/api/v1/bedtime/free", {
+    method: "POST",
+    headers: { authorization: "Bearer phone", "content-type": "application/json", "x-forwarded-for": "100.64.1.1", "x-device-time-zone": "Asia/Jakarta" },
+    body: JSON.stringify({ id: "zoned" }),
+  }), "127.0.0.1");
+  expect(r.status).toBe(200);
+  expect(loadState().bedtime?.freeUnlocks?.[0]).toMatchObject({ zone: "Asia/Jakarta", day: "2026-11-25" });
+});
+
 test("Jakarta to Bali keeps the allowance used through the origin midnight", async () => {
   const { noteDeviceZone } = await import("../src/hygiene-gate");
   await jakarta(Date.parse("2026-11-25T15:30:00Z")); await free();
@@ -496,6 +559,10 @@ test("receipt start within destination day prevents a second use when recorded d
 });
 
 test("Bali to Vancouver on Dec 3 keeps the destination day spent until its midnight", async () => {
+  // The fixture gate starts Nov 25, so by Dec 4 unsent photos would arm it and refuse the free
+  // unlock; this test is about the day boundary only, so the gate never starts here.
+  writeFileSync(process.env.HYGIENE_GATE_STATE!, JSON.stringify(emptyState("2027-01-01T00:00:00.000Z")));
+  resetGateCache();
   const { noteDeviceZone } = await import("../src/hygiene-gate");
   clock = Date.parse("2026-12-03T07:00:00Z"); await noteDeviceZone("Asia/Makassar"); await free();
   clock += 16 * MIN; await noteDeviceZone("America/Vancouver");

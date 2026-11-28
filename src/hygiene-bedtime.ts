@@ -90,11 +90,16 @@ export function bedtimeFreeStatus(state: GateState, now: number) {
   return { available: !used, day, zone, ...(used ? { used_at: used.at } : {}) };
 }
 
-export function freeBedtime(state: GateState, input: { id?: unknown }, by: string, now: number): BedtimeResult {
+/**
+ * `gateArmed`: the hygiene gate shields the phone for owed checks. A free unlock lifts only the
+ * bedtime lock, so it would open nothing then; it is refused without being spent.
+ */
+export function freeBedtime(state: GateState, input: { id?: unknown }, by: string, now: number, gateArmed = false): BedtimeResult {
   if (typeof input?.id !== "string" || !ID.test(input.id)) return fail(400, "id must be 1-80 letters, digits, . _ : -");
   const b = bedtimeState(state);
   const old = b.freeUnlocks?.find(r => r.id === input.id && r.by === by);
   if (old) return { ok: true, id: old.id, duplicate: true, granted: Date.parse(old.until) > now, message: "Free unlock already recorded." };
+  if (gateArmed) return fail(409, "The hygiene gate is locked, so a free unlock would open nothing. Send the photo first; your free unlock is still available.");
   const today = bedtimeFreeStatus(state, now);
   if (!today.available) return fail(409, "Today's free unlock is used.");
   if (bedtimeUnlockUntil(state, now)) return fail(409, "Bedtime is already unlocked. Your free unlock is still available.");
