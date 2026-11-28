@@ -111,6 +111,7 @@ function status() {
   return {
     ...(s.adult_filter_unlock_until ? { adult_filter_unlock_until: s.adult_filter_unlock_until } : {}),
     ...(s.bedtime_unlock_until ? { bedtime_unlock_until: s.bedtime_unlock_until } : {}),
+    ...(s.bedtime_full_from ? { bedtime_full_from: s.bedtime_full_from } : {}),
     bedtime_free: s.bedtime_free,
     enabled: s.enabled,
     state: s.state,
