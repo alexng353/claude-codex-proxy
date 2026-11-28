@@ -940,8 +940,9 @@ export const BEDTIME_HOLD_LIMIT_MINUTE = 60;
 /**
  * How long a LATER holds tonight's whole-phone Screen Time lock (Alex, Nov 28: "can I have it so
  * a LATER pushes my screen time lock too, but not for x and aidoku"): until the earliest moved-to
- * time still ahead of last night's shower and night teeth, never past 01:00. Done photos keep
- * the hold (Bubble, Nov 28: sending them late must not pay). `capped` when a moved time ran past
+ * time of last night's shower and night teeth, passed ones included, never past 01:00. Done photos
+ * keep the hold (Bubble, Nov 28: sending them late must not pay). Counting a passed time means
+ * the hold ends once and never comes back for a later move. `capped` when that time ran past
  * 01:00. Undefined with no such move or once the time arrives, so the phone keeps its own
  * midnight start. The late-app lock (X, Aidoku) is the phone's and never moves.
  */
@@ -951,7 +952,7 @@ export function bedtimeHold(state: GateState, now: number): { at: number; capped
   let to = Number.POSITIVE_INFINITY;
   for (const name of [slot.shower(yesterday), slot.night(yesterday)]) {
     const moved = movedTo(state, name, now);
-    if (moved === null || moved <= now || !enforced(state, name, now)) continue;
+    if (moved === null || !enforced(state, name, now)) continue;
     to = Math.min(to, moved);
   }
   if (!Number.isFinite(to)) return undefined;

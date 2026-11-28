@@ -199,15 +199,27 @@ describe("a LATER for last night's photos moves tonight's whole-phone lock", () 
     expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:30")));
   });
 
-  // F3: a moved time that has passed no longer holds; the next one does, without a gap.
-  test("a passed moved time hands the hold to the next one", async () => {
+  // F3 (build lane, 12:23): the hold ends at the earliest moved time and never comes back, so the
+  // phone never relocks at 00:30 and then unlocks again until 00:50.
+  test("the hold ends at the earliest moved time, done or not, and never comes back", async () => {
     await say("MOVE shower 00:30");
     await say("MOVE night 00:50");
-    clock = at(NIGHT, "00:35");
-    expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:50")));
+    clock = at(NIGHT, "00:10");
     await sendPhoto("shower");
-    expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:50")));
-    clock = at(NIGHT, "00:50");
+    expect((await state()).filled["2026-11-05/shower"]).toBeTruthy();
+    expect((await getStatus()).bedtime_full_from).toBe(iso(at(NIGHT, "00:30")));
+    for (const time of ["00:30", "00:35", "00:49", "00:50", "00:55"]) {
+      clock = at(NIGHT, time);
+      expect((await getStatus()).bedtime_full_from).toBeUndefined();
+    }
+  });
+
+  test("a LATER after the first moved time has passed holds nothing and says nothing about the phone", async () => {
+    await say("MOVE shower 00:30");
+    clock = at(NIGHT, "00:35");
+    const reply = (await say("MOVE night 00:50"))!;
+    expect(reply).toStartWith("⏩ moved night teeth (Nov 5) to 00:50.");
+    expect(reply).not.toContain("whole-phone");
     expect((await getStatus()).bedtime_full_from).toBeUndefined();
   });
 
