@@ -512,6 +512,16 @@ test("a retried free id that was already granted still answers after the gate re
   expect(retry.body.duplicate).toBe(true);
 });
 
+test("a spent free unlock says it is used, not still available, while the gate is armed", async () => {
+  gateState({ filled: NIGHT_DONE });
+  clock = Date.parse("2026-11-24T21:50:00Z"); // 04:50 WIB, nothing owed
+  expect((await free("early")).code).toBe(200);
+  clock = Date.parse("2026-11-24T22:20:00Z"); // 05:20 WIB: the grant has ended and the morning photos arm
+  const r = await free("again");
+  expect(r.code).toBe(409);
+  expect(r.body.error).toBe("Today's free unlock is used.");
+});
+
 test("the free command records the phone's zone like a status read does", async () => {
   const r = await handleRequest(new Request("http://localhost/hygiene/api/v1/bedtime/free", {
     method: "POST",

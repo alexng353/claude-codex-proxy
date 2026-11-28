@@ -99,9 +99,10 @@ export function freeBedtime(state: GateState, input: { id?: unknown }, by: strin
   const b = bedtimeState(state);
   const old = b.freeUnlocks?.find(r => r.id === input.id && r.by === by);
   if (old) return { ok: true, id: old.id, duplicate: true, granted: Date.parse(old.until) > now, message: "Free unlock already recorded." };
-  if (gateArmed) return fail(409, "The hygiene gate is locked, so a free unlock would open nothing. Send the photo first; your free unlock is still available.");
   const today = bedtimeFreeStatus(state, now);
+  // Spent beats armed, so the refusal never claims an allowance that is already used.
   if (!today.available) return fail(409, "Today's free unlock is used.");
+  if (gateArmed) return fail(409, "The hygiene gate is locked, so a free unlock would open nothing. Send the photo first; your free unlock is still available.");
   if (bedtimeUnlockUntil(state, now)) return fail(409, "Bedtime is already unlocked. Your free unlock is still available.");
   const at = new Date(now).toISOString();
   const until = new Date(now + BEDTIME_MS).toISOString();
