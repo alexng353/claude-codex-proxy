@@ -78,6 +78,7 @@ import {
   allMoves,
   chargeBrokenMoves,
   isOverdueItem,
+  bedtimeFullFrom,
   movableSlots,
   moveSlots,
   movesToday,
@@ -1168,9 +1169,14 @@ function applyMove(state: GateState, now: number, cmd: MoveCommand, by: string):
   const promise = names.every(isOverdueItem)
     ? `it locks again at ${clockLabel(time.at)}, and if it isn't done by ${clockLabel(limit)} it counts as a skip`
     : "if it isn't done by midnight it counts as a skip";
+  // Last night's photos also hold back the phone's whole-phone lock (bedtimeFullFrom).
+  const phone =
+    names.some(isOverdueItem) && screenTimeView(state, now)?.bedtime_enabled
+      ? ` Your phone's whole-phone lock waits until ${clockLabel(time.at)} too; the late-night apps stay locked.`
+      : "";
   return {
     ok: true,
-    message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); ${promise}.`,
+    message: `⏩ moved ${names.map((n) => slotLabel(n, state)).join(", ")} to ${clockLabel(time.at)}. No bypass, no debt (${left ? `${left} more move${left === 1 ? "" : "s"}` : "no more moves"} today); ${promise}.${phone}`,
     moved: r.moved,
   };
 }
@@ -1485,7 +1491,7 @@ export function startGymPolling(intervalMs?: number): () => Promise<void> {
  */
 export function shieldSignature(): string {
   const status = gateStatus();
-  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}${status.bedtime_unlock_until ? `|bedtime:${status.bedtime_unlock_until}` : ""}${status.adult_filter_unlock_until ? `|adult-filter:${status.adult_filter_unlock_until}` : ""}`;
+  return `${status.state}|${status.bypass.activeUntil ?? ""}|${status.badge}${status.bedtime_unlock_until ? `|bedtime:${status.bedtime_unlock_until}` : ""}${status.adult_filter_unlock_until ? `|adult-filter:${status.adult_filter_unlock_until}` : ""}${status.bedtime_full_from ? `|bedtime-full:${status.bedtime_full_from}` : ""}`;
 }
 
 /** Wakes Cairn when the shield signature changes (authority only; never under tests). */
@@ -1690,6 +1696,7 @@ export function gateStatus() {
     bedtime_free: bedtimeFreeStatus(state, now),
     ...(adultFilterUnlockUntil(state, now) ? { adult_filter_unlock_until: adultFilterUnlockUntil(state, now) } : {}),
     ...(bedtimeUnlockUntil(state, now) ? { bedtime_unlock_until: bedtimeUnlockUntil(state, now) } : {}),
+    ...(bedtimeFullFrom(state, now) ? { bedtime_full_from: bedtimeFullFrom(state, now) } : {}),
     enabled: !disabled,
     armed: !disabled && due.length > 0 && !bypass,
     state: gateState,
